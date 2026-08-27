@@ -33,6 +33,8 @@ use gpui::{
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
     WindowParams, point, px, size,
 };
+#[cfg(feature = "external-gpu-surface")]
+use gpui::{ExternalGpuSurfaceError, ExternalGpuSurfaceHandle};
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 
@@ -904,7 +906,7 @@ impl MacWindow {
         background_executor: BackgroundExecutor,
         renderer_context: renderer::Context,
         marker: MainThreadMarker,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
 
@@ -1115,6 +1117,14 @@ impl MacWindow {
             setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawDuringViewResize
             ];
 
+            #[cfg(feature = "external-gpu-surface")]
+            {
+                let drawable_size = bounds
+                    .size
+                    .to_device_pixels(get_scale_factor(native_window));
+                window.0.lock().renderer.initialize(drawable_size)?;
+            }
+
             content_view.addSubview_(native_view.autorelease());
             native_window.makeFirstResponder_(native_view);
 
@@ -1232,7 +1242,7 @@ impl MacWindow {
 
             pool.drain();
 
-            window
+            Ok(window)
         }
     }
 
@@ -1701,6 +1711,12 @@ impl PlatformWindow for MacWindow {
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
+        #[cfg(feature = "external-gpu-surface")]
+        {
+            return self.0.lock().renderer.supports_dual_source_blending();
+        }
+
+        #[cfg(not(feature = "external-gpu-surface"))]
         false
     }
 
@@ -1814,7 +1830,12 @@ impl PlatformWindow for MacWindow {
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
-        self.0.as_ref().lock().request_frame_callback = Some(callback);
+        let mut state = self.0.as_ref().lock();
+        state.request_frame_callback = Some(callback);
+        // The window may already be visible by the time GPUI installs its frame callback.
+        // Start the display link here so an earlier occlusion-state notification cannot be
+        // the only opportunity to arm continuous frame delivery.
+        state.start_display_link();
     }
 
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>) {
@@ -1908,7 +1929,54 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
+
+        #[cfg(feature = "external-gpu-surface")]
+        if this.renderer.device_lost() {
+            if let Err(error) = this.renderer.recover() {
+                log::error!("failed to recover the macOS WGPU compositor: {error:#}");
+                return;
+            }
+        }
+
         this.renderer.draw(scene);
+    }
+
+    #[cfg(feature = "external-gpu-surface")]
+    fn create_external_gpu_surface(
+        &self,
+        width: u32,
+        height: u32,
+        format: gpui::wgpu::TextureFormat,
+    ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
+        let window_state = Arc::downgrade(&self.0);
+        let invalidator = Arc::new(move || {
+            let Some(window_state) = window_state.upgrade() else {
+                return;
+            };
+            let foreground_executor = window_state.lock().foreground_executor.clone();
+            foreground_executor
+                .spawn(async move {
+                    let mut state = window_state.lock();
+                    if state.closed.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let Some(mut callback) = state.request_frame_callback.take() else {
+                        return;
+                    };
+                    drop(state);
+                    callback(RequestFrameOptions {
+                        require_presentation: true,
+                        force_render: false,
+                    });
+                    window_state.lock().request_frame_callback = Some(callback);
+                })
+                .detach();
+        });
+
+        self.0
+            .lock()
+            .renderer
+            .create_external_gpu_surface(width, height, format, invalidator)
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -1916,6 +1984,12 @@ impl PlatformWindow for MacWindow {
     }
 
     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {
+        #[cfg(feature = "external-gpu-surface")]
+        {
+            return Some(self.0.lock().renderer.gpu_specs());
+        }
+
+        #[cfg(not(feature = "external-gpu-surface"))]
         None
     }
 

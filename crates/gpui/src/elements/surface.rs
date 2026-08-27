@@ -1,6 +1,7 @@
 use crate::{
-    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    ObjectFit, Pixels, Style, StyleRefinement, Styled, Window,
+    App, Bounds, Element, ElementId, ExternalGpuSurfaceHandle, GlobalElementId, InspectorElementId,
+    IntoElement, LayoutId, ObjectFit, Pixels, Style, StyleRefinement, Styled, TransformationMatrix,
+    Window,
 };
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
@@ -12,6 +13,8 @@ pub enum SurfaceSource {
     /// A macOS image buffer from CoreVideo
     #[cfg(target_os = "macos")]
     Surface(CVPixelBuffer),
+    /// A texture surface rendered by an external producer on GPUI's device.
+    ExternalGpu(ExternalGpuSurfaceHandle),
 }
 
 #[cfg(target_os = "macos")]
@@ -25,6 +28,7 @@ impl From<CVPixelBuffer> for SurfaceSource {
 pub struct Surface {
     source: SurfaceSource,
     object_fit: ObjectFit,
+    transformation: TransformationMatrix,
     style: StyleRefinement,
 }
 
@@ -34,6 +38,17 @@ pub fn surface(source: impl Into<SurfaceSource>) -> Surface {
     Surface {
         source: source.into(),
         object_fit: ObjectFit::Contain,
+        transformation: TransformationMatrix::unit(),
+        style: Default::default(),
+    }
+}
+
+/// Create an element that composites an external GPU surface inside GPUI.
+pub fn external_gpu_surface(source: ExternalGpuSurfaceHandle) -> Surface {
+    Surface {
+        source: SurfaceSource::ExternalGpu(source),
+        object_fit: ObjectFit::Fill,
+        transformation: TransformationMatrix::unit(),
         style: Default::default(),
     }
 }
@@ -44,10 +59,16 @@ impl Surface {
         self.object_fit = object_fit;
         self
     }
+
+    /// Apply a scene-space transform while retaining the GPUI content mask.
+    pub fn with_transformation(mut self, transformation: TransformationMatrix) -> Self {
+        self.transformation = transformation;
+        self
+    }
 }
 
 impl Element for Surface {
-    type RequestLayoutState = ();
+    type RequestLayoutState = Style;
     type PrepaintState = ();
 
     fn id(&self) -> Option<ElementId> {
@@ -67,19 +88,32 @@ impl Element for Surface {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
         style.refine(&self.style);
-        let layout_id = window.request_layout(style, [], cx);
-        (layout_id, ())
+        let layout_id = window.request_layout(style.clone(), [], cx);
+        (layout_id, style)
     }
 
     fn prepaint(
         &mut self,
         _global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
+        let surface = match &self.source {
+            SurfaceSource::ExternalGpu(surface) => Some(surface),
+            #[cfg(target_os = "macos")]
+            SurfaceSource::Surface(_) => None,
+        };
+        if let Some(surface) = surface {
+            let scale_factor = window.scale_factor();
+            let width = (bounds.size.width.0 * scale_factor).round().max(1.0) as u32;
+            let height = (bounds.size.height.0 * scale_factor).round().max(1.0) as u32;
+            if surface.size().ok() != Some((width, height)) {
+                surface.request_resize(width, height);
+            }
+        }
     }
 
     fn paint(
@@ -87,22 +121,25 @@ impl Element for Surface {
         _global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] bounds: Bounds<Pixels>,
-        _: &mut Self::RequestLayoutState,
+        style: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] window: &mut Window,
-        _: &mut App,
+        cx: &mut App,
     ) {
-        match &self.source {
-            #[cfg(target_os = "macos")]
-            SurfaceSource::Surface(surface) => {
-                let size = crate::size(surface.get_width().into(), surface.get_height().into());
-                let new_bounds = self.object_fit.get_bounds(bounds, size);
-                // TODO: Add support for corner_radii
-                window.paint_surface(new_bounds, surface.clone());
+        style.paint(bounds, window, cx, |window, _cx| {
+            match &self.source {
+                #[cfg(target_os = "macos")]
+                SurfaceSource::Surface(surface) => {
+                    let size = crate::size(surface.get_width().into(), surface.get_height().into());
+                    let new_bounds = self.object_fit.get_bounds(bounds, size);
+                    // TODO: Add support for corner_radii
+                    window.paint_surface(new_bounds, surface.clone());
+                }
+                SurfaceSource::ExternalGpu(surface) => {
+                    window.paint_external_gpu_surface(bounds, surface, self.transformation);
+                }
             }
-            #[allow(unreachable_patterns)]
-            _ => {}
-        }
+        });
     }
 }
 

@@ -18,6 +18,7 @@ font-kit = ["gpui_macos/font-kit"]
 test-support = ["gpui/test-support", "gpui_macos/test-support", "gpui_windows/test-support"]
 screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
 runtime_shaders = ["gpui_macos/runtime_shaders"]
+external-gpu-surface = ["gpui_macos/external-gpu-surface"]
 wayland = ["gpui_linux/wayland"]
 x11 = ["gpui_linux/x11"]
 

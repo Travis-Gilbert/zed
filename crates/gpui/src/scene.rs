@@ -5,8 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges,
+    ExternalGpuSurfaceId, Hsla, Pixels, Point, Radians, ScaledPixels, Size,
+    bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -763,14 +764,25 @@ impl From<PolychromeSprite> for Primitive {
     }
 }
 
+/// The GPU content sampled by a [`PaintSurface`].
+#[derive(Clone, Debug)]
+pub enum SurfaceContent {
+    /// A CoreVideo image used by the native macOS video path.
+    #[cfg(target_os = "macos")]
+    Video(core_video::pixel_buffer::CVPixelBuffer),
+    /// A texture from GPUI's bounded external-surface registry.
+    ExternalGpu(ExternalGpuSurfaceId),
+}
+
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
 pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
-    #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    pub opacity: f32,
+    pub transformation: TransformationMatrix,
+    pub content: SurfaceContent,
 }
 
 impl From<PaintSurface> for Primitive {

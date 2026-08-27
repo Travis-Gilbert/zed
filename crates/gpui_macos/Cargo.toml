@@ -18,6 +18,7 @@ test-support = ["gpui/test-support", "gpui_apple/test-support"]
 runtime_shaders = ["gpui_apple/runtime_shaders"]
 font-kit = ["dep:font-kit"]
 screen-capture = ["gpui/screen-capture"]
+external-gpu-surface = ["dep:gpui_wgpu"]
 
 [dependencies]
 gpui.workspace = true
@@ -43,6 +44,7 @@ foreign-types.workspace = true
 futures.workspace = true
 gpui_apple.workspace = true
 gpui_util.workspace = true
+gpui_wgpu = { workspace = true, optional = true }
 image.workspace = true
 itertools.workspace = true
 libc.workspace = true

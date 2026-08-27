@@ -1,5 +1,6 @@
 #[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
+use gpui::ExternalGpuSurfaceRegistry;
 #[cfg(not(target_family = "wasm"))]
 use gpui_util::ResultExt;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ pub struct WgpuContext {
     dual_source_blending: bool,
     color_texture_format: wgpu::TextureFormat,
     device_lost: Arc<AtomicBool>,
+    pub(crate) external_surface_registry: Arc<ExternalGpuSurfaceRegistry>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,6 +140,7 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             device_lost,
+            external_surface_registry: Arc::new(ExternalGpuSurfaceRegistry::new()),
         })
     }
 
@@ -229,6 +232,7 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             device_lost,
+            external_surface_registry: Arc::new(ExternalGpuSurfaceRegistry::new()),
         };
         Ok(PreparedWebGraphics { context, surface })
     }
@@ -289,7 +293,7 @@ impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends: wgpu::Backends::all(),
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),

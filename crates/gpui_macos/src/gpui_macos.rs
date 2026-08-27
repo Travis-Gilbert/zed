@@ -15,7 +15,13 @@ mod system_notifications;
 #[cfg(feature = "screen-capture")]
 mod screen_capture;
 
+#[cfg(not(feature = "external-gpu-surface"))]
 use gpui_apple::metal_renderer as renderer;
+
+#[cfg(feature = "external-gpu-surface")]
+mod wgpu_renderer;
+#[cfg(feature = "external-gpu-surface")]
+use wgpu_renderer as renderer;
 
 pub mod metal_renderer {
     pub use gpui_apple::metal_renderer::{PathRasterizationVertex, PathSprite, SurfaceBounds};

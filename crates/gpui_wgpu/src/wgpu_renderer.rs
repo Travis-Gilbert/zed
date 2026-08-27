@@ -2,8 +2,10 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, ExternalGpuSurfaceError,
+    ExternalGpuSurfaceHandle, ExternalGpuSurfaceInvalidator, ExternalGpuSurfaceRegistry, GpuSpecs,
+    Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, SurfaceContent,
+    get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -13,6 +15,7 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use wgpu::util::DeviceExt as _;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -82,6 +85,14 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    rotation_scale: [[f32; 2]; 2],
+    translation: [f32; 2],
+    opacity: f32,
+    _pad: f32,
+}
+
+struct PreparedExternalSurface {
+    bind_group: wgpu::BindGroup,
 }
 
 #[repr(C)]
@@ -229,6 +240,7 @@ pub struct WgpuRenderer {
     last_error: Arc<Mutex<Option<String>>>,
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    external_surface_registry: Arc<ExternalGpuSurfaceRegistry>,
     surface_configured: bool,
     needs_redraw: bool,
 }
@@ -602,6 +614,7 @@ impl WgpuRenderer {
             last_error,
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
+            external_surface_registry: Arc::clone(&context.external_surface_registry),
             surface_configured: true,
             needs_redraw: false,
         })
@@ -715,16 +728,6 @@ impl WgpuRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -1262,6 +1265,29 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    pub fn create_external_gpu_surface(
+        &self,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        invalidator: ExternalGpuSurfaceInvalidator,
+    ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
+        if self.device_lost() {
+            return Err(ExternalGpuSurfaceError::DeviceLost);
+        }
+        let resources = self.resources();
+        ExternalGpuSurfaceHandle::new(
+            Arc::clone(&self.external_surface_registry),
+            Arc::clone(&resources.device),
+            Arc::clone(&resources.queue),
+            width,
+            height,
+            format,
+            Arc::clone(&self.device_lost),
+            invalidator,
+        )
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> bool {
         #[cfg(target_family = "wasm")]
         if self.device_lost() {
@@ -1403,6 +1429,9 @@ impl WgpuRenderer {
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+        let external_surface_registry = Arc::clone(&self.external_surface_registry);
+        let _external_submission_guard = external_surface_registry.lock_submission();
+        let prepared_external_surfaces = self.prepare_external_surfaces(scene);
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
@@ -1526,9 +1555,20 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::Surfaces(range) => {
+                        for surface_index in range {
+                            let Some(prepared_surface) = prepared_external_surfaces
+                                .get(surface_index)
+                                .and_then(Option::as_ref)
+                            else {
+                                continue;
+                            };
+                            pass.set_pipeline(&self.resources().pipelines.surfaces);
+                            pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
+                            pass.set_bind_group(1, &prepared_surface.bind_group, &[]);
+                            pass.draw(0..4, 0..1);
+                        }
+                    }
                 }
             }
         }
@@ -1537,6 +1577,61 @@ impl WgpuRenderer {
             .queue
             .submit(std::iter::once(encoder.finish()));
         Ok(())
+    }
+
+    fn prepare_external_surfaces(&self, scene: &Scene) -> Vec<Option<PreparedExternalSurface>> {
+        scene
+            .surfaces
+            .iter()
+            .map(|surface| {
+                let surface_id = match &surface.content {
+                    SurfaceContent::ExternalGpu(surface_id) => surface_id,
+                    #[cfg(target_os = "macos")]
+                    SurfaceContent::Video(_) => return None,
+                };
+                let texture_view = self
+                    .external_surface_registry
+                    .promote_and_front_view(*surface_id)?;
+                let parameters = SurfaceParams {
+                    bounds: surface.bounds.into(),
+                    content_mask: surface.content_mask.bounds.into(),
+                    rotation_scale: surface.transformation.rotation_scale,
+                    translation: surface.transformation.translation,
+                    opacity: surface.opacity,
+                    _pad: 0.0,
+                };
+                let resources = self.resources();
+                let parameters_buffer =
+                    resources
+                        .device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("external_surface_parameters"),
+                            contents: bytemuck::bytes_of(&parameters),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
+                let bind_group = resources
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("external_surface_bind_group"),
+                        layout: &resources.bind_group_layouts.surfaces,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: parameters_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&texture_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                            },
+                        ],
+                    });
+                Some(PreparedExternalSurface { bind_group })
+            })
+            .collect()
     }
 
     fn write_instances(
