@@ -177,7 +177,12 @@ struct Mirrored {
     role: Option<&'static str>,
     label: Option<String>,
     description: Option<String>,
-    value: Option<String>,
+    /// The value, for the handful of roles where ARIA takes one as an
+    /// attribute.
+    value_text: Option<String>,
+    /// The value, for every other role, where it belongs in the element's own
+    /// content because that is where a reader looks for it.
+    text: Option<String>,
     bounds: Option<Rect>,
     disabled: bool,
     hidden: bool,
@@ -194,13 +199,43 @@ struct Mirrored {
     children: Vec<NodeId>,
 }
 
+/// The ARIA roles that take `aria-valuetext`.
+///
+/// Everywhere else -- a textbox above all -- the value is the element's
+/// content. Writing it as `aria-valuetext` there is invalid ARIA, and a reader
+/// announces nothing for it, so the value would be lost twice over.
+fn takes_valuetext(role: Option<&str>) -> bool {
+    matches!(
+        role,
+        Some("slider" | "spinbutton" | "progressbar" | "meter" | "scrollbar")
+    )
+}
+
+/// An ARIA attribute whose value is the empty string is worse than an absent
+/// one: it suppresses the name computation that would otherwise have found the
+/// element's content, so the node ends up with no accessible name at all.
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+}
+
 impl Mirrored {
     fn read(node: &accesskit::Node) -> Self {
+        let role = aria_role(node.role());
+        let value = non_empty(node.value());
+        let children = node.children().to_vec();
         Self {
-            role: aria_role(node.role()),
-            label: node.label().map(str::to_owned),
-            description: node.description().map(str::to_owned),
-            value: node.value().map(str::to_owned),
+            role,
+            label: non_empty(node.label()),
+            description: non_empty(node.description()),
+            value_text: takes_valuetext(role).then(|| value.clone()).flatten(),
+            // Only a leaf: `set_text_content` replaces every child, and a
+            // parent's children are written by the reorder pass, which runs
+            // only when the child list changed.
+            text: (!takes_valuetext(role) && children.is_empty())
+                .then_some(value)
+                .flatten(),
             bounds: node.bounds(),
             disabled: node.is_disabled(),
             hidden: node.is_hidden(),
@@ -214,7 +249,7 @@ impl Mirrored {
             live: node.live(),
             clickable: node.supports_action(Action::Click),
             focusable: node.supports_action(Action::Focus),
-            children: node.children().to_vec(),
+            children,
         }
     }
 }
@@ -504,7 +539,14 @@ fn write_node(element: &web_sys::Element, node: &Mirrored, scale_factor: f32) {
     set_or_clear(element, "role", node.role);
     set_or_clear(element, "aria-label", node.label.as_deref());
     set_or_clear(element, "aria-description", node.description.as_deref());
-    set_or_clear(element, "aria-valuetext", node.value.as_deref());
+    set_or_clear(element, "aria-valuetext", node.value_text.as_deref());
+    // A leaf's value is its content. `Mirrored::read` only fills this in for a
+    // node with no children, so this can never replace a mirrored subtree.
+    if let Some(text) = node.text.as_deref() {
+        element.set_text_content(Some(text));
+    } else if node.children.is_empty() {
+        element.set_text_content(None);
+    }
 
     set_flag(element, "aria-disabled", node.disabled);
     set_flag(element, "aria-required", node.required);
