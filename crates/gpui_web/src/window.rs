@@ -1,3 +1,4 @@
+use crate::a11y::WebA11yAdapter;
 use crate::display::WebDisplay;
 use crate::events::{ClickState, EventListenerHandle, WebEventListeners, is_mac_platform};
 use crate::platform::WebWindowLifecycle;
@@ -5,11 +6,12 @@ use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
-    Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
-    ResizeEdge, Scene, Size, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowControls, WindowDecorations, WindowParams, px,
+    A11yCallbacks, AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels,
+    DispatchEventResult, GpuSpecs, Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, ResizeEdge, Scene, Size, TextInputStateChange, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+    WindowParams, px,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use wasm_bindgen::prelude::*;
@@ -56,6 +58,9 @@ pub(crate) struct WebWindowInner {
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
+    /// The accessibility mirror, present once assistive technology support is
+    /// initialized. `None` until then, and when accessibility is force-disabled.
+    pub(crate) a11y: RefCell<Option<WebA11yAdapter>>,
     mql_handle: RefCell<Option<MqlHandle>>,
     pending_physical_size: Cell<Option<(u32, u32)>>,
     raf_id: Cell<Option<i32>>,
@@ -191,6 +196,7 @@ impl WebWindow {
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
+            a11y: RefCell::new(None),
             mql_handle: RefCell::new(None),
             pending_physical_size: Cell::new(None),
             raf_id: Cell::new(None),
@@ -810,7 +816,117 @@ impl PlatformWindow for WebWindow {
         Some(self.inner.state.borrow().renderer.gpu_specs())
     }
 
-    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
+    /// Move the hidden input to the caret.
+    ///
+    /// The input is the element the browser composes into, so the browser opens
+    /// the IME candidate window at the input's box -- which, before this, was a
+    /// 1x1 box pinned at the viewport origin. Composing Japanese anywhere in the
+    /// window put the candidate list in the top-left corner. Moving the input to
+    /// the caret is the whole fix; nothing else about focus or composition
+    /// changes.
+    fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+        // `bounds` is in the window's logical coordinates, which on the web are
+        // CSS pixels -- the same units the input's style takes -- so there is no
+        // scale factor to divide out here.
+        let style = self.inner.input_element.style();
+        let _ = style.set_property("left", &format!("{}px", f32::from(bounds.origin.x)));
+        let _ = style.set_property("top", &format!("{}px", f32::from(bounds.origin.y)));
+        // Give the input the caret's height so the candidate window clears the
+        // line rather than overlapping it, but keep the width at 1px: a wide
+        // transparent input over the canvas would still swallow nothing (it is
+        // behind the canvas in paint order) yet would confuse hit-testing tools.
+        let _ = style.set_property(
+            "height",
+            &format!("{}px", f32::from(bounds.size.height).max(1.0)),
+        );
+    }
+
+    /// Track the focused editable so mobile browsers raise the software
+    /// keyboard only when something is actually editable.
+    ///
+    /// GPUI reports focus, selection and content transitions but not the *kind*
+    /// of the focused input, so `inputmode` can only be "there is text here" or
+    /// "there is not". A per-field hint (`numeric`, `email`, `url`) needs the
+    /// input handler to describe itself, which is a GPUI API change rather than
+    /// a platform one.
+    fn text_input_state_changed(&self, change: TextInputStateChange) {
+        let input = &self.inner.input_element;
+        match change {
+            TextInputStateChange::FocusGained => {
+                let _ = input.set_attribute("inputmode", "text");
+                let _ = input.set_attribute("enterkeyhint", "enter");
+            }
+            TextInputStateChange::FocusLost => {
+                let _ = input.set_attribute("inputmode", "none");
+                let _ = input.remove_attribute("enterkeyhint");
+                // Nothing is editable, so park the composition box back at the
+                // origin rather than leaving it over a stale caret.
+                let style = input.style();
+                let _ = style.set_property("left", "0");
+                let _ = style.set_property("top", "0");
+                let _ = style.set_property("height", "1px");
+            }
+            TextInputStateChange::SelectionChanged | TextInputStateChange::ContentChanged => {}
+        }
+    }
+
+    /// Stand up the accessibility mirror and turn accessibility on.
+    ///
+    /// Unlike a desktop adapter there is nothing to wait for: the browser is
+    /// always "connected", because assistive technology reads the DOM whether
+    /// or not we can detect it. There is no reliable screen-reader probe on the
+    /// web, and guessing wrong means shipping an inaccessible application to
+    /// the people who need it. So the mirror is built and activated eagerly,
+    /// and stays on -- it is diffed, so a steady frame costs nothing.
+    fn a11y_init(&self, callbacks: A11yCallbacks) {
+        let Some(document) = self.inner.browser_window.document() else {
+            log::error!("a11y: no document; the accessibility mirror was not created");
+            return;
+        };
+
+        let action = callbacks.action;
+        let action: Rc<dyn Fn(gpui::accesskit::ActionRequest)> =
+            Rc::new(move |request| action(request));
+
+        let adapter = match WebA11yAdapter::new(document, self.inner.input_element.clone(), action)
+        {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                log::error!("a11y: failed to create the accessibility mirror: {error:?}");
+                return;
+            }
+        };
+
+        let initial = (callbacks.activation)();
+        *self.inner.a11y.borrow_mut() = Some(adapter);
+        if let Some(update) = initial {
+            let scale_factor = self.inner.state.borrow().scale_factor;
+            if let Some(adapter) = self.inner.a11y.borrow_mut().as_mut() {
+                adapter.apply(&update, scale_factor);
+            }
+        }
+
+        // Let an oracle read the mirror without owning the window. Weak so the
+        // published closure never keeps the window alive on its own.
+        let weak = Rc::downgrade(&self.inner);
+        crate::a11y::publish_summary_source(Rc::new(move || {
+            weak.upgrade()
+                .and_then(|inner| inner.a11y.borrow().as_ref().map(WebA11yAdapter::summary))
+                .unwrap_or_default()
+        }));
+    }
+
+    fn a11y_tree_update(&self, tree_update: gpui::accesskit::TreeUpdate) {
+        let scale_factor = self.inner.state.borrow().scale_factor;
+        if let Some(adapter) = self.inner.a11y.borrow_mut().as_mut() {
+            adapter.apply(&tree_update, scale_factor);
+        }
+    }
+
+    /// The mirror is positioned in the viewport, and the canvas fills the
+    /// viewport, so a resize needs no repositioning: the next frame's tree
+    /// carries the new bounds for every node.
+    fn a11y_update_window_bounds(&self) {}
 
     fn request_decorations(&self, _decorations: WindowDecorations) {}
 

@@ -356,10 +356,50 @@ impl WebWindowInner {
         })
     }
 
+    /// Reads the dropped files and delivers them on [`crate::web_file_drops`].
+    ///
+    /// `PlatformInput::FileDrop` carries `ExternalPaths`, and a browser has no
+    /// path to give: a `File` exposes bytes and a name, never a location. So
+    /// the drop is read here and delivered on its own channel rather than
+    /// synthesized into a path that no consumer could open. `preventDefault`
+    /// still runs first, because without it the browser navigates away from
+    /// the application to display the dropped file.
     fn register_drop(self: &Rc<Self>) -> EventListenerHandle {
         self.listen("drop", move |event: JsValue| {
             let event: web_sys::DragEvent = event.unchecked_into();
             event.prevent_default();
+
+            let position = mouse_position_in_element(&event);
+            let Some(files) = event.data_transfer().and_then(|transfer| transfer.files()) else {
+                return;
+            };
+            for index in 0..files.length() {
+                let Some(file) = files.item(index) else {
+                    continue;
+                };
+                // `File::array_buffer` is the only way to see the bytes, and it
+                // is asynchronous, so each file is delivered when its own read
+                // resolves rather than as one ordered batch.
+                wasm_bindgen_futures::spawn_local(async move {
+                    let name = file.name();
+                    let mime = file.type_();
+                    let buffer =
+                        match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
+                            Ok(buffer) => buffer,
+                            Err(error) => {
+                                log::warn!("failed to read dropped file {name}: {error:?}");
+                                return;
+                            }
+                        };
+                    let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+                    crate::file_drop::deliver(crate::WebFileDrop {
+                        name,
+                        mime,
+                        bytes,
+                        position,
+                    });
+                });
+            }
         })
     }
 
