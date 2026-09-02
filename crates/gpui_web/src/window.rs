@@ -7,11 +7,11 @@ use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 use gpui::{
     A11yCallbacks, AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels,
-    DispatchEventResult, GpuSpecs, Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel,
-    RequestFrameOptions, ResizeEdge, Scene, Size, TextInputStateChange, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowParams, px,
+    DispatchEventResult, EnterKeyHint, GpuSpecs, Modifiers, MouseButton, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
+    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, TextInputKind, TextInputStateChange,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
+    WindowDecorations, WindowParams, px,
 };
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use wasm_bindgen::prelude::*;
@@ -857,19 +857,20 @@ impl PlatformWindow for WebWindow {
     }
 
     /// Track the focused editable so mobile browsers raise the software
-    /// keyboard only when something is actually editable.
+    /// keyboard only when something is actually editable, and raise the right
+    /// one.
     ///
-    /// GPUI reports focus, selection and content transitions but not the *kind*
-    /// of the focused input, so `inputmode` can only be "there is text here" or
-    /// "there is not". A per-field hint (`numeric`, `email`, `url`) needs the
-    /// input handler to describe itself, which is a GPUI API change rather than
-    /// a platform one.
+    /// `inputmode` and `enterkeyhint` are the two things a browser asks an
+    /// editable about, and both come from the focused input handler through
+    /// [`TextInputHints`]. They are the difference between a phone keyboard
+    /// with a digit row and one without, and between a return key that says
+    /// "return" and one that says "Search".
     fn text_input_state_changed(&self, change: TextInputStateChange) {
         let input = &self.inner.input_element;
         match change {
-            TextInputStateChange::FocusGained => {
-                let _ = input.set_attribute("inputmode", "text");
-                let _ = input.set_attribute("enterkeyhint", "enter");
+            TextInputStateChange::FocusGained(hints) => {
+                let _ = input.set_attribute("inputmode", input_mode(hints.kind));
+                let _ = input.set_attribute("enterkeyhint", enter_key_hint(hints.enter_key));
             }
             TextInputStateChange::FocusLost => {
                 let _ = input.set_attribute("inputmode", "none");
@@ -967,4 +968,82 @@ impl PlatformWindow for WebWindow {
     }
 
     fn set_client_inset(&self, _inset: Pixels) {}
+}
+
+/// The `inputmode` a browser understands for each kind of field.
+///
+/// Names from the HTML attribute rather than GPUI's, because this is the one
+/// place the two vocabularies meet and a browser only accepts its own.
+fn input_mode(kind: TextInputKind) -> &'static str {
+    match kind {
+        TextInputKind::Text => "text",
+        TextInputKind::Search => "search",
+        TextInputKind::Numeric => "numeric",
+        TextInputKind::Decimal => "decimal",
+        TextInputKind::Telephone => "tel",
+        TextInputKind::Email => "email",
+        TextInputKind::Url => "url",
+    }
+}
+
+/// The `enterkeyhint` a browser understands for each return-key label.
+fn enter_key_hint(hint: EnterKeyHint) -> &'static str {
+    match hint {
+        EnterKeyHint::Enter => "enter",
+        EnterKeyHint::Done => "done",
+        EnterKeyHint::Go => "go",
+        EnterKeyHint::Next => "next",
+        EnterKeyHint::Previous => "previous",
+        EnterKeyHint::Search => "search",
+        EnterKeyHint::Send => "send",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_hint_maps_to_a_name_the_html_attribute_accepts() {
+        // The attribute values, from the HTML standard. A kind that mapped to
+        // a name outside these sets would be ignored by the browser in
+        // silence, which is the failure this guards.
+        const INPUT_MODES: [&str; 7] = [
+            "text", "search", "numeric", "decimal", "tel", "email", "url",
+        ];
+        const ENTER_KEY_HINTS: [&str; 7] =
+            ["enter", "done", "go", "next", "previous", "search", "send"];
+
+        for kind in [
+            TextInputKind::Text,
+            TextInputKind::Search,
+            TextInputKind::Numeric,
+            TextInputKind::Decimal,
+            TextInputKind::Telephone,
+            TextInputKind::Email,
+            TextInputKind::Url,
+        ] {
+            assert!(
+                INPUT_MODES.contains(&input_mode(kind)),
+                "{kind:?} maps to {:?}, which is not an inputmode",
+                input_mode(kind)
+            );
+        }
+
+        for hint in [
+            EnterKeyHint::Enter,
+            EnterKeyHint::Done,
+            EnterKeyHint::Go,
+            EnterKeyHint::Next,
+            EnterKeyHint::Previous,
+            EnterKeyHint::Search,
+            EnterKeyHint::Send,
+        ] {
+            assert!(
+                ENTER_KEY_HINTS.contains(&enter_key_hint(hint)),
+                "{hint:?} maps to {:?}, which is not an enterkeyhint",
+                enter_key_hint(hint)
+            );
+        }
+    }
 }

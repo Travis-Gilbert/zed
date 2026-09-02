@@ -1,4 +1,6 @@
-use crate::{App, Bounds, Context, Entity, InputHandler, Pixels, UTF16Selection, Window};
+use crate::{
+    App, Bounds, Context, Entity, InputHandler, Pixels, TextInputHints, UTF16Selection, Window,
+};
 use std::ops::Range;
 
 /// Implement this trait to allow views to handle textual input when implementing an editor, field, etc.
@@ -93,6 +95,15 @@ pub trait EntityInputHandler: 'static + Sized {
     fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
         true
     }
+
+    /// See [`InputHandler::text_input_hints`] for details
+    fn text_input_hints(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> TextInputHints {
+        TextInputHints::default()
+    }
 }
 
 /// The canonical implementation of [`crate::PlatformInputHandler`]. Call [`Window::handle_input`]
@@ -115,6 +126,11 @@ impl<V: 'static> ElementInputHandler<V> {
 }
 
 impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
+    fn text_input_hints(&mut self, window: &mut Window, cx: &mut App) -> TextInputHints {
+        self.view
+            .update(cx, |view, cx| view.text_input_hints(window, cx))
+    }
+
     fn selected_text_range(
         &mut self,
         ignore_disabled_input: bool,

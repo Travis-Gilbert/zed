@@ -16,11 +16,11 @@ use crate::{
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputStateChange,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
-    prelude::*, px, rems, size, transparent_black,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputHints,
+    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    point, prelude::*, px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -1170,13 +1170,15 @@ pub struct Window {
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
-    /// Whether the last drawn frame installed a text input handler.
+    /// The hints of the editable the last drawn frame focused, if any.
     ///
     /// A platform learns that an editable gained or lost focus only from this
     /// transition: `PlatformWindow::text_input_state_changed` has no other
     /// caller, and a platform that raises a software keyboard or sets an
-    /// `inputmode` needs the edge, not the level.
-    editable_focused: bool,
+    /// `inputmode` needs the edge, not the level. Hints rather than a bool
+    /// because moving straight from a search box to a number field is not a
+    /// focus change but *is* a keyboard change, and only the hints show it.
+    focused_text_input: Option<TextInputHints>,
     /// The caret rectangle last pushed to the platform, so the push happens on
     /// change rather than every frame.
     last_ime_bounds: Option<Bounds<Pixels>>,
@@ -1864,7 +1866,7 @@ impl Window {
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
-            editable_focused: false,
+            focused_text_input: None,
             last_ime_bounds: None,
             focus_enabled: true,
             focus_generation: 0,
@@ -2892,8 +2894,9 @@ impl Window {
         // first one at the window origin. Afterwards the application drives it
         // through `invalidate_character_coordinates`, so nothing here runs per
         // frame.
-        let editable_focused = installed.is_some();
+        let mut focused_text_input = None;
         if let Some(mut input_handler) = installed {
+            focused_text_input = Some(input_handler.text_input_hints(self, cx));
             // Where the caret is, so a platform that opens IME candidates puts
             // them on the caret rather than at the window origin. Pushed on
             // change, so a still caret costs one comparison a frame and a
@@ -2910,13 +2913,12 @@ impl Window {
         } else {
             self.last_ime_bounds = None;
         }
-        if editable_focused != self.editable_focused {
-            self.editable_focused = editable_focused;
+        if focused_text_input != self.focused_text_input {
+            self.focused_text_input = focused_text_input;
             self.platform_window
-                .text_input_state_changed(if editable_focused {
-                    TextInputStateChange::FocusGained
-                } else {
-                    TextInputStateChange::FocusLost
+                .text_input_state_changed(match focused_text_input {
+                    Some(hints) => TextInputStateChange::FocusGained(hints),
+                    None => TextInputStateChange::FocusLost,
                 });
         }
 

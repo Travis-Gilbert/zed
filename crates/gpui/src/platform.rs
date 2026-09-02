@@ -787,11 +787,76 @@ impl WindowInsets {
     }
 }
 
+/// What kind of text a focused editable expects.
+///
+/// A platform with a software keyboard picks a layout from this, and a browser
+/// maps it onto the `inputmode` attribute. Prose is the default because most
+/// editables are prose; a field only has to say so when it is not.
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Hash)]
+pub enum TextInputKind {
+    /// Ordinary prose.
+    #[default]
+    Text,
+    /// A search query.
+    Search,
+    /// Digits only, such as a one-time code.
+    Numeric,
+    /// A number, fractional part included.
+    Decimal,
+    /// A telephone number.
+    Telephone,
+    /// An email address.
+    Email,
+    /// A URL.
+    Url,
+}
+
+/// What the return key does in a focused editable.
+///
+/// This is a label on a key, not a binding: the platform draws it, and the
+/// application still decides what the key means.
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Hash)]
+pub enum EnterKeyHint {
+    /// Insert a newline, or nothing in particular.
+    #[default]
+    Enter,
+    /// Finish editing.
+    Done,
+    /// Navigate somewhere.
+    Go,
+    /// Move to the next field.
+    Next,
+    /// Move to the previous field.
+    Previous,
+    /// Run the search.
+    Search,
+    /// Send the message.
+    Send,
+}
+
+/// How a focused editable asks to be typed into.
+///
+/// One value rather than two arguments, because the two travel together: they
+/// are read at the same moment, from the same field, and a platform that acts
+/// on one always acts on the other.
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq, Hash)]
+pub struct TextInputHints {
+    /// The keyboard layout this field wants.
+    pub kind: TextInputKind,
+    /// The label on the return key.
+    pub enter_key: EnterKeyHint,
+}
+
 /// A change in the state of the focused text input.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum TextInputStateChange {
-    /// An editable element gained focus.
-    FocusGained,
+    /// An editable element gained focus, and asks to be typed into this way.
+    ///
+    /// Sent again without an intervening [`Self::FocusLost`] when focus moves
+    /// straight from one editable to another whose hints differ, because from
+    /// the platform's side that is the same event: the keyboard it should be
+    /// drawing has changed.
+    FocusGained(TextInputHints),
     /// The focused editable element lost focus.
     FocusLost,
     /// The selection or caret moved
@@ -1432,6 +1497,10 @@ impl PlatformInputHandler {
         Self { cx, handler }
     }
 
+    pub fn text_input_hints(&mut self, window: &mut Window, cx: &mut App) -> TextInputHints {
+        self.handler.text_input_hints(window, cx)
+    }
+
     pub fn selected_text_range(&mut self, ignore_disabled_input: bool) -> Option<UTF16Selection> {
         self.cx
             .update(|window, cx| {
@@ -1760,6 +1829,17 @@ pub trait InputHandler: 'static {
     /// Get the length of the document in UTF-16 characters, if known.
     fn text_length_utf16(&mut self, _window: &mut Window, _cx: &mut App) -> Option<usize> {
         None
+    }
+
+    /// How this editable asks to be typed into.
+    ///
+    /// The source for the hints carried by
+    /// [`TextInputStateChange::FocusGained`]. The default describes an
+    /// ordinary text field, which is what an editable is unless it says
+    /// otherwise, so a handler only implements this when it is something
+    /// else -- a number field, a search box, a one-time code.
+    fn text_input_hints(&mut self, _window: &mut Window, _cx: &mut App) -> TextInputHints {
+        TextInputHints::default()
     }
 
     /// Allows a given input context to opt into getting raw key repeats instead of
