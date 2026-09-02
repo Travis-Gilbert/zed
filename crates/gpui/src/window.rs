@@ -16,11 +16,11 @@ use crate::{
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
-    transparent_black,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputStateChange,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -1170,6 +1170,16 @@ pub struct Window {
     pub(crate) refreshing: bool,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
+    /// Whether the last drawn frame installed a text input handler.
+    ///
+    /// A platform learns that an editable gained or lost focus only from this
+    /// transition: `PlatformWindow::text_input_state_changed` has no other
+    /// caller, and a platform that raises a software keyboard or sets an
+    /// `inputmode` needs the edge, not the level.
+    editable_focused: bool,
+    /// The caret rectangle last pushed to the platform, so the push happens on
+    /// change rather than every frame.
+    last_ime_bounds: Option<Bounds<Pixels>>,
     focus_enabled: bool,
     /// Incremented every time focus moves. Used to invalidate a
     /// pending keyboard activation state when focus changes.
@@ -1854,6 +1864,8 @@ impl Window {
             refreshing: false,
             activation_observers: SubscriberSet::new(),
             focus: None,
+            editable_focused: false,
+            last_ime_bounds: None,
             focus_enabled: true,
             focus_generation: 0,
             pending_input: None,
@@ -2867,14 +2879,45 @@ impl Window {
         // paint_range indices remain valid for reuse_paint on the next frame.
         // Search backwards to find the last Some entry, since reuse_paint may
         // have copied None slots from the previous frame. (Fixes #50456)
-        if let Some(input_handler) = self
+        let installed = self
             .next_frame
             .input_handlers
             .iter_mut()
             .rev()
-            .find_map(|h| h.take())
-        {
+            .find_map(|h| h.take());
+        // Whether an editable is focused is exactly whether this frame asked
+        // for an input handler, and this is the only place that is known.
+        // Report the edge -- and on the way in, place the IME where the caret
+        // is, so a platform that opens a candidate window does not open the
+        // first one at the window origin. Afterwards the application drives it
+        // through `invalidate_character_coordinates`, so nothing here runs per
+        // frame.
+        let editable_focused = installed.is_some();
+        if let Some(mut input_handler) = installed {
+            // Where the caret is, so a platform that opens IME candidates puts
+            // them on the caret rather than at the window origin. Pushed on
+            // change, so a still caret costs one comparison a frame and a
+            // platform is never told the same rectangle twice.
+            // `invalidate_character_coordinates` remains the explicit nudge for
+            // a caller that moved the caret without redrawing.
+            if let Some(bounds) = input_handler.selected_bounds(self, cx)
+                && self.last_ime_bounds != Some(bounds)
+            {
+                self.last_ime_bounds = Some(bounds);
+                self.platform_window.update_ime_position(bounds);
+            }
             self.platform_window.set_input_handler(input_handler);
+        } else {
+            self.last_ime_bounds = None;
+        }
+        if editable_focused != self.editable_focused {
+            self.editable_focused = editable_focused;
+            self.platform_window
+                .text_input_state_changed(if editable_focused {
+                    TextInputStateChange::FocusGained
+                } else {
+                    TextInputStateChange::FocusLost
+                });
         }
 
         self.layout_engine.as_mut().unwrap().clear();
