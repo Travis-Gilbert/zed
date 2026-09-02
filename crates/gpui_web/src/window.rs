@@ -20,6 +20,10 @@ use gpui::{
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use wasm_bindgen::prelude::*;
 
+/// The id of the hidden textarea that carries browser text input, IME
+/// composition, and caret positioning for GPUI's web platform.
+pub const IME_INPUT_ELEMENT_ID: &str = "gpui-ime-input";
+
 #[derive(Default)]
 pub(crate) struct WebWindowCallbacks {
     pub(crate) request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,

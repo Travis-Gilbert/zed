@@ -20,7 +20,7 @@ use std::rc::Rc;
 use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration};
 use wasm_bindgen::JsCast;
 
-use crate::window::WebWindowInner;
+use crate::window::{IME_INPUT_ELEMENT_ID, WebWindowInner};
 
 /// UTF-16 code units of document text mirrored on each side of the
 /// selection.
@@ -105,6 +105,7 @@ impl ImeMirror {
             .map_err(|e| anyhow::anyhow!("Failed to create textarea element: {e:?}"))?
             .dyn_into()
             .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
+        element.set_id(IME_INPUT_ELEMENT_ID);
         let style = element.style();
         style.set_property("position", "fixed").ok();
         style.set_property("top", "0").ok();

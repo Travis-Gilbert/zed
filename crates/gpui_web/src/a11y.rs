@@ -603,7 +603,22 @@ fn write_node(element: &web_sys::Element, node: &Mirrored, scale_factor: f32) {
             set_style(
                 element,
                 &[
-                    ("position", "absolute"),
+                    // `fixed`, not `absolute`. AccessKit reports every node's
+                    // bounds in window coordinates, but the mirror nests its
+                    // elements the way the tree nests its nodes -- and an
+                    // absolutely positioned element resolves against its
+                    // nearest positioned ancestor, which here is its mirrored
+                    // parent. Absolute coordinates written into a nested
+                    // absolute element accumulate their ancestors' origins:
+                    // a tab inside a tablist at (249, 131) landed at (498,
+                    // 262), and a node deeper still landed further out again.
+                    // A fixed element resolves against the viewport whatever
+                    // it sits inside, which is the frame these coordinates are
+                    // already in -- the same frame the root's `inset: 0`
+                    // assumes. The rectangle matters: it is where a screen
+                    // reader draws its cursor and where a touch exploration
+                    // gesture decides it is.
+                    ("position", "fixed"),
                     ("left", &format!("{}px", bounds.x0 / scale)),
                     ("top", &format!("{}px", bounds.y0 / scale)),
                     ("width", &format!("{}px", (bounds.x1 - bounds.x0) / scale)),
