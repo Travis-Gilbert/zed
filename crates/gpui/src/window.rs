@@ -1174,6 +1174,9 @@ pub struct Window {
     /// input session can restart the IME connection).
     last_text_input_configuration: Option<TextInputConfiguration>,
     focused_text_input_active: bool,
+    /// The caret rectangle last pushed to the platform, so the push happens
+    /// on change rather than every frame.
+    last_ime_bounds: Option<Bounds<Pixels>>,
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
@@ -2001,6 +2004,7 @@ impl Window {
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
+            last_ime_bounds: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame_callbacks,
@@ -3085,9 +3089,20 @@ impl Window {
             .find_map(|h| h.take())
         {
             let accepts_text_input = input_handler.accepts_text_input(self, cx);
+            if accepts_text_input {
+                if let Some(bounds) = input_handler.selected_bounds(self, cx)
+                    && self.last_ime_bounds != Some(bounds)
+                {
+                    self.last_ime_bounds = Some(bounds);
+                    self.platform_window.update_ime_position(bounds);
+                }
+            } else {
+                self.last_ime_bounds = None;
+            }
             self.platform_window.set_input_handler(input_handler);
             accepts_text_input
         } else {
+            self.last_ime_bounds = None;
             false
         };
         self.apply_text_input_configuration(cx);
