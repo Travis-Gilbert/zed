@@ -25,4 +25,4 @@ pub use http_client::{FetchCredentials, FetchHttpClient};
 pub use keyboard::WebKeyboardLayout;
 pub use logging::init_logging;
 pub use platform::{WebPlatform, WebWindowError};
-pub use window::WebWindow;
+pub use window::{IME_INPUT_ELEMENT_ID, WebWindow};

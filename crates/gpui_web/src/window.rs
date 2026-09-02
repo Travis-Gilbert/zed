@@ -16,6 +16,15 @@ use gpui::{
 use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 use wasm_bindgen::prelude::*;
 
+/// The id of the hidden input that carries every text interaction on the web:
+/// keyboard entry, IME composition, and the caret position candidate windows
+/// open at.
+///
+/// It is exported because the element is a contract, not an implementation
+/// detail -- a host that wants to style it, an oracle that wants to assert the
+/// caret moved, and a test that wants to type into it all need to name it.
+pub const IME_INPUT_ELEMENT_ID: &str = "gpui-ime-input";
+
 #[derive(Default)]
 pub(crate) struct WebWindowCallbacks {
     pub(crate) request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
@@ -148,6 +157,12 @@ impl WebWindow {
             .map_err(|e| anyhow::anyhow!("Failed to create input element: {e:?}"))?
             .dyn_into()
             .map_err(|e| anyhow::anyhow!("Created element is not an input: {e:?}"))?;
+        // A stable id, because this element is the whole IME surface: it is
+        // where composition happens, where `inputmode` is set, and what
+        // `update_ime_position` moves to the caret. Without an id the only way
+        // to find it from outside is its position in the body, which is not a
+        // property anyone should have to rely on.
+        input_element.set_id(IME_INPUT_ELEMENT_ID);
         let input_style = input_element.style();
         input_style.set_property("position", "fixed").ok();
         input_style.set_property("top", "0").ok();
