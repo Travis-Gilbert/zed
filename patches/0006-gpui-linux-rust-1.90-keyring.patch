@@ -1,0 +1,67 @@
+From 85052cfdc2fc91550740a1c739ae223bc50ca8d7 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 3 Sep 2026 22:15:20 -0400
+Subject: [PATCH] fix(gpui_linux): keep keyring support on Rust 1.90
+
+---
+ Cargo.lock                   | 10 +++++-----
+ crates/gpui_linux/Cargo.toml |  2 +-
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index f9193983f8..60a8e041e7 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7793,7 +7793,7 @@ dependencies = [
+  "smallvec",
+  "uuid",
+  "windows 0.62.2",
+- "windows-core 0.62.2",
++ "windows-core 0.57.0",
+  "windows-numerics 0.3.1",
+  "windows-registry 0.6.1",
+  "zed-scap",
+@@ -8481,7 +8481,7 @@ dependencies = [
+  "js-sys",
+  "log",
+  "wasm-bindgen",
+- "windows-core 0.57.0",
++ "windows-core 0.62.2",
+ ]
+ 
+ [[package]]
+@@ -12145,9 +12145,9 @@ checksum = "a4895175b425cb1f87721b59f0f286c2092bd4af812243672510e1ac53e2e0ad"
+ 
+ [[package]]
+ name = "oo7"
+-version = "0.6.0"
++version = "0.6.0-alpha"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "78f2bfed90f1618b4b48dcad9307f25e14ae894e2949642c87c351601d62cebd"
++checksum = "dc26d063a0f3c0f47e393ea1649209aa96147ef435b8ca2752112d4ca10117c6"
+ dependencies = [
+  "aes",
+  "ashpd",
+@@ -12161,7 +12161,7 @@ dependencies = [
+  "endi",
+  "futures-lite 2.6.1",
+  "futures-util",
+- "getrandom 0.4.1",
++ "getrandom 0.3.4",
+  "hkdf",
+  "hmac",
+  "md-5",
+diff --git a/crates/gpui_linux/Cargo.toml b/crates/gpui_linux/Cargo.toml
+index 583ad38972..f2db7b72b3 100644
+--- a/crates/gpui_linux/Cargo.toml
++++ b/crates/gpui_linux/Cargo.toml
+@@ -71,7 +71,7 @@ url.workspace = true
+ uuid.workspace = true
+ 
+ # Always used
+-oo7 = { version = "0.6", default-features = false, features = [
++oo7 = { version = "=0.6.0-alpha", default-features = false, features = [
+     "async-std",
+     "native_crypto",
+ ] }
+

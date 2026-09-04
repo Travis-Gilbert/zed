@@ -3,3 +3,4 @@
 0003-gpui-web-accessible-value-mirror.patch
 0004-gpui-web-mirror-bounds-and-ime-id.patch
 0005-gpui-ime-focus-and-caret-seams.patch
+0006-gpui-linux-rust-1.90-keyring.patch
