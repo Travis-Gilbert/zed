@@ -1,0 +1,44 @@
+From 0a3e29a42a1646cb9f50df076e2aa6c9fda85868 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 3 Sep 2026 22:49:37 -0400
+Subject: [PATCH] fix(gpui): support Rust 1.90 action profiling
+
+---
+ crates/gpui/src/profiler/actions.rs | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/crates/gpui/src/profiler/actions.rs b/crates/gpui/src/profiler/actions.rs
+index a4892f8ac2..8a8259ee96 100644
+--- a/crates/gpui/src/profiler/actions.rs
++++ b/crates/gpui/src/profiler/actions.rs
+@@ -6,6 +6,11 @@ use scheduler::Instant;
+ #[cfg(feature = "profiler")]
+ use crate::action::Action;
+ 
++#[cfg(feature = "profiler")]
++#[cold]
++#[inline(never)]
++fn cold_path() {}
++
+ #[doc(hidden)]
+ #[derive(Clone)]
+ pub struct ActionStatistics {
+@@ -92,7 +97,7 @@ impl ActionStatistics {
+             // When ran sequentially self.running will always be Some. When ran
+             // concurrently that is no longer true. But that is fine, we do not
+             // need to track action timings in tests.
+-            std::hint::cold_path();
++            cold_path();
+             return;
+         };
+ 
+@@ -104,7 +109,7 @@ impl ActionStatistics {
+ 
+         let runtime = now.duration_since(started);
+         if runtime >= self.runtime_to_beat {
+-            std::hint::cold_path(); // most actions are not the worst, optimize for that
++            cold_path(); // most actions are not the worst, optimize for that
+ 
+             if self.longest_runtimes.is_full()
+                 && let Some(to_replace) = self
+
