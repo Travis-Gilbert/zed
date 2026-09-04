@@ -1,0 +1,90 @@
+From a12993ebbc6f47ff196f10c261fcf94b9fc40fb1 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 3 Sep 2026 22:36:12 -0400
+Subject: [PATCH] fix(gpui): keep profiling and text wrapping on Rust 1.90
+
+---
+ crates/gpui/src/profiler.rs                 | 12 ++++++++----
+ crates/gpui/src/text_system/line_wrapper.rs | 10 +++++++++-
+ 2 files changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/crates/gpui/src/profiler.rs b/crates/gpui/src/profiler.rs
+index 340f054b9c..5b18c2313f 100644
+--- a/crates/gpui/src/profiler.rs
++++ b/crates/gpui/src/profiler.rs
+@@ -29,6 +29,10 @@ use serde::{Deserialize, Serialize};
+ use crate::{Action, App, WindowId};
+ use crate::{SharedString, TasksIncluded};
+ 
++#[cold]
++#[inline(never)]
++fn cold_path() {}
++
+ #[cfg(feature = "profiler")]
+ #[doc(hidden)]
+ pub fn get_all_timings(included: gpui::TasksIncluded) -> Vec<gpui::ThreadTaskTimings> {
+@@ -470,7 +474,7 @@ impl TaskStatistics {
+     fn add_yield_timing(&mut self, task: TaskTiming) {
+         let yielded_after = task.poll_duration();
+         if yielded_after >= self.poll_time_to_beat {
+-            std::hint::cold_path(); // most tasks are not the worst, optimize for that
++            cold_path(); // most tasks are not the worst, optimize for that
+             let to_replace = self
+                 .longest_poll_times
+                 .iter()
+@@ -491,7 +495,7 @@ impl TaskStatistics {
+     fn add_runtime(&mut self, task: TaskTiming) {
+         let runtime = task.since_spawn();
+         if runtime >= self.runtime_to_beat {
+-            std::hint::cold_path(); // most tasks are not the worst, optimize for that
++            cold_path(); // most tasks are not the worst, optimize for that
+             let to_replace = self
+                 .longest_runtimes
+                 .iter()
+@@ -611,7 +615,7 @@ impl ThreadTimings {
+         self.stats.add_runtime(timing);
+ 
+         if trace_enabled() {
+-            std::hint::cold_path(); // optimize for when the profiling is off
++            cold_path(); // optimize for when the profiling is off
+             if self.timings.len() >= MAX_TASK_TIMINGS {
+                 self.timings.pop_front();
+             }
+@@ -1184,7 +1188,7 @@ pub fn record_frame_event(event: FrameEvent) {
+     if !trace_enabled() {
+         return;
+     }
+-    std::hint::cold_path(); // optimize for when profiling is off
++    cold_path(); // optimize for when profiling is off
+ 
+     let mut frames = FRAME_TIMINGS.lock();
+     if frames.timings.len() >= MAX_FRAME_TIMINGS {
+diff --git a/crates/gpui/src/text_system/line_wrapper.rs b/crates/gpui/src/text_system/line_wrapper.rs
+index 678e9e0f18..855367207a 100644
+--- a/crates/gpui/src/text_system/line_wrapper.rs
++++ b/crates/gpui/src/text_system/line_wrapper.rs
+@@ -281,7 +281,7 @@ impl LineWrapper {
+             let result = match truncate_from {
+                 TruncateFrom::Start => SharedString::from(format!(
+                     "{truncation_affix}{}",
+-                    &line[line.ceil_char_boundary(truncate_ix + 1)..]
++                    &line[ceil_char_boundary(&line, truncate_ix + 1)..]
+                 )),
+                 TruncateFrom::End => SharedString::from(format!(
+                     "{}{truncation_affix}",
+@@ -513,6 +513,14 @@ impl LineWrapper {
+     }
+ }
+ 
++fn ceil_char_boundary(text: &str, index: usize) -> usize {
++    let mut boundary = index.min(text.len());
++    while !text.is_char_boundary(boundary) {
++        boundary += 1;
++    }
++    boundary
++}
++
+ fn update_runs_after_truncation(
+     result: &str,
+     ellipsis: &str,
+

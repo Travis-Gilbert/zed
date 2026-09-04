@@ -13,6 +13,9 @@ The final patch keeps Linux keyring support on the API-equivalent
 release raised its MSRV to Rust 1.92 after the GPUI Kit 0.6 contract fixed the
 consumer toolchain at Rust 1.90. The following patch expresses the same MSRV
 boundary in `gpui_util` without the newer `slice::as_array` helper.
+The last MSRV patch retains the cold-branch optimization and Unicode-safe text
+truncation without the newer `std::hint::cold_path` and
+`str::ceil_char_boundary` helpers.
 
 Regenerate the files from the rebased commits with `git format-patch`, preserve
 their order in `series`, and run the patch-series workflow before moving a

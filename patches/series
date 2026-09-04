@@ -5,3 +5,4 @@
 0005-gpui-ime-focus-and-caret-seams.patch
 0006-gpui-linux-rust-1.90-keyring.patch
 0007-gpui-util-rust-1.90-slice-conversion.patch
+0008-gpui-rust-1.90-stdlib-compat.patch
