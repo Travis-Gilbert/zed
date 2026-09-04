@@ -6,6 +6,11 @@ use scheduler::Instant;
 #[cfg(feature = "profiler")]
 use crate::action::Action;
 
+#[cfg(feature = "profiler")]
+#[cold]
+#[inline(never)]
+fn cold_path() {}
+
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct ActionStatistics {
@@ -92,7 +97,7 @@ impl ActionStatistics {
             // When ran sequentially self.running will always be Some. When ran
             // concurrently that is no longer true. But that is fine, we do not
             // need to track action timings in tests.
-            std::hint::cold_path();
+            cold_path();
             return;
         };
 
@@ -104,7 +109,7 @@ impl ActionStatistics {
 
         let runtime = now.duration_since(started);
         if runtime >= self.runtime_to_beat {
-            std::hint::cold_path(); // most actions are not the worst, optimize for that
+            cold_path(); // most actions are not the worst, optimize for that
 
             if self.longest_runtimes.is_full()
                 && let Some(to_replace) = self
