@@ -550,10 +550,10 @@ impl std::hash::Hasher for TypeIdHasher {
     fn write(&mut self, bytes: &[u8]) {
         // TypeId should only hash its first 8 bytes
         if let Some(bytes) = bytes.get(..8) {
-            bytes
-                .as_array()
-                .map(|&array| self.value = u64::from_ne_bytes(array))
-                .unwrap_or_else(|| unreachable!("slice was sliced to 8 bytes"));
+            let array: [u8; 8] = bytes
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("slice was sliced to 8 bytes"));
+            self.value = u64::from_ne_bytes(array);
         } else {
             debug_panic!(
                 "expected a 64-bit value, did you use this hasher with something other than a TypeId?"
