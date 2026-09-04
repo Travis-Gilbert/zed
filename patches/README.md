@@ -11,7 +11,8 @@ Theorem web accessibility and IME seams that are not present at that base.
 The final patch keeps Linux keyring support on the API-equivalent
 `oo7 0.6.0-alpha` release, whose declared MSRV is Rust 1.86; the stable 0.6.0
 release raised its MSRV to Rust 1.92 after the GPUI Kit 0.6 contract fixed the
-consumer toolchain at Rust 1.90.
+consumer toolchain at Rust 1.90. The following patch expresses the same MSRV
+boundary in `gpui_util` without the newer `slice::as_array` helper.
 
 Regenerate the files from the rebased commits with `git format-patch`, preserve
 their order in `series`, and run the patch-series workflow before moving a

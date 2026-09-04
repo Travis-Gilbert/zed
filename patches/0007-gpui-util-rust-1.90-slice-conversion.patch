@@ -1,0 +1,29 @@
+From 9eb27d749cd7864c76586ae5a17570a2f6cf7053 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 3 Sep 2026 22:28:07 -0400
+Subject: [PATCH] fix(gpui_util): avoid post-1.90 slice helpers
+
+---
+ crates/gpui_util/src/lib.rs | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/crates/gpui_util/src/lib.rs b/crates/gpui_util/src/lib.rs
+index 109ef6f16b..909bbec060 100644
+--- a/crates/gpui_util/src/lib.rs
++++ b/crates/gpui_util/src/lib.rs
+@@ -550,10 +550,10 @@ impl std::hash::Hasher for TypeIdHasher {
+     fn write(&mut self, bytes: &[u8]) {
+         // TypeId should only hash its first 8 bytes
+         if let Some(bytes) = bytes.get(..8) {
+-            bytes
+-                .as_array()
+-                .map(|&array| self.value = u64::from_ne_bytes(array))
+-                .unwrap_or_else(|| unreachable!("slice was sliced to 8 bytes"));
++            let array: [u8; 8] = bytes
++                .try_into()
++                .unwrap_or_else(|_| unreachable!("slice was sliced to 8 bytes"));
++            self.value = u64::from_ne_bytes(array);
+         } else {
+             debug_panic!(
+                 "expected a 64-bit value, did you use this hasher with something other than a TypeId?"
+
