@@ -1,0 +1,2406 @@
+From 08940670d0c59674091e586cccbcd0380c5ae738 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 27 Aug 2026 17:33:42 -0400
+Subject: [PATCH 1/5] feat(gpui): add composited external GPU surfaces
+
+---
+ Cargo.lock                                    |   2 +
+ crates/gpui/Cargo.toml                        |  13 +-
+ .../gpui/EXTERNAL_GPU_SURFACE_PROVENANCE.md   |  28 +
+ .../gpui/examples/external_gpu_surface.html   |  42 ++
+ crates/gpui/examples/external_gpu_surface.rs  | 409 +++++++++++
+ crates/gpui/src/elements/surface.rs           |  75 +-
+ crates/gpui/src/external_gpu_surface.rs       | 665 ++++++++++++++++++
+ crates/gpui/src/gpui.rs                       |   3 +
+ crates/gpui/src/platform.rs                   |  20 +-
+ crates/gpui/src/scene.rs                      |  20 +-
+ crates/gpui/src/window.rs                     |  65 +-
+ crates/gpui_apple/src/metal_renderer.rs       |  23 +-
+ crates/gpui_macos/Cargo.toml                  |   2 +
+ crates/gpui_macos/src/gpui_macos.rs           |   6 +
+ crates/gpui_macos/src/platform.rs             |   2 +-
+ crates/gpui_macos/src/wgpu_renderer.rs        | 181 +++++
+ crates/gpui_macos/src/window.rs               |  80 ++-
+ crates/gpui_platform/Cargo.toml               |   1 +
+ crates/gpui_web/src/window.rs                 |  27 +-
+ crates/gpui_wgpu/src/shaders.wgsl             |  37 +-
+ crates/gpui_wgpu/src/wgpu_context.rs          |   6 +-
+ crates/gpui_wgpu/src/wgpu_renderer.rs         | 125 +++-
+ 22 files changed, 1739 insertions(+), 93 deletions(-)
+ create mode 100644 crates/gpui/EXTERNAL_GPU_SURFACE_PROVENANCE.md
+ create mode 100644 crates/gpui/examples/external_gpu_surface.html
+ create mode 100644 crates/gpui/examples/external_gpu_surface.rs
+ create mode 100644 crates/gpui/src/external_gpu_surface.rs
+ create mode 100644 crates/gpui_macos/src/wgpu_renderer.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 717553b405..fdbdfe63e0 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7549,6 +7549,7 @@ dependencies = [
+  "wasm-bindgen",
+  "web-sys",
+  "web-time",
++ "wgpu",
+  "windows 0.62.2",
+  "zed-font-kit",
+  "zed-scap",
+@@ -7645,6 +7646,7 @@ dependencies = [
+  "gpui",
+  "gpui_apple",
+  "gpui_util",
++ "gpui_wgpu",
+  "image",
+  "itertools 0.14.0",
+  "libc",
+diff --git a/crates/gpui/Cargo.toml b/crates/gpui/Cargo.toml
+index 336e3c0035..163618fdf6 100644
+--- a/crates/gpui/Cargo.toml
++++ b/crates/gpui/Cargo.toml
+@@ -108,6 +108,7 @@ uuid.workspace = true
+ web-time.workspace = true
+ heapless.workspace = true
+ ztracing.workspace = true
++wgpu.workspace = true
+
+ [target.'cfg(target_family = "wasm")'.dependencies]
+ getrandom = { version = "0.3.4", features = ["wasm_js"] }
+@@ -135,7 +136,13 @@ windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Powe
+ backtrace.workspace = true
+ collections = { workspace = true, features = ["test-support"] }
+ env_logger.workspace = true
+-gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
++gpui_platform = { workspace = true, features = [
++    "external-gpu-surface",
++    "font-kit",
++    "runtime_shaders",
++    "wayland",
++    "x11",
++] }
+ gpui_util = { workspace = true }
+ lyon = { version = "1.0", features = ["extra"] }
+ rand.workspace = true
+@@ -172,6 +179,10 @@ ignored-paths = ["src/_ownership_and_data_flow.rs"]
+ name = "hello_world"
+ path = "examples/hello_world.rs"
+
++[[example]]
++name = "external_gpu_surface"
++path = "examples/external_gpu_surface.rs"
++
+ [[example]]
+ name = "move_entity_between_windows"
+ path = "examples/move_entity_between_windows.rs"
+diff --git a/crates/gpui/EXTERNAL_GPU_SURFACE_PROVENANCE.md b/crates/gpui/EXTERNAL_GPU_SURFACE_PROVENANCE.md
+new file mode 100644
+index 0000000000..b1410354f7
+--- /dev/null
++++ b/crates/gpui/EXTERNAL_GPU_SURFACE_PROVENANCE.md
+@@ -0,0 +1,28 @@
++# External GPU surface provenance
++
++This implementation is based on Zed's GPUI source at commit
++`8b1497dbd22fb06f5838a7c0b84a1e54fafa71bc` and is maintained on the
++`theorem/external-gpu-surface` branch of Theorem's Zed fork.
++
++The focused external-surface seam adapts architectural ideas observed in
++[Far-Beyond-Pulsar/WGPUI](https://github.com/Far-Beyond-Pulsar/WGPUI) at commit
++`41674d05a93648f7830a30a967bcae859f524291`, licensed under Apache-2.0. The
++reference files were:
++
++- `src/platform/cross/surface_registry.rs`
++- `src/elements/wgpu_surface.rs`
++- `src/platform/cross/renderer.rs`
++- `src/platform/cross/shaders/surfaces.wgsl`
++- `examples/learn/wgpu_surface_stress.rs`
++
++The adapted concepts are a renderer-owned surface registry, a bounded
++three-texture producer/ready/display rotation, serialized producer/compositor
++submission, coalesced resize, and redraw invalidation on publication. The GPUI
++API, target-specific platform adapters, scene integration, error model, and
++implementation in this fork are a focused reimplementation for Theorem's
++SceneOS boundary; WGPUI is not vendored and its broader API is not reproduced.
++
++SceneOS remains outside GPUI. It consumes the narrow
++`ExternalGpuSurfaceHandle` contract and submits ordinary `wgpu` command buffers;
++GPUI remains responsible for layout, clipping, opacity, transformation, hit
++testing, compositor ordering, and teardown.
+diff --git a/crates/gpui/examples/external_gpu_surface.html b/crates/gpui/examples/external_gpu_surface.html
+new file mode 100644
+index 0000000000..6f1cddf439
+--- /dev/null
++++ b/crates/gpui/examples/external_gpu_surface.html
+@@ -0,0 +1,42 @@
++<!doctype html>
++<html lang="en">
++    <head>
++        <meta charset="utf-8" />
++        <meta
++            name="viewport"
++            content="width=device-width, height=device-height, initial-scale=1.0"
++        />
++        <link rel="icon" href="data:," />
++        <title>GPUI external GPU surface</title>
++        <style>
++            * {
++                box-sizing: border-box;
++                margin: 0;
++                padding: 0;
++            }
++
++            html,
++            body {
++                width: 100%;
++                height: 100%;
++                overflow: hidden;
++                background: #090b16;
++            }
++
++            canvas {
++                display: block;
++                width: 100%;
++                height: 100%;
++                outline: none;
++                touch-action: none;
++            }
++        </style>
++    </head>
++    <body>
++        <script type="module">
++            import initialize from "./external_gpu_surface.js";
++
++            await initialize();
++        </script>
++    </body>
++</html>
+diff --git a/crates/gpui/examples/external_gpu_surface.rs b/crates/gpui/examples/external_gpu_surface.rs
+new file mode 100644
+index 0000000000..a092b7f5cd
+--- /dev/null
++++ b/crates/gpui/examples/external_gpu_surface.rs
+@@ -0,0 +1,409 @@
++#![cfg_attr(target_family = "wasm", no_main)]
++
++use gpui::wgpu;
++use gpui::wgpu::util::DeviceExt;
++use gpui::{
++    AnyElement, App, Bounds, Context, ExternalGpuSurfaceError, ExternalGpuSurfaceHandle,
++    ExternalGpuSurfaceStatus, Render, SharedString, TransformationMatrix, Window, WindowBounds,
++    WindowOptions, div, external_gpu_surface, prelude::*, px, rgb, size,
++};
++use gpui_platform::application;
++use web_time::Instant;
++
++const TRIANGLE_SHADER: &str = r#"
++struct Uniforms {
++    angle: f32,
++    aspect: f32,
++    pulse: f32,
++    padding: f32,
++}
++
++@group(0) @binding(0) var<uniform> uniforms: Uniforms;
++
++struct VertexOutput {
++    @builtin(position) position: vec4<f32>,
++    @location(0) color: vec3<f32>,
++}
++
++@vertex
++fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
++    let positions = array(
++        vec2<f32>(0.0, 0.72),
++        vec2<f32>(-0.72, -0.62),
++        vec2<f32>(0.72, -0.62),
++    );
++    let colors = array(
++        vec3<f32>(0.22, 0.86, 1.0),
++        vec3<f32>(0.82, 0.34, 1.0),
++        vec3<f32>(1.0, 0.64, 0.24),
++    );
++    let rotation = mat2x2<f32>(
++        cos(uniforms.angle), -sin(uniforms.angle),
++        sin(uniforms.angle), cos(uniforms.angle),
++    );
++    var position = rotation * positions[vertex_index];
++    position.x = position.x / uniforms.aspect;
++
++    var output: VertexOutput;
++    output.position = vec4<f32>(position, 0.0, 1.0);
++    output.color = colors[vertex_index] * uniforms.pulse;
++    return output;
++}
++
++@fragment
++fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
++    return vec4<f32>(input.color, 1.0);
++}
++"#;
++
++struct TriangleGpu {
++    surface: ExternalGpuSurfaceHandle,
++    pipeline: wgpu::RenderPipeline,
++    uniform: wgpu::Buffer,
++    uniform_bind_group: wgpu::BindGroup,
++}
++
++impl TriangleGpu {
++    fn new(surface: ExternalGpuSurfaceHandle) -> Self {
++        let device = surface.device();
++        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++            label: Some("external_gpu_surface_triangle_shader"),
++            source: wgpu::ShaderSource::Wgsl(TRIANGLE_SHADER.into()),
++        });
++        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
++            label: Some("external_gpu_surface_triangle_uniform"),
++            contents: &uniform_bytes([0.0, 1.0, 1.0, 0.0]),
++            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
++        });
++        let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: Some("external_gpu_surface_triangle_uniform_layout"),
++            entries: &[wgpu::BindGroupLayoutEntry {
++                binding: 0,
++                visibility: wgpu::ShaderStages::VERTEX,
++                ty: wgpu::BindingType::Buffer {
++                    ty: wgpu::BufferBindingType::Uniform,
++                    has_dynamic_offset: false,
++                    min_binding_size: None,
++                },
++                count: None,
++            }],
++        });
++        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++            label: Some("external_gpu_surface_triangle_uniform_bind_group"),
++            layout: &uniform_layout,
++            entries: &[wgpu::BindGroupEntry {
++                binding: 0,
++                resource: uniform.as_entire_binding(),
++            }],
++        });
++        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: Some("external_gpu_surface_triangle_pipeline_layout"),
++            bind_group_layouts: &[Some(&uniform_layout)],
++            immediate_size: 0,
++        });
++        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++            label: Some("external_gpu_surface_triangle_pipeline"),
++            layout: Some(&pipeline_layout),
++            vertex: wgpu::VertexState {
++                module: &shader,
++                entry_point: Some("vertex_main"),
++                buffers: &[],
++                compilation_options: wgpu::PipelineCompilationOptions::default(),
++            },
++            fragment: Some(wgpu::FragmentState {
++                module: &shader,
++                entry_point: Some("fragment_main"),
++                targets: &[Some(wgpu::ColorTargetState {
++                    format: surface.format(),
++                    blend: Some(wgpu::BlendState::REPLACE),
++                    write_mask: wgpu::ColorWrites::ALL,
++                })],
++                compilation_options: wgpu::PipelineCompilationOptions::default(),
++            }),
++            primitive: wgpu::PrimitiveState::default(),
++            depth_stencil: None,
++            multisample: wgpu::MultisampleState::default(),
++            multiview_mask: None,
++            cache: None,
++        });
++
++        Self {
++            surface,
++            pipeline,
++            uniform,
++            uniform_bind_group,
++        }
++    }
++
++    fn render(&self, elapsed_seconds: f32) -> Result<bool, ExternalGpuSurfaceError> {
++        if self.surface.has_unconsumed_frame()? {
++            return Ok(false);
++        }
++
++        let (width, height) = self.surface.size()?;
++        let angle = elapsed_seconds * 0.72;
++        let aspect = width as f32 / height.max(1) as f32;
++        let pulse = 0.82 + 0.18 * (elapsed_seconds * 1.7).sin();
++        self.surface.queue().write_buffer(
++            &self.uniform,
++            0,
++            &uniform_bytes([angle, aspect, pulse, 0.0]),
++        );
++
++        let mut encoder =
++            self.surface
++                .device()
++                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
++                    label: Some("external_gpu_surface_triangle_encoder"),
++                });
++        let frame = self.surface.acquire_frame()?;
++        {
++            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                label: Some("external_gpu_surface_triangle_pass"),
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: frame.view(),
++                    resolve_target: None,
++                    ops: wgpu::Operations {
++                        load: wgpu::LoadOp::Clear(wgpu::Color {
++                            r: 0.025,
++                            g: 0.035,
++                            b: 0.075,
++                            a: 1.0,
++                        }),
++                        store: wgpu::StoreOp::Store,
++                    },
++                    depth_slice: None,
++                })],
++                depth_stencil_attachment: None,
++                ..Default::default()
++            });
++            pass.set_pipeline(&self.pipeline);
++            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
++            pass.draw(0..3, 0..1);
++        }
++        frame.submit_and_present([encoder.finish()])?;
++        Ok(true)
++    }
++}
++
++struct ExternalSurfaceDemo {
++    gpu: Option<TriangleGpu>,
++    error: Option<SharedString>,
++    started_at: Instant,
++    paused: bool,
++    translucent: bool,
++    submitted_frames: u64,
++    last_title_state: Option<(bool, ExternalGpuSurfaceStatus, u64)>,
++}
++
++impl ExternalSurfaceDemo {
++    fn new(window: &mut Window) -> Self {
++        let (gpu, error) =
++            match window.create_external_gpu_surface(960, 540, wgpu::TextureFormat::Rgba8UnormSrgb)
++            {
++                Ok(surface) => (Some(TriangleGpu::new(surface)), None),
++                Err(error) => (None, Some(error.to_string().into())),
++            };
++        Self {
++            gpu,
++            error,
++            started_at: Instant::now(),
++            paused: false,
++            translucent: false,
++            submitted_frames: 0,
++            last_title_state: None,
++        }
++    }
++
++    fn toggle(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
++        self.paused = !self.paused;
++        self.translucent = !self.translucent;
++        cx.notify();
++    }
++}
++
++impl Render for ExternalSurfaceDemo {
++    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        if !self.paused {
++            if let Some(gpu) = &self.gpu {
++                match gpu.render(self.started_at.elapsed().as_secs_f32()) {
++                    Ok(true) => self.submitted_frames += 1,
++                    Ok(false) => {}
++                    Err(error) => {
++                        self.error = Some(error.to_string().into());
++                    }
++                }
++            }
++            window.request_animation_frame();
++        }
++
++        let status = self
++            .gpu
++            .as_ref()
++            .map_or(ExternalGpuSurfaceStatus::Closed, |gpu| gpu.surface.status());
++        let texture_bytes = self
++            .gpu
++            .as_ref()
++            .and_then(|gpu| gpu.surface.allocated_texture_bytes().ok())
++            .unwrap_or(0);
++        let title_state = (self.paused, status, self.submitted_frames / 60);
++        if self.last_title_state != Some(title_state) {
++            let activity = if self.paused { "paused" } else { "live" };
++            window.set_window_title(&format!(
++                "GPUI external GPU surface - {activity} - {status:?} - {} frames",
++                self.submitted_frames
++            ));
++            self.last_title_state = Some(title_state);
++        }
++        let surface: AnyElement = if let Some(gpu) = &self.gpu {
++            external_gpu_surface(gpu.surface.clone())
++                .with_transformation(TransformationMatrix {
++                    rotation_scale: [[0.985, 0.0], [0.0, 0.985]],
++                    translation: [4.0, 3.0],
++                })
++                .size_full()
++                .opacity(if self.translucent { 0.62 } else { 1.0 })
++                .into_any_element()
++        } else {
++            div()
++                .size_full()
++                .flex()
++                .items_center()
++                .justify_center()
++                .text_color(rgb(0xff8f8f))
++                .child(
++                    self.error
++                        .clone()
++                        .unwrap_or_else(|| "external GPU surface unavailable".into()),
++                )
++                .into_any_element()
++        };
++
++        div()
++            .size_full()
++            .flex()
++            .flex_col()
++            .gap_4()
++            .p_6()
++            .bg(rgb(0x090b16))
++            .text_color(rgb(0xf2f5ff))
++            .child(
++                div()
++                    .flex()
++                    .justify_between()
++                    .items_center()
++                    .child(
++                        div()
++                            .flex()
++                            .flex_col()
++                            .child(div().text_2xl().child("GPUI external GPU surface"))
++                            .child(
++                                div().text_sm().text_color(rgb(0x9ba7c7)).child(
++                                    "One wgpu texture, composed as an ordinary GPUI element",
++                                ),
++                            ),
++                    )
++                    .child(div().text_sm().child(format!(
++                        "status: {status:?} | frames: {}",
++                        self.submitted_frames
++                    ))),
++            )
++            .child(
++                div()
++                    .id("external-surface-hitbox")
++                    .relative()
++                    .flex_1()
++                    .min_h(px(320.0))
++                    .rounded_xl()
++                    .overflow_hidden()
++                    .border_1()
++                    .border_color(rgb(0x53618c))
++                    .on_click(cx.listener(Self::toggle))
++                    .child(div().absolute().inset_0().bg(rgb(0x231a3d)))
++                    .child(surface)
++                    .child(
++                        div()
++                            .absolute()
++                            .top_4()
++                            .left_4()
++                            .px_3()
++                            .py_2()
++                            .rounded_md()
++                            .bg(rgb(0x171c31))
++                            .text_sm()
++                            .child(if self.paused {
++                                "Paused; click to resume"
++                            } else {
++                                "Live; click to pause and test opacity"
++                            }),
++                    )
++                    .child(
++                        div()
++                            .absolute()
++                            .bottom_4()
++                            .right_4()
++                            .text_sm()
++                            .text_color(rgb(0xbac5e8))
++                            .child(format!("bounded texture bytes: {texture_bytes}")),
++                    ),
++            )
++            .child(
++                div()
++                    .text_sm()
++                    .text_color(rgb(0x9ba7c7))
++                    .child("Resize the window to exercise coalesced device-pixel allocation."),
++            )
++    }
++}
++
++fn uniform_bytes(values: [f32; 4]) -> [u8; 16] {
++    let mut bytes = [0; 16];
++    for (destination, value) in bytes.chunks_exact_mut(4).zip(values) {
++        destination.copy_from_slice(&value.to_ne_bytes());
++    }
++    bytes
++}
++
++fn launch(cx: &mut App) {
++    let bounds = Bounds::centered(None, size(px(960.0), px(680.0)), cx);
++    cx.open_window(
++        WindowOptions {
++            window_bounds: Some(WindowBounds::Windowed(bounds)),
++            ..Default::default()
++        },
++        |window, cx| cx.new(|_| ExternalSurfaceDemo::new(window)),
++    )
++    .expect("failed to open external GPU surface example window");
++    cx.activate(true);
++}
++
++#[cfg(not(target_family = "wasm"))]
++fn run_example() {
++    application().run(launch);
++}
++
++#[cfg(target_family = "wasm")]
++thread_local! {
++    static APPLICATION: std::cell::RefCell<Option<gpui::ApplicationHandle>> = const {
++        std::cell::RefCell::new(None)
++    };
++}
++
++#[cfg(target_family = "wasm")]
++fn run_example() {
++    let application = application().run_embedded(launch);
++    APPLICATION.with(|slot| slot.replace(Some(application)));
++}
++
++#[cfg(not(target_family = "wasm"))]
++fn main() {
++    env_logger::init();
++    run_example();
++}
++
++#[cfg(target_family = "wasm")]
++#[wasm_bindgen::prelude::wasm_bindgen(start)]
++pub fn start() {
++    gpui_platform::web_init();
++    run_example();
++}
+diff --git a/crates/gpui/src/elements/surface.rs b/crates/gpui/src/elements/surface.rs
+index ac1c247b47..afc42d6c2e 100644
+--- a/crates/gpui/src/elements/surface.rs
++++ b/crates/gpui/src/elements/surface.rs
+@@ -1,6 +1,7 @@
+ use crate::{
+-    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+-    ObjectFit, Pixels, Style, StyleRefinement, Styled, Window,
++    App, Bounds, Element, ElementId, ExternalGpuSurfaceHandle, GlobalElementId, InspectorElementId,
++    IntoElement, LayoutId, ObjectFit, Pixels, Style, StyleRefinement, Styled, TransformationMatrix,
++    Window,
+ };
+ #[cfg(target_os = "macos")]
+ use core_video::pixel_buffer::CVPixelBuffer;
+@@ -12,6 +13,8 @@ pub enum SurfaceSource {
+     /// A macOS image buffer from CoreVideo
+     #[cfg(target_os = "macos")]
+     Surface(CVPixelBuffer),
++    /// A texture surface rendered by an external producer on GPUI's device.
++    ExternalGpu(ExternalGpuSurfaceHandle),
+ }
+
+ #[cfg(target_os = "macos")]
+@@ -25,6 +28,7 @@ impl From<CVPixelBuffer> for SurfaceSource {
+ pub struct Surface {
+     source: SurfaceSource,
+     object_fit: ObjectFit,
++    transformation: TransformationMatrix,
+     style: StyleRefinement,
+ }
+
+@@ -34,6 +38,17 @@ pub fn surface(source: impl Into<SurfaceSource>) -> Surface {
+     Surface {
+         source: source.into(),
+         object_fit: ObjectFit::Contain,
++        transformation: TransformationMatrix::unit(),
++        style: Default::default(),
++    }
++}
++
++/// Create an element that composites an external GPU surface inside GPUI.
++pub fn external_gpu_surface(source: ExternalGpuSurfaceHandle) -> Surface {
++    Surface {
++        source: SurfaceSource::ExternalGpu(source),
++        object_fit: ObjectFit::Fill,
++        transformation: TransformationMatrix::unit(),
+         style: Default::default(),
+     }
+ }
+@@ -44,10 +59,16 @@ impl Surface {
+         self.object_fit = object_fit;
+         self
+     }
++
++    /// Apply a scene-space transform while retaining the GPUI content mask.
++    pub fn with_transformation(mut self, transformation: TransformationMatrix) -> Self {
++        self.transformation = transformation;
++        self
++    }
+ }
+
+ impl Element for Surface {
+-    type RequestLayoutState = ();
++    type RequestLayoutState = Style;
+     type PrepaintState = ();
+
+     fn id(&self) -> Option<ElementId> {
+@@ -67,19 +88,32 @@ impl Element for Surface {
+     ) -> (LayoutId, Self::RequestLayoutState) {
+         let mut style = Style::default();
+         style.refine(&self.style);
+-        let layout_id = window.request_layout(style, [], cx);
+-        (layout_id, ())
++        let layout_id = window.request_layout(style.clone(), [], cx);
++        (layout_id, style)
+     }
+
+     fn prepaint(
+         &mut self,
+         _global_id: Option<&GlobalElementId>,
+         _inspector_id: Option<&InspectorElementId>,
+-        _bounds: Bounds<Pixels>,
++        bounds: Bounds<Pixels>,
+         _request_layout: &mut Self::RequestLayoutState,
+-        _window: &mut Window,
++        window: &mut Window,
+         _cx: &mut App,
+     ) -> Self::PrepaintState {
++        let surface = match &self.source {
++            SurfaceSource::ExternalGpu(surface) => Some(surface),
++            #[cfg(target_os = "macos")]
++            SurfaceSource::Surface(_) => None,
++        };
++        if let Some(surface) = surface {
++            let scale_factor = window.scale_factor();
++            let width = (bounds.size.width.0 * scale_factor).round().max(1.0) as u32;
++            let height = (bounds.size.height.0 * scale_factor).round().max(1.0) as u32;
++            if surface.size().ok() != Some((width, height)) {
++                surface.request_resize(width, height);
++            }
++        }
+     }
+
+     fn paint(
+@@ -87,22 +121,25 @@ impl Element for Surface {
+         _global_id: Option<&GlobalElementId>,
+         _inspector_id: Option<&InspectorElementId>,
+         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] bounds: Bounds<Pixels>,
+-        _: &mut Self::RequestLayoutState,
++        style: &mut Self::RequestLayoutState,
+         _: &mut Self::PrepaintState,
+         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] window: &mut Window,
+-        _: &mut App,
++        cx: &mut App,
+     ) {
+-        match &self.source {
+-            #[cfg(target_os = "macos")]
+-            SurfaceSource::Surface(surface) => {
+-                let size = crate::size(surface.get_width().into(), surface.get_height().into());
+-                let new_bounds = self.object_fit.get_bounds(bounds, size);
+-                // TODO: Add support for corner_radii
+-                window.paint_surface(new_bounds, surface.clone());
++        style.paint(bounds, window, cx, |window, _cx| {
++            match &self.source {
++                #[cfg(target_os = "macos")]
++                SurfaceSource::Surface(surface) => {
++                    let size = crate::size(surface.get_width().into(), surface.get_height().into());
++                    let new_bounds = self.object_fit.get_bounds(bounds, size);
++                    // TODO: Add support for corner_radii
++                    window.paint_surface(new_bounds, surface.clone());
++                }
++                SurfaceSource::ExternalGpu(surface) => {
++                    window.paint_external_gpu_surface(bounds, surface, self.transformation);
++                }
+             }
+-            #[allow(unreachable_patterns)]
+-            _ => {}
+-        }
++        });
+     }
+ }
+
+diff --git a/crates/gpui/src/external_gpu_surface.rs b/crates/gpui/src/external_gpu_surface.rs
+new file mode 100644
+index 0000000000..4f81aed499
+--- /dev/null
++++ b/crates/gpui/src/external_gpu_surface.rs
+@@ -0,0 +1,665 @@
++use parking_lot::{Mutex, MutexGuard};
++use std::{
++    collections::HashMap,
++    fmt,
++    sync::{
++        Arc,
++        atomic::{AtomicBool, AtomicU64, Ordering},
++    },
++};
++
++#[cfg(target_family = "wasm")]
++use std::rc::Rc;
++
++/// An error returned by GPUI's external GPU surface seam.
++#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
++pub enum ExternalGpuSurfaceError {
++    /// The active platform renderer cannot composite external GPU textures.
++    #[error("the active GPUI platform does not support external GPU surfaces")]
++    Unsupported,
++    /// The requested texture format is not a supported color surface format.
++    #[error("texture format {0:?} is not supported for an external GPU surface")]
++    UnsupportedFormat(wgpu::TextureFormat),
++    /// The renderer's device was lost. Create a new surface after renderer recovery.
++    #[error("the external GPU surface device was lost")]
++    DeviceLost,
++    /// The surface was removed from its compositor registry.
++    #[error("the external GPU surface is no longer registered")]
++    Closed,
++}
++
++/// The terminal-aware state of an external GPU surface.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ExternalGpuSurfaceStatus {
++    /// The surface can acquire, render, and present frames.
++    Ready,
++    /// The creating device was lost; this handle cannot be recovered in place.
++    DeviceLost,
++    /// The compositor no longer owns this surface.
++    Closed,
++}
++
++/// Opaque identity for an external GPU surface in a compositor registry.
++#[doc(hidden)]
++#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
++pub struct ExternalGpuSurfaceId(u64);
++
++#[cfg(not(target_family = "wasm"))]
++#[doc(hidden)]
++pub type ExternalGpuSurfaceInvalidator = Arc<dyn Fn() + Send + Sync>;
++
++#[cfg(target_family = "wasm")]
++#[doc(hidden)]
++pub type ExternalGpuSurfaceInvalidator = Rc<dyn Fn()>;
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++struct BufferIndices {
++    rendering: usize,
++    ready: usize,
++    display: usize,
++}
++
++impl Default for BufferIndices {
++    fn default() -> Self {
++        Self {
++            rendering: 0,
++            ready: 1,
++            display: 2,
++        }
++    }
++}
++
++impl BufferIndices {
++    fn publish(&mut self) -> usize {
++        let published = self.rendering;
++        std::mem::swap(&mut self.rendering, &mut self.ready);
++        published
++    }
++
++    fn promote(&mut self) {
++        std::mem::swap(&mut self.ready, &mut self.display);
++    }
++
++    #[cfg(test)]
++    fn are_distinct(self) -> bool {
++        self.rendering != self.ready && self.ready != self.display && self.display != self.rendering
++    }
++}
++
++struct TripleBuffer {
++    textures: [wgpu::Texture; 3],
++    views: [wgpu::TextureView; 3],
++    indices: BufferIndices,
++    submission_indices: [Option<wgpu::SubmissionIndex>; 3],
++    frame_generation: u64,
++    composited_generation: u64,
++    redraw_pending: bool,
++    width: u32,
++    height: u32,
++    format: wgpu::TextureFormat,
++}
++
++impl TripleBuffer {
++    fn new(
++        device: &wgpu::Device,
++        width: u32,
++        height: u32,
++        format: wgpu::TextureFormat,
++    ) -> Result<Self, ExternalGpuSurfaceError> {
++        if !matches!(
++            format,
++            wgpu::TextureFormat::Rgba8Unorm
++                | wgpu::TextureFormat::Rgba8UnormSrgb
++                | wgpu::TextureFormat::Bgra8Unorm
++                | wgpu::TextureFormat::Bgra8UnormSrgb
++        ) {
++            return Err(ExternalGpuSurfaceError::UnsupportedFormat(format));
++        }
++
++        let width = width.max(1);
++        let height = height.max(1);
++        let create_texture = |label| {
++            device.create_texture(&wgpu::TextureDescriptor {
++                label: Some(label),
++                size: wgpu::Extent3d {
++                    width,
++                    height,
++                    depth_or_array_layers: 1,
++                },
++                mip_level_count: 1,
++                sample_count: 1,
++                dimension: wgpu::TextureDimension::D2,
++                format,
++                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
++                    | wgpu::TextureUsages::TEXTURE_BINDING
++                    | wgpu::TextureUsages::COPY_DST,
++                view_formats: &[],
++            })
++        };
++
++        let textures = [
++            create_texture("gpui_external_surface_0"),
++            create_texture("gpui_external_surface_1"),
++            create_texture("gpui_external_surface_2"),
++        ];
++        let views = textures
++            .each_ref()
++            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
++
++        Ok(Self {
++            textures,
++            views,
++            indices: BufferIndices::default(),
++            submission_indices: [None, None, None],
++            frame_generation: 0,
++            composited_generation: 0,
++            redraw_pending: false,
++            width,
++            height,
++            format,
++        })
++    }
++
++    fn allocated_bytes(&self) -> u64 {
++        let bytes_per_texel = u64::from(self.format.block_copy_size(None).unwrap_or(0));
++        u64::from(self.width)
++            .saturating_mul(u64::from(self.height))
++            .saturating_mul(bytes_per_texel)
++            .saturating_mul(self.textures.len() as u64)
++    }
++}
++
++/// The compositor-owned registry behind [`ExternalGpuSurfaceHandle`].
++///
++/// This type is public only so platform renderer crates can share it with `gpui`.
++#[doc(hidden)]
++pub struct ExternalGpuSurfaceRegistry {
++    surfaces: Mutex<HashMap<ExternalGpuSurfaceId, TripleBuffer>>,
++    next_id: AtomicU64,
++    submission_gate: Mutex<()>,
++}
++
++impl Default for ExternalGpuSurfaceRegistry {
++    fn default() -> Self {
++        Self {
++            surfaces: Mutex::new(HashMap::new()),
++            next_id: AtomicU64::new(1),
++            submission_gate: Mutex::new(()),
++        }
++    }
++}
++
++impl ExternalGpuSurfaceRegistry {
++    /// Create an empty registry.
++    #[doc(hidden)]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Serialize compositor submission with producer submission and resize.
++    #[doc(hidden)]
++    pub fn lock_submission(&self) -> MutexGuard<'_, ()> {
++        self.submission_gate.lock()
++    }
++
++    /// Allocate exactly three textures and register them as one surface.
++    #[doc(hidden)]
++    pub fn register(
++        &self,
++        device: &wgpu::Device,
++        width: u32,
++        height: u32,
++        format: wgpu::TextureFormat,
++    ) -> Result<ExternalGpuSurfaceId, ExternalGpuSurfaceError> {
++        let id = ExternalGpuSurfaceId(self.next_id.fetch_add(1, Ordering::Relaxed));
++        let triple_buffer = TripleBuffer::new(device, width, height, format)?;
++        self.surfaces.lock().insert(id, triple_buffer);
++        Ok(id)
++    }
++
++    fn remove(&self, id: ExternalGpuSurfaceId) {
++        self.surfaces.lock().remove(&id);
++    }
++
++    fn contains(&self, id: ExternalGpuSurfaceId) -> bool {
++        self.surfaces.lock().contains_key(&id)
++    }
++
++    fn back_view_with_size(
++        &self,
++        id: ExternalGpuSurfaceId,
++    ) -> Option<(wgpu::TextureView, (u32, u32))> {
++        self.surfaces.lock().get(&id).map(|surface| {
++            (
++                surface.views[surface.indices.rendering].clone(),
++                (surface.width, surface.height),
++            )
++        })
++    }
++
++    fn publish(
++        &self,
++        id: ExternalGpuSurfaceId,
++        submission_index: wgpu::SubmissionIndex,
++    ) -> Option<bool> {
++        let mut surfaces = self.surfaces.lock();
++        let Some(surface) = surfaces.get_mut(&id) else {
++            return None;
++        };
++        let published = surface.indices.publish();
++        surface.submission_indices[published] = Some(submission_index);
++        surface.frame_generation = surface.frame_generation.wrapping_add(1);
++        let should_invalidate = !surface.redraw_pending;
++        surface.redraw_pending = true;
++        Some(should_invalidate)
++    }
++
++    /// Promote the newest producer frame and return the stable display view.
++    #[doc(hidden)]
++    pub fn promote_and_front_view(&self, id: ExternalGpuSurfaceId) -> Option<wgpu::TextureView> {
++        let mut surfaces = self.surfaces.lock();
++        let surface = surfaces.get_mut(&id)?;
++        if surface.frame_generation != surface.composited_generation {
++            surface.indices.promote();
++            surface.composited_generation = surface.frame_generation;
++        }
++        surface.redraw_pending = false;
++        Some(surface.views[surface.indices.display].clone())
++    }
++
++    fn resize(
++        &self,
++        device: &wgpu::Device,
++        id: ExternalGpuSurfaceId,
++        width: u32,
++        height: u32,
++    ) -> Result<(u32, u32), ExternalGpuSurfaceError> {
++        let mut surfaces = self.surfaces.lock();
++        let surface = surfaces
++            .get_mut(&id)
++            .ok_or(ExternalGpuSurfaceError::Closed)?;
++        let width = width.max(1);
++        let height = height.max(1);
++        if (surface.width, surface.height) == (width, height) {
++            return Ok((width, height));
++        }
++        device
++            .poll(wgpu::PollType::Wait {
++                submission_index: None,
++                timeout: None,
++            })
++            .map_err(|_| ExternalGpuSurfaceError::DeviceLost)?;
++        *surface = TripleBuffer::new(device, width, height, surface.format)?;
++        Ok((width, height))
++    }
++
++    fn size(&self, id: ExternalGpuSurfaceId) -> Option<(u32, u32)> {
++        self.surfaces
++            .lock()
++            .get(&id)
++            .map(|surface| (surface.width, surface.height))
++    }
++
++    fn allocated_bytes(&self, id: ExternalGpuSurfaceId) -> Option<u64> {
++        self.surfaces
++            .lock()
++            .get(&id)
++            .map(TripleBuffer::allocated_bytes)
++    }
++
++    fn has_unconsumed_frame(&self, id: ExternalGpuSurfaceId) -> Option<bool> {
++        self.surfaces
++            .lock()
++            .get(&id)
++            .map(|surface| surface.frame_generation != surface.composited_generation)
++    }
++}
++
++struct ExternalGpuSurfaceInner {
++    id: ExternalGpuSurfaceId,
++    registry: Arc<ExternalGpuSurfaceRegistry>,
++    device: Arc<wgpu::Device>,
++    queue: Arc<wgpu::Queue>,
++    format: wgpu::TextureFormat,
++    pending_size: Mutex<Option<(u32, u32)>>,
++    device_lost: Arc<AtomicBool>,
++    invalidator: ExternalGpuSurfaceInvalidator,
++}
++
++impl Drop for ExternalGpuSurfaceInner {
++    fn drop(&mut self) {
++        let _submission_guard = self.registry.lock_submission();
++        self.registry.remove(self.id);
++    }
++}
++
++/// A cloneable handle to a bounded, compositor-owned GPU texture surface.
++///
++/// Acquire a frame with [`Self::acquire_frame`], encode commands against its
++/// texture view, and finish with [`ExternalGpuSurfaceFrame::submit_and_present`].
++/// GPUI then samples the newest completed slot as an ordinary scene primitive.
++#[derive(Clone)]
++pub struct ExternalGpuSurfaceHandle {
++    inner: Arc<ExternalGpuSurfaceInner>,
++}
++
++impl ExternalGpuSurfaceHandle {
++    /// Construct a handle from a platform renderer's shared registry.
++    #[doc(hidden)]
++    #[allow(clippy::too_many_arguments)]
++    pub fn new(
++        registry: Arc<ExternalGpuSurfaceRegistry>,
++        device: Arc<wgpu::Device>,
++        queue: Arc<wgpu::Queue>,
++        width: u32,
++        height: u32,
++        format: wgpu::TextureFormat,
++        device_lost: Arc<AtomicBool>,
++        invalidator: ExternalGpuSurfaceInvalidator,
++    ) -> Result<Self, ExternalGpuSurfaceError> {
++        let id = {
++            let _submission_guard = registry.lock_submission();
++            registry.register(&device, width, height, format)?
++        };
++        Ok(Self {
++            inner: Arc::new(ExternalGpuSurfaceInner {
++                id,
++                registry,
++                device,
++                queue,
++                format,
++                pending_size: Mutex::new(None),
++                device_lost,
++                invalidator,
++            }),
++        })
++    }
++
++    /// Return the renderer-owned device used by both producer and compositor.
++    pub fn device(&self) -> &wgpu::Device {
++        &self.inner.device
++    }
++
++    /// Return the renderer-owned queue used by both producer and compositor.
++    pub fn queue(&self) -> &wgpu::Queue {
++        &self.inner.queue
++    }
++
++    /// Return the surface texture format.
++    pub fn format(&self) -> wgpu::TextureFormat {
++        self.inner.format
++    }
++
++    /// Return the currently committed size in device pixels.
++    pub fn size(&self) -> Result<(u32, u32), ExternalGpuSurfaceError> {
++        self.inner
++            .registry
++            .size(self.inner.id)
++            .ok_or(ExternalGpuSurfaceError::Closed)
++    }
++
++    /// Coalesce a resize request. The newest request is applied at frame acquisition.
++    pub fn request_resize(&self, width: u32, height: u32) {
++        let requested_size = (width.max(1), height.max(1));
++        let should_invalidate = {
++            let mut pending_size = self.inner.pending_size.lock();
++            if *pending_size == Some(requested_size) {
++                false
++            } else {
++                *pending_size = Some(requested_size);
++                true
++            }
++        };
++        if should_invalidate {
++            (self.inner.invalidator)();
++        }
++    }
++
++    /// Return whether a resize is waiting to be applied.
++    pub fn is_resize_pending(&self) -> bool {
++        self.inner.pending_size.lock().is_some()
++    }
++
++    /// Return whether a published frame has not yet been promoted by GPUI.
++    ///
++    /// Producers can use this as backpressure and skip work that would only
++    /// replace the already-bounded ready slot.
++    pub fn has_unconsumed_frame(&self) -> Result<bool, ExternalGpuSurfaceError> {
++        self.inner
++            .registry
++            .has_unconsumed_frame(self.inner.id)
++            .ok_or(ExternalGpuSurfaceError::Closed)
++    }
++
++    /// Return the surface status, including the typed terminal device-loss state.
++    pub fn status(&self) -> ExternalGpuSurfaceStatus {
++        if self.inner.device_lost.load(Ordering::Acquire) {
++            ExternalGpuSurfaceStatus::DeviceLost
++        } else if self.inner.registry.contains(self.inner.id) {
++            ExternalGpuSurfaceStatus::Ready
++        } else {
++            ExternalGpuSurfaceStatus::Closed
++        }
++    }
++
++    /// Acquire the rendering slot while excluding compositor submission and resize.
++    pub fn acquire_frame(&self) -> Result<ExternalGpuSurfaceFrame<'_>, ExternalGpuSurfaceError> {
++        match self.status() {
++            ExternalGpuSurfaceStatus::Ready => {}
++            ExternalGpuSurfaceStatus::DeviceLost => {
++                return Err(ExternalGpuSurfaceError::DeviceLost);
++            }
++            ExternalGpuSurfaceStatus::Closed => return Err(ExternalGpuSurfaceError::Closed),
++        }
++
++        let submission_guard = self.inner.registry.lock_submission();
++        if let Some((width, height)) = self.inner.pending_size.lock().take() {
++            self.inner
++                .registry
++                .resize(&self.inner.device, self.inner.id, width, height)?;
++        }
++        let (view, size) = self
++            .inner
++            .registry
++            .back_view_with_size(self.inner.id)
++            .ok_or(ExternalGpuSurfaceError::Closed)?;
++
++        Ok(ExternalGpuSurfaceFrame {
++            handle: self,
++            view,
++            size,
++            submission_guard: Some(submission_guard),
++        })
++    }
++
++    /// Return the exact memory occupied by this surface's three color textures.
++    pub fn allocated_texture_bytes(&self) -> Result<u64, ExternalGpuSurfaceError> {
++        self.inner
++            .registry
++            .allocated_bytes(self.inner.id)
++            .ok_or(ExternalGpuSurfaceError::Closed)
++    }
++
++    /// Return the opaque registry identity used by the GPUI scene primitive.
++    #[doc(hidden)]
++    pub fn id(&self) -> ExternalGpuSurfaceId {
++        self.inner.id
++    }
++}
++
++impl fmt::Debug for ExternalGpuSurfaceHandle {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter
++            .debug_struct("ExternalGpuSurfaceHandle")
++            .field("id", &self.inner.id)
++            .field("format", &self.inner.format)
++            .field("status", &self.status())
++            .finish_non_exhaustive()
++    }
++}
++
++impl PartialEq for ExternalGpuSurfaceHandle {
++    fn eq(&self, other: &Self) -> bool {
++        Arc::ptr_eq(&self.inner, &other.inner)
++    }
++}
++
++impl Eq for ExternalGpuSurfaceHandle {}
++
++/// One exclusively synchronized frame acquired from an external GPU surface.
++pub struct ExternalGpuSurfaceFrame<'a> {
++    handle: &'a ExternalGpuSurfaceHandle,
++    view: wgpu::TextureView,
++    size: (u32, u32),
++    submission_guard: Option<MutexGuard<'a, ()>>,
++}
++
++impl ExternalGpuSurfaceFrame<'_> {
++    /// Return the render-target view for this frame.
++    pub fn view(&self) -> &wgpu::TextureView {
++        &self.view
++    }
++
++    /// Return this frame's immutable device-pixel dimensions.
++    pub fn size(&self) -> (u32, u32) {
++        self.size
++    }
++
++    /// Submit command buffers and atomically publish this frame to GPUI.
++    pub fn submit_and_present(
++        mut self,
++        command_buffers: impl IntoIterator<Item = wgpu::CommandBuffer>,
++    ) -> Result<wgpu::SubmissionIndex, ExternalGpuSurfaceError> {
++        if self.handle.status() == ExternalGpuSurfaceStatus::DeviceLost {
++            return Err(ExternalGpuSurfaceError::DeviceLost);
++        }
++        let submission_index = self.handle.inner.queue.submit(command_buffers);
++        let should_invalidate = self
++            .handle
++            .inner
++            .registry
++            .publish(self.handle.inner.id, submission_index.clone())
++            .ok_or(ExternalGpuSurfaceError::Closed)?;
++        drop(self.submission_guard.take());
++        if should_invalidate {
++            (self.handle.inner.invalidator)();
++        }
++        Ok(submission_index)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{
++        BufferIndices, ExternalGpuSurfaceError, ExternalGpuSurfaceHandle,
++        ExternalGpuSurfaceRegistry, ExternalGpuSurfaceStatus,
++    };
++    use std::sync::{
++        Arc,
++        atomic::{AtomicBool, AtomicU64, Ordering},
++    };
++
++    #[test]
++    fn external_gpu_surface_triple_buffer_rotation_stays_distinct() {
++        let mut indices = BufferIndices::default();
++        for _ in 0..1_000 {
++            indices.publish();
++            assert!(indices.are_distinct());
++            indices.promote();
++            assert!(indices.are_distinct());
++        }
++    }
++
++    #[test]
++    fn external_gpu_surface_skipped_composite_keeps_display_stable() {
++        let mut indices = BufferIndices::default();
++        let initial_display = indices.display;
++        indices.publish();
++        assert_eq!(indices.display, initial_display);
++        indices.promote();
++        assert_ne!(indices.display, initial_display);
++    }
++
++    #[cfg(not(target_family = "wasm"))]
++    #[test]
++    #[ignore = "requires a live native wgpu adapter"]
++    fn external_gpu_surface_live_submit_resize_stress_is_bounded() -> anyhow::Result<()> {
++        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
++            backends: wgpu::Backends::all(),
++            flags: wgpu::InstanceFlags::default(),
++            backend_options: wgpu::BackendOptions::default(),
++            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
++            display: None,
++        });
++        let adapter = crate::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
++            power_preference: wgpu::PowerPreference::LowPower,
++            compatible_surface: None,
++            force_fallback_adapter: false,
++        }))?;
++        let (device, queue) = crate::block_on(
++            adapter.request_device(&wgpu::DeviceDescriptor {
++                label: Some("external_gpu_surface_live_test_device"),
++                required_features: wgpu::Features::empty(),
++                required_limits: wgpu::Limits::downlevel_defaults()
++                    .using_resolution(adapter.limits())
++                    .using_alignment(adapter.limits()),
++                memory_hints: wgpu::MemoryHints::MemoryUsage,
++                trace: wgpu::Trace::Off,
++                experimental_features: wgpu::ExperimentalFeatures::disabled(),
++            }),
++        )?;
++        let device = Arc::new(device);
++        let queue = Arc::new(queue);
++        let registry = Arc::new(ExternalGpuSurfaceRegistry::new());
++        let device_lost = Arc::new(AtomicBool::new(false));
++        let invalidations = Arc::new(AtomicU64::new(0));
++        let invalidator = {
++            let invalidations = Arc::clone(&invalidations);
++            Arc::new(move || {
++                invalidations.fetch_add(1, Ordering::Relaxed);
++            })
++        };
++        let handle = ExternalGpuSurfaceHandle::new(
++            Arc::clone(&registry),
++            Arc::clone(&device),
++            queue,
++            64,
++            48,
++            wgpu::TextureFormat::Rgba8Unorm,
++            Arc::clone(&device_lost),
++            invalidator,
++        )?;
++
++        for iteration in 0..256_u32 {
++            let width = 64 + iteration % 17;
++            let height = 48 + iteration % 13;
++            handle.request_resize(width, height);
++            let frame = handle.acquire_frame()?;
++            assert_eq!(frame.size(), (width, height));
++            let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
++                label: Some("external_gpu_surface_live_test_encoder"),
++            });
++            frame.submit_and_present([encoder.finish()])?;
++            assert!(handle.has_unconsumed_frame()?);
++            assert!(registry.promote_and_front_view(handle.id()).is_some());
++            assert!(!handle.has_unconsumed_frame()?);
++            assert_eq!(
++                handle.allocated_texture_bytes()?,
++                u64::from(width) * u64::from(height) * 4 * 3
++            );
++        }
++
++        assert_eq!(handle.status(), ExternalGpuSurfaceStatus::Ready);
++        assert!(invalidations.load(Ordering::Relaxed) >= 256);
++        device_lost.store(true, Ordering::Release);
++        assert_eq!(handle.status(), ExternalGpuSurfaceStatus::DeviceLost);
++        assert!(matches!(
++            handle.acquire_frame(),
++            Err(ExternalGpuSurfaceError::DeviceLost)
++        ));
++        let id = handle.id();
++        drop(handle);
++        assert!(registry.promote_and_front_view(id).is_none());
++        Ok(())
++    }
++}
+diff --git a/crates/gpui/src/gpui.rs b/crates/gpui/src/gpui.rs
+index 51585b5e5e..27a737762e 100644
+--- a/crates/gpui/src/gpui.rs
++++ b/crates/gpui/src/gpui.rs
+@@ -21,6 +21,7 @@ mod debug_overlay;
+ mod element;
+ mod elements;
+ mod executor;
++mod external_gpu_surface;
+ mod platform_scheduler;
+ pub(crate) use platform_scheduler::PlatformScheduler;
+ mod geometry;
+@@ -102,6 +103,7 @@ pub use debug_overlay::*;
+ pub use element::*;
+ pub use elements::*;
+ pub use executor::*;
++pub use external_gpu_surface::*;
+ pub use geometry::*;
+ pub use gestures::*;
+ pub use global::*;
+@@ -162,6 +164,7 @@ pub use test::*;
+ pub use text_system::*;
+ pub use util::{FutureExt, Timeout};
+ pub use view::*;
++pub use wgpu;
+ pub use window::*;
+
+ #[cfg(not(target_family = "wasm"))]
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index eeba999dac..527bddcbf5 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -36,11 +36,12 @@ pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBu
+
+ use crate::{
+     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
+-    DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
+-    FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap,
+-    LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
+-    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
+-    Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
++    DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload,
++    ExternalGpuSurfaceError, ExternalGpuSurfaceHandle, Font, FontId, FontMetrics, FontRun,
++    ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout, Pixels,
++    PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams, RenderImage,
++    RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size,
++    SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
+ };
+ #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+ use anyhow::bail;
+@@ -867,6 +868,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
+     fn draw(&self, scene: &Scene);
+     fn schedule_frame(&self) {}
++    /// Allocate a bounded texture surface on this window's compositor device.
++    fn create_external_gpu_surface(
++        &self,
++        _width: u32,
++        _height: u32,
++        _format: wgpu::TextureFormat,
++    ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
++        Err(ExternalGpuSurfaceError::Unsupported)
++    }
+     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+     fn is_subpixel_rendering_supported(&self) -> bool;
+
+diff --git a/crates/gpui/src/scene.rs b/crates/gpui/src/scene.rs
+index ea0f5d7e31..2c11769c2a 100644
+--- a/crates/gpui/src/scene.rs
++++ b/crates/gpui/src/scene.rs
+@@ -5,8 +5,9 @@ use schemars::JsonSchema;
+ use serde::{Deserialize, Serialize};
+
+ use crate::{
+-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
+-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
++    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges,
++    ExternalGpuSurfaceId, Hsla, Pixels, Point, Radians, ScaledPixels, Size,
++    bounds_tree::BoundsTree, point,
+ };
+ use std::{
+     fmt::Debug,
+@@ -763,14 +764,25 @@ impl From<PolychromeSprite> for Primitive {
+     }
+ }
+
++/// The GPU content sampled by a [`PaintSurface`].
++#[derive(Clone, Debug)]
++pub enum SurfaceContent {
++    /// A CoreVideo image used by the native macOS video path.
++    #[cfg(target_os = "macos")]
++    Video(core_video::pixel_buffer::CVPixelBuffer),
++    /// A texture from GPUI's bounded external-surface registry.
++    ExternalGpu(ExternalGpuSurfaceId),
++}
++
+ #[derive(Clone, Debug)]
+ #[allow(missing_docs)]
+ pub struct PaintSurface {
+     pub order: DrawOrder,
+     pub bounds: Bounds<ScaledPixels>,
+     pub content_mask: ContentMask<ScaledPixels>,
+-    #[cfg(target_os = "macos")]
+-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
++    pub opacity: f32,
++    pub transformation: TransformationMatrix,
++    pub content: SurfaceContent,
+ }
+
+ impl From<PaintSurface> for Primitive {
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index cf8eded704..6951e4e73c 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -9,17 +9,18 @@ use crate::{
+     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
+-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
+-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
+-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
++    EntityId, EventEmitter, ExternalGpuSurfaceError, ExternalGpuSurfaceHandle, FileDropEvent,
++    FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding,
++    KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex,
++    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
++    MouseUpEvent, PaintSurface, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
++    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
++    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
++    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
++    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
++    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
++    TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, TextRenderingMode,
++    TextStyle, TextStyleRefinement, ThermalState,
+     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+     point, prelude::*, px, rems, size, transparent_black,
+@@ -4785,10 +4786,50 @@ impl Window {
+             order: 0,
+             bounds,
+             content_mask,
+-            image_buffer,
++            opacity: self.element_opacity(),
++            transformation: TransformationMatrix::unit(),
++            content: crate::SurfaceContent::Video(image_buffer),
+         });
+     }
+
++    /// Paint a compositor-owned external GPU texture at the current z-index.
++    ///
++    /// The texture remains on the renderer's device; this inserts only its
++    /// registry identity and resolved geometry into the next GPUI scene.
++    pub fn paint_external_gpu_surface(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        surface: &ExternalGpuSurfaceHandle,
++        transformation: TransformationMatrix,
++    ) {
++        self.invalidator.debug_assert_paint();
++
++        let bounds = self.snap_bounds(bounds);
++        let content_mask = self.snapped_content_mask();
++        self.next_frame.scene.insert_primitive(PaintSurface {
++            order: 0,
++            bounds,
++            content_mask,
++            opacity: self.element_opacity(),
++            transformation,
++            content: crate::SurfaceContent::ExternalGpu(surface.id()),
++        });
++    }
++
++    /// Allocate an external GPU surface on this window's compositor device.
++    ///
++    /// The returned handle and GPUI share one device, queue, registry, and
++    /// submission gate, so its textures can be sampled without CPU readback.
++    pub fn create_external_gpu_surface(
++        &self,
++        width: u32,
++        height: u32,
++        format: wgpu::TextureFormat,
++    ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
++        self.platform_window
++            .create_external_gpu_surface(width, height, format)
++    }
++
+     /// Removes an image from the sprite atlas.
+     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
+         for frame_index in 0..data.frame_count() {
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+index 112717b234..8c47e6223f 100644
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -8,7 +8,7 @@ use cocoa::{
+ };
+ use gpui::{
+     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
+-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
++    PrimitiveBatch, ScaledPixels, Scene, Size, SurfaceContent, point, size,
+ };
+ #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+ use image::RgbaImage;
+@@ -1145,35 +1145,38 @@ impl MetalRenderer {
+         );
+
+         for (index, surface) in surfaces.iter().enumerate() {
++            let SurfaceContent::Video(image_buffer) = &surface.content else {
++                continue;
++            };
+             let texture_size = size(
+-                DevicePixels::from(surface.image_buffer.get_width() as i32),
+-                DevicePixels::from(surface.image_buffer.get_height() as i32),
++                DevicePixels::from(image_buffer.get_width() as i32),
++                DevicePixels::from(image_buffer.get_height() as i32),
+             );
+
+             assert_eq!(
+-                surface.image_buffer.get_pixel_format(),
++                image_buffer.get_pixel_format(),
+                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+             );
+
+             let y_texture = self
+                 .core_video_texture_cache
+                 .create_texture_from_image(
+-                    surface.image_buffer.as_concrete_TypeRef(),
++                    image_buffer.as_concrete_TypeRef(),
+                     None,
+                     MTLPixelFormat::R8Unorm,
+-                    surface.image_buffer.get_width_of_plane(0),
+-                    surface.image_buffer.get_height_of_plane(0),
++                    image_buffer.get_width_of_plane(0),
++                    image_buffer.get_height_of_plane(0),
+                     0,
+                 )
+                 .unwrap();
+             let cb_cr_texture = self
+                 .core_video_texture_cache
+                 .create_texture_from_image(
+-                    surface.image_buffer.as_concrete_TypeRef(),
++                    image_buffer.as_concrete_TypeRef(),
+                     None,
+                     MTLPixelFormat::RG8Unorm,
+-                    surface.image_buffer.get_width_of_plane(1),
+-                    surface.image_buffer.get_height_of_plane(1),
++                    image_buffer.get_width_of_plane(1),
++                    image_buffer.get_height_of_plane(1),
+                     1,
+                 )
+                 .unwrap();
+diff --git a/crates/gpui_macos/Cargo.toml b/crates/gpui_macos/Cargo.toml
+index 22bc2ab685..448c1cab3f 100644
+--- a/crates/gpui_macos/Cargo.toml
++++ b/crates/gpui_macos/Cargo.toml
+@@ -18,6 +18,7 @@ test-support = ["gpui/test-support", "gpui_apple/test-support"]
+ runtime_shaders = ["gpui_apple/runtime_shaders"]
+ font-kit = ["dep:font-kit"]
+ screen-capture = ["gpui/screen-capture"]
++external-gpu-surface = ["dep:gpui_wgpu"]
+
+ [dependencies]
+ gpui.workspace = true
+@@ -43,6 +44,7 @@ foreign-types.workspace = true
+ futures.workspace = true
+ gpui_apple.workspace = true
+ gpui_util.workspace = true
++gpui_wgpu = { workspace = true, optional = true }
+ image.workspace = true
+ itertools.workspace = true
+ libc.workspace = true
+diff --git a/crates/gpui_macos/src/gpui_macos.rs b/crates/gpui_macos/src/gpui_macos.rs
+index 1e393e4875..52877ef56e 100644
+--- a/crates/gpui_macos/src/gpui_macos.rs
++++ b/crates/gpui_macos/src/gpui_macos.rs
+@@ -15,8 +15,14 @@ mod system_notifications;
+ #[cfg(feature = "screen-capture")]
+ mod screen_capture;
+
++#[cfg(not(feature = "external-gpu-surface"))]
+ use gpui_apple::metal_renderer as renderer;
+
++#[cfg(feature = "external-gpu-surface")]
++mod wgpu_renderer;
++#[cfg(feature = "external-gpu-surface")]
++use wgpu_renderer as renderer;
++
+ pub mod metal_renderer {
+     pub use gpui_apple::metal_renderer::{PathRasterizationVertex, PathSprite, SurfaceBounds};
+
+diff --git a/crates/gpui_macos/src/platform.rs b/crates/gpui_macos/src/platform.rs
+index c6f75a85bb..53d4927d32 100644
+--- a/crates/gpui_macos/src/platform.rs
++++ b/crates/gpui_macos/src/platform.rs
+@@ -678,7 +678,7 @@ impl Platform for MacPlatform {
+             background_executor,
+             renderer_context,
+             self.1,
+-        )))
++        )?))
+     }
+
+     fn window_appearance(&self) -> WindowAppearance {
+diff --git a/crates/gpui_macos/src/wgpu_renderer.rs b/crates/gpui_macos/src/wgpu_renderer.rs
+new file mode 100644
+index 0000000000..67f4a14930
+--- /dev/null
++++ b/crates/gpui_macos/src/wgpu_renderer.rs
+@@ -0,0 +1,181 @@
++use foreign_types::ForeignType;
++use gpui::{
++    DevicePixels, ExternalGpuSurfaceError, ExternalGpuSurfaceHandle, ExternalGpuSurfaceInvalidator,
++    GpuSpecs, Scene, Size,
++};
++use gpui_wgpu::{GpuContext, WgpuAtlas, WgpuRenderer, WgpuSurfaceConfig};
++#[cfg(any(test, feature = "test-support"))]
++use image::RgbaImage;
++use raw_window_handle::{
++    AppKitWindowHandle, DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle,
++    RawWindowHandle, WindowHandle,
++};
++use std::{ffi::c_void, fmt, ptr::NonNull, rc::Rc, sync::Arc};
++
++pub type Context = GpuContext;
++
++#[derive(Clone, Copy)]
++struct MacSurfaceTarget {
++    native_view: NonNull<c_void>,
++}
++
++impl fmt::Debug for MacSurfaceTarget {
++    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter
++            .debug_struct("MacSurfaceTarget")
++            .field("native_view", &self.native_view)
++            .finish()
++    }
++}
++
++unsafe impl Send for MacSurfaceTarget {}
++unsafe impl Sync for MacSurfaceTarget {}
++
++impl HasWindowHandle for MacSurfaceTarget {
++    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
++        let handle = AppKitWindowHandle::new(self.native_view);
++        Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::AppKit(handle)) })
++    }
++}
++
++impl HasDisplayHandle for MacSurfaceTarget {
++    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
++        Ok(DisplayHandle::appkit())
++    }
++}
++
++pub struct Renderer {
++    context: Context,
++    surface_target: MacSurfaceTarget,
++    layer: metal::MetalLayer,
++    inner: Option<WgpuRenderer>,
++    transparent: bool,
++}
++
++pub unsafe fn new_renderer(
++    context: Context,
++    _native_window: *mut c_void,
++    native_view: *mut c_void,
++    _bounds: gpui::Size<f32>,
++    transparent: bool,
++) -> Renderer {
++    // SAFETY: MacWindow creates the NSView immediately before constructing the renderer
++    // and checks it for null before passing it here.
++    let native_view = unsafe { NonNull::new_unchecked(native_view) };
++    let layer = metal::MetalLayer::new();
++    layer.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
++    layer.set_opaque(!transparent);
++    layer.set_maximum_drawable_count(3);
++
++    Renderer {
++        context,
++        surface_target: MacSurfaceTarget { native_view },
++        layer,
++        inner: None,
++        transparent,
++    }
++}
++
++impl Renderer {
++    pub fn initialize(&mut self, size: Size<DevicePixels>) -> anyhow::Result<()> {
++        if self.inner.is_some() {
++            return Ok(());
++        }
++        self.inner = Some(WgpuRenderer::new(
++            Rc::clone(&self.context),
++            &self.surface_target,
++            WgpuSurfaceConfig {
++                size,
++                transparent: self.transparent,
++                preferred_present_mode: None,
++            },
++            None,
++        )?);
++        Ok(())
++    }
++
++    fn inner(&self) -> &WgpuRenderer {
++        self.inner
++            .as_ref()
++            .expect("macOS WGPU renderer must be initialized after attaching its CAMetalLayer")
++    }
++
++    fn inner_mut(&mut self) -> &mut WgpuRenderer {
++        self.inner
++            .as_mut()
++            .expect("macOS WGPU renderer must be initialized after attaching its CAMetalLayer")
++    }
++
++    pub fn layer(&self) -> Option<&metal::MetalLayerRef> {
++        Some(self.layer.as_ref())
++    }
++
++    pub fn layer_ptr(&self) -> *mut c_void {
++        self.layer.as_ptr().cast()
++    }
++
++    pub fn set_presents_with_transaction(&mut self, enabled: bool) {
++        self.layer.set_presents_with_transaction(enabled);
++    }
++
++    pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
++        if let Some(inner) = self.inner.as_mut() {
++            inner.update_drawable_size(size);
++        }
++    }
++
++    pub fn update_transparency(&mut self, transparent: bool) {
++        self.transparent = transparent;
++        if let Some(inner) = self.inner.as_mut() {
++            inner.update_transparency(transparent);
++        }
++    }
++
++    pub fn draw(&mut self, scene: &Scene) -> bool {
++        self.inner_mut().draw(scene)
++    }
++
++    pub fn destroy(&mut self) {
++        if let Some(inner) = self.inner.as_mut() {
++            inner.destroy();
++        }
++        self.inner = None;
++    }
++
++    pub fn sprite_atlas(&self) -> &Arc<WgpuAtlas> {
++        self.inner().sprite_atlas()
++    }
++
++    pub fn supports_dual_source_blending(&self) -> bool {
++        self.inner().supports_dual_source_blending()
++    }
++
++    pub fn gpu_specs(&self) -> GpuSpecs {
++        self.inner().gpu_specs()
++    }
++
++    pub fn create_external_gpu_surface(
++        &self,
++        width: u32,
++        height: u32,
++        format: gpui::wgpu::TextureFormat,
++        invalidator: ExternalGpuSurfaceInvalidator,
++    ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
++        self.inner()
++            .create_external_gpu_surface(width, height, format, invalidator)
++    }
++
++    pub fn device_lost(&self) -> bool {
++        self.inner().device_lost()
++    }
++
++    pub fn recover(&mut self) -> anyhow::Result<()> {
++        let surface_target = self.surface_target;
++        self.inner_mut().recover(&surface_target)
++    }
++
++    #[cfg(any(test, feature = "test-support"))]
++    pub fn render_to_image(&mut self, _scene: &Scene) -> anyhow::Result<RgbaImage> {
++        anyhow::bail!("render_to_image is not implemented by the macOS WGPU compositor")
++    }
++}
+diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
+index 88a694c971..7f73c1e5be 100644
+--- a/crates/gpui_macos/src/window.rs
++++ b/crates/gpui_macos/src/window.rs
+@@ -33,6 +33,8 @@ use gpui::{
+     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind,
+     WindowParams, point, px, size,
+ };
++#[cfg(feature = "external-gpu-surface")]
++use gpui::{ExternalGpuSurfaceError, ExternalGpuSurfaceHandle};
+ #[cfg(any(test, feature = "test-support"))]
+ use image::RgbaImage;
+
+@@ -904,7 +906,7 @@ impl MacWindow {
+         background_executor: BackgroundExecutor,
+         renderer_context: renderer::Context,
+         marker: MainThreadMarker,
+-    ) -> Self {
++    ) -> anyhow::Result<Self> {
+         unsafe {
+             let pool = NSAutoreleasePool::new(nil);
+
+@@ -1115,6 +1117,14 @@ impl MacWindow {
+             setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawDuringViewResize
+             ];
+
++            #[cfg(feature = "external-gpu-surface")]
++            {
++                let drawable_size = bounds
++                    .size
++                    .to_device_pixels(get_scale_factor(native_window));
++                window.0.lock().renderer.initialize(drawable_size)?;
++            }
++
+             content_view.addSubview_(native_view.autorelease());
+             native_window.makeFirstResponder_(native_view);
+
+@@ -1232,7 +1242,7 @@ impl MacWindow {
+
+             pool.drain();
+
+-            window
++            Ok(window)
+         }
+     }
+
+@@ -1701,6 +1711,12 @@ impl PlatformWindow for MacWindow {
+     }
+
+     fn is_subpixel_rendering_supported(&self) -> bool {
++        #[cfg(feature = "external-gpu-surface")]
++        {
++            return self.0.lock().renderer.supports_dual_source_blending();
++        }
++
++        #[cfg(not(feature = "external-gpu-surface"))]
+         false
+     }
+
+@@ -1814,7 +1830,12 @@ impl PlatformWindow for MacWindow {
+     }
+
+     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
+-        self.0.as_ref().lock().request_frame_callback = Some(callback);
++        let mut state = self.0.as_ref().lock();
++        state.request_frame_callback = Some(callback);
++        // The window may already be visible by the time GPUI installs its frame callback.
++        // Start the display link here so an earlier occlusion-state notification cannot be
++        // the only opportunity to arm continuous frame delivery.
++        state.start_display_link();
+     }
+
+     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>) {
+@@ -1908,14 +1929,67 @@ impl PlatformWindow for MacWindow {
+
+     fn draw(&self, scene: &gpui::Scene) {
+         let mut this = self.0.lock();
++
++        #[cfg(feature = "external-gpu-surface")]
++        if this.renderer.device_lost() {
++            if let Err(error) = this.renderer.recover() {
++                log::error!("failed to recover the macOS WGPU compositor: {error:#}");
++                return;
++            }
++        }
++
+         this.renderer.draw(scene);
+     }
+
++    #[cfg(feature = "external-gpu-surface")]
++    fn create_external_gpu_surface(
++        &self,
++        width: u32,
++        height: u32,
++        format: gpui::wgpu::TextureFormat,
++    ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
++        let window_state = Arc::downgrade(&self.0);
++        let invalidator = Arc::new(move || {
++            let Some(window_state) = window_state.upgrade() else {
++                return;
++            };
++            let foreground_executor = window_state.lock().foreground_executor.clone();
++            foreground_executor
++                .spawn(async move {
++                    let mut state = window_state.lock();
++                    if state.closed.load(Ordering::Acquire) {
++                        return;
++                    }
++                    let Some(mut callback) = state.request_frame_callback.take() else {
++                        return;
++                    };
++                    drop(state);
++                    callback(RequestFrameOptions {
++                        require_presentation: true,
++                        force_render: false,
++                    });
++                    window_state.lock().request_frame_callback = Some(callback);
++                })
++                .detach();
++        });
++
++        self.0
++            .lock()
++            .renderer
++            .create_external_gpu_surface(width, height, format, invalidator)
++    }
++
+     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+         self.0.lock().renderer.sprite_atlas().clone()
+     }
+
+     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {
++        #[cfg(feature = "external-gpu-surface")]
++        {
++            return Some(self.0.lock().renderer.gpu_specs());
++        }
++
++        #[cfg(not(feature = "external-gpu-surface"))]
+         None
+     }
+
+diff --git a/crates/gpui_platform/Cargo.toml b/crates/gpui_platform/Cargo.toml
+index 57629a7993..fecd8e4040 100644
+--- a/crates/gpui_platform/Cargo.toml
++++ b/crates/gpui_platform/Cargo.toml
+@@ -18,6 +18,7 @@ font-kit = ["gpui_macos/font-kit"]
+ test-support = ["gpui/test-support", "gpui_macos/test-support", "gpui_windows/test-support"]
+ screen-capture = ["gpui/screen-capture", "gpui_macos/screen-capture", "gpui_windows/screen-capture", "gpui_linux/screen-capture"]
+ runtime_shaders = ["gpui_macos/runtime_shaders"]
++external-gpu-surface = ["gpui_macos/external-gpu-surface"]
+ wayland = ["gpui_linux/wayland"]
+ x11 = ["gpui_linux/x11"]
+
+diff --git a/crates/gpui_web/src/window.rs b/crates/gpui_web/src/window.rs
+index 8d6b0bd688..6ea3abb7bf 100644
+--- a/crates/gpui_web/src/window.rs
++++ b/crates/gpui_web/src/window.rs
+@@ -8,10 +8,11 @@ use std::sync::Arc;
+ use std::{cell::Cell, cell::RefCell, rc::Rc};
+
+ use gpui::{
+-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult, GpuSpecs,
+-    Modifiers, MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+-    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+-    ResizeEdge, Scene, Size, TextInputConfiguration, TextInputStateChange, WindowAppearance,
++    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult,
++    ExternalGpuSurfaceError, ExternalGpuSurfaceHandle, GpuSpecs, Modifiers, MouseButton, Pixels,
++    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
++    PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
++    TextInputConfiguration, TextInputStateChange, WindowAppearance,
+     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+     WindowParams, px,
+ };
+@@ -833,6 +834,24 @@ impl PlatformWindow for WebWindow {
+         self.inner.state.borrow_mut().renderer.draw(scene);
+     }
+
++    fn create_external_gpu_surface(
++        &self,
++        width: u32,
++        height: u32,
++        format: wgpu::TextureFormat,
++    ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
++        let inner = Rc::downgrade(&self.inner);
++        let invalidator = Rc::new(move || {
++            if let Some(inner) = inner.upgrade() {
++                inner.wake_frame_loop();
++            }
++        });
++        self.inner
++            .state
++            .borrow()
++            .renderer
++            .create_external_gpu_surface(width, height, format, invalidator)
++    }
+     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+         self.inner.state.borrow().renderer.sprite_atlas().clone()
+     }
+diff --git a/crates/gpui_wgpu/src/shaders.wgsl b/crates/gpui_wgpu/src/shaders.wgsl
+index 718cb7595d..89d4aba8f5 100644
+--- a/crates/gpui_wgpu/src/shaders.wgsl
++++ b/crates/gpui_wgpu/src/shaders.wgsl
+@@ -1315,19 +1315,15 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
+ struct SurfaceParams {
+     bounds: Bounds,
+     content_mask: Bounds,
++    rotation_scale: mat2x2<f32>,
++    translation: vec2<f32>,
++    opacity: f32,
++    pad: f32,
+ }
+
+ @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
+-@group(1) @binding(1) var t_y: texture_2d<f32>;
+-@group(1) @binding(2) var t_cb_cr: texture_2d<f32>;
+-@group(1) @binding(3) var s_surface: sampler;
+-
+-const ycbcr_to_RGB = mat4x4<f32>(
+-    vec4<f32>( 1.0000f,  1.0000f,  1.0000f, 0.0),
+-    vec4<f32>( 0.0000f, -0.3441f,  1.7720f, 0.0),
+-    vec4<f32>( 1.4020f, -0.7141f,  0.0000f, 0.0),
+-    vec4<f32>(-0.7010f,  0.5291f, -0.8860f, 1.0),
+-);
++@group(1) @binding(1) var t_surface: texture_2d<f32>;
++@group(1) @binding(2) var s_surface: sampler;
+
+ struct SurfaceVarying {
+     @builtin(position) position: vec4<f32>,
+@@ -1338,11 +1334,20 @@ struct SurfaceVarying {
+ @vertex
+ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
+     let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
++    let transformation = TransformationMatrix(
++        surface_locals.rotation_scale,
++        surface_locals.translation,
++    );
+
+     var out = SurfaceVarying();
+-    out.position = to_device_position(unit_vertex, surface_locals.bounds);
++    out.position = to_device_position_transformed(unit_vertex, surface_locals.bounds, transformation);
+     out.texture_position = unit_vertex;
+-    out.clip_distances = distance_from_clip_rect(unit_vertex, surface_locals.bounds, surface_locals.content_mask);
++    out.clip_distances = distance_from_clip_rect_transformed(
++        unit_vertex,
++        surface_locals.bounds,
++        surface_locals.content_mask,
++        transformation,
++    );
+     return out;
+ }
+
+@@ -1353,10 +1358,6 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
+         return vec4<f32>(0.0);
+     }
+
+-    let y_cb_cr = vec4<f32>(
+-        textureSampleLevel(t_y, s_surface, input.texture_position, 0.0).r,
+-        textureSampleLevel(t_cb_cr, s_surface, input.texture_position, 0.0).rg,
+-        1.0);
+-
+-    return ycbcr_to_RGB * y_cb_cr;
++    let color = textureSampleLevel(t_surface, s_surface, input.texture_position, 0.0);
++    return blend_color(color, surface_locals.opacity);
+ }
+diff --git a/crates/gpui_wgpu/src/wgpu_context.rs b/crates/gpui_wgpu/src/wgpu_context.rs
+index 7e744e80d6..4b61d12abe 100644
+--- a/crates/gpui_wgpu/src/wgpu_context.rs
++++ b/crates/gpui_wgpu/src/wgpu_context.rs
+@@ -1,5 +1,6 @@
+ #[cfg(not(target_family = "wasm"))]
+ use anyhow::Context as _;
++use gpui::ExternalGpuSurfaceRegistry;
+ #[cfg(not(target_family = "wasm"))]
+ use gpui_util::ResultExt;
+ use std::sync::Arc;
+@@ -15,6 +16,7 @@ pub struct WgpuContext {
+     dual_source_blending: bool,
+     color_texture_format: wgpu::TextureFormat,
+     device_lost: Arc<AtomicBool>,
++    pub(crate) external_surface_registry: Arc<ExternalGpuSurfaceRegistry>,
+ }
+
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+@@ -138,6 +140,7 @@ impl WgpuContext {
+             dual_source_blending,
+             color_texture_format,
+             device_lost,
++            external_surface_registry: Arc::new(ExternalGpuSurfaceRegistry::new()),
+         })
+     }
+
+@@ -229,6 +232,7 @@ impl WgpuContext {
+             dual_source_blending,
+             color_texture_format,
+             device_lost,
++            external_surface_registry: Arc::new(ExternalGpuSurfaceRegistry::new()),
+         };
+         Ok(PreparedWebGraphics { context, surface })
+     }
+@@ -289,7 +293,7 @@ impl WgpuContext {
+     #[cfg(not(target_family = "wasm"))]
+     pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
+         wgpu::Instance::new(wgpu::InstanceDescriptor {
+-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
++            backends: wgpu::Backends::all(),
+             flags: wgpu::InstanceFlags::default(),
+             backend_options: wgpu::BackendOptions::default(),
+             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+diff --git a/crates/gpui_wgpu/src/wgpu_renderer.rs b/crates/gpui_wgpu/src/wgpu_renderer.rs
+index b0cd40a767..2e82abef1a 100644
+--- a/crates/gpui_wgpu/src/wgpu_renderer.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
+@@ -2,8 +2,10 @@ use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
+ use anyhow::{Context as _, Result};
+ use bytemuck::{Pod, Zeroable};
+ use gpui::{
+-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
+-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
++    AtlasTextureId, Background, Bounds, DevicePixels, ExternalGpuSurfaceError,
++    ExternalGpuSurfaceHandle, ExternalGpuSurfaceInvalidator, ExternalGpuSurfaceRegistry, GpuSpecs,
++    Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, SurfaceContent,
++    get_gamma_correction_ratios,
+ };
+ use log::warn;
+ #[cfg(not(target_family = "wasm"))]
+@@ -13,6 +15,7 @@ use std::num::NonZeroU64;
+ use std::ops::Range;
+ use std::rc::Rc;
+ use std::sync::{Arc, Mutex};
++use wgpu::util::DeviceExt as _;
+
+ const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
+
+@@ -82,6 +85,14 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
+ struct SurfaceParams {
+     bounds: PodBounds,
+     content_mask: PodBounds,
++    rotation_scale: [[f32; 2]; 2],
++    translation: [f32; 2],
++    opacity: f32,
++    _pad: f32,
++}
++
++struct PreparedExternalSurface {
++    bind_group: wgpu::BindGroup,
+ }
+
+ #[repr(C)]
+@@ -229,6 +240,7 @@ pub struct WgpuRenderer {
+     last_error: Arc<Mutex<Option<String>>>,
+     failed_frame_count: u32,
+     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
++    external_surface_registry: Arc<ExternalGpuSurfaceRegistry>,
+     surface_configured: bool,
+     needs_redraw: bool,
+ }
+@@ -602,6 +614,7 @@ impl WgpuRenderer {
+             last_error,
+             failed_frame_count: 0,
+             device_lost: context.device_lost_flag(),
++            external_surface_registry: Arc::clone(&context.external_surface_registry),
+             surface_configured: true,
+             needs_redraw: false,
+         })
+@@ -716,16 +729,6 @@ impl WgpuRenderer {
+                 wgpu::BindGroupLayoutEntry {
+                     binding: 2,
+                     visibility: wgpu::ShaderStages::FRAGMENT,
+-                    ty: wgpu::BindingType::Texture {
+-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+-                        view_dimension: wgpu::TextureViewDimension::D2,
+-                        multisampled: false,
+-                    },
+-                    count: None,
+-                },
+-                wgpu::BindGroupLayoutEntry {
+-                    binding: 3,
+-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                     count: None,
+                 },
+@@ -1262,6 +1265,29 @@ impl WgpuRenderer {
+         self.max_texture_size
+     }
+
++    pub fn create_external_gpu_surface(
++        &self,
++        width: u32,
++        height: u32,
++        format: wgpu::TextureFormat,
++        invalidator: ExternalGpuSurfaceInvalidator,
++    ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
++        if self.device_lost() {
++            return Err(ExternalGpuSurfaceError::DeviceLost);
++        }
++        let resources = self.resources();
++        ExternalGpuSurfaceHandle::new(
++            Arc::clone(&self.external_surface_registry),
++            Arc::clone(&resources.device),
++            Arc::clone(&resources.queue),
++            width,
++            height,
++            format,
++            Arc::clone(&self.device_lost),
++            invalidator,
++        )
++    }
++
+     pub fn draw(&mut self, scene: &Scene) -> bool {
+         #[cfg(target_family = "wasm")]
+         if self.device_lost() {
+@@ -1403,6 +1429,9 @@ impl WgpuRenderer {
+     }
+
+     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
++        let external_surface_registry = Arc::clone(&self.external_surface_registry);
++        let _external_submission_guard = external_surface_registry.lock_submission();
++        let prepared_external_surfaces = self.prepare_external_surfaces(scene);
+         let mut instance_offset = 0;
+         let instance_bindings = self
+             .write_instances(scene, &mut instance_offset)
+@@ -1526,9 +1555,20 @@ impl WgpuRenderer {
+                         instance_range(range),
+                         &mut pass,
+                     ),
+-                    // Surfaces are macOS-only for video playback and are not
+-                    // implemented by the WGPU renderer.
+-                    PrimitiveBatch::Surfaces(_surfaces) => {}
++                    PrimitiveBatch::Surfaces(range) => {
++                        for surface_index in range {
++                            let Some(prepared_surface) = prepared_external_surfaces
++                                .get(surface_index)
++                                .and_then(Option::as_ref)
++                            else {
++                                continue;
++                            };
++                            pass.set_pipeline(&self.resources().pipelines.surfaces);
++                            pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
++                            pass.set_bind_group(1, &prepared_surface.bind_group, &[]);
++                            pass.draw(0..4, 0..1);
++                        }
++                    }
+                 }
+             }
+         }
+@@ -1539,6 +1579,61 @@ impl WgpuRenderer {
+         Ok(())
+     }
+
++    fn prepare_external_surfaces(&self, scene: &Scene) -> Vec<Option<PreparedExternalSurface>> {
++        scene
++            .surfaces
++            .iter()
++            .map(|surface| {
++                let surface_id = match &surface.content {
++                    SurfaceContent::ExternalGpu(surface_id) => surface_id,
++                    #[cfg(target_os = "macos")]
++                    SurfaceContent::Video(_) => return None,
++                };
++                let texture_view = self
++                    .external_surface_registry
++                    .promote_and_front_view(*surface_id)?;
++                let parameters = SurfaceParams {
++                    bounds: surface.bounds.into(),
++                    content_mask: surface.content_mask.bounds.into(),
++                    rotation_scale: surface.transformation.rotation_scale,
++                    translation: surface.transformation.translation,
++                    opacity: surface.opacity,
++                    _pad: 0.0,
++                };
++                let resources = self.resources();
++                let parameters_buffer =
++                    resources
++                        .device
++                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
++                            label: Some("external_surface_parameters"),
++                            contents: bytemuck::bytes_of(&parameters),
++                            usage: wgpu::BufferUsages::UNIFORM,
++                        });
++                let bind_group = resources
++                    .device
++                    .create_bind_group(&wgpu::BindGroupDescriptor {
++                        label: Some("external_surface_bind_group"),
++                        layout: &resources.bind_group_layouts.surfaces,
++                        entries: &[
++                            wgpu::BindGroupEntry {
++                                binding: 0,
++                                resource: parameters_buffer.as_entire_binding(),
++                            },
++                            wgpu::BindGroupEntry {
++                                binding: 1,
++                                resource: wgpu::BindingResource::TextureView(&texture_view),
++                            },
++                            wgpu::BindGroupEntry {
++                                binding: 2,
++                                resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
++                            },
++                        ],
++                    });
++                Some(PreparedExternalSurface { bind_group })
++            })
++            .collect()
++    }
++
+     fn write_instances(
+         &mut self,
+         scene: &Scene,

@@ -1,0 +1,15 @@
+# Theorem Zed patch series
+
+This hard-fork series is applied in the order recorded by `series`. It is not
+an upstream contribution queue.
+
+The base used to generate this series is Zed commit
+`5b055fa789a8b8d38ac951a6e0cde272f66b4495`. The first patch carries the
+external WGPU surface work originally recorded as Theorem commit
+`d9849af9f00e33e6f466f514c34e2fc37761d2f8`; the remaining patches carry the
+Theorem web accessibility and IME seams that are not present at that base.
+
+Regenerate the files from the rebased commits with `git format-patch`, preserve
+their order in `series`, and run the patch-series workflow before moving a
+consumer pin. If upstream makes a patch redundant, remove it from the series
+instead of retaining an empty compatibility patch.

@@ -1,0 +1,91 @@
+name: Zed patch series
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 1 * *"
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  rebase-series:
+    runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_URL: https://github.com/zed-industries/zed.git
+      REBASE_BRANCH: automation/zed-patch-series
+      CONFLICT_BRANCH: automation/zed-patch-series-conflict
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply Theorem patches to upstream main
+        id: apply
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -R patches "$RUNNER_TEMP/zed-patches"
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream main
+          git config user.name "theorem-patch-series"
+          git config user.email "theorem-patch-series@users.noreply.github.com"
+          git switch --force-create "$REBASE_BRANCH" upstream/main
+
+          failed_patch=""
+          while IFS= read -r patch; do
+            if [[ -z "$patch" || "$patch" == \#* ]]; then
+              continue
+            fi
+            if ! git am "$RUNNER_TEMP/zed-patches/$patch"; then
+              failed_patch="$patch"
+              git am --abort
+              break
+            fi
+          done < "$RUNNER_TEMP/zed-patches/series"
+
+          if [[ -n "$failed_patch" ]]; then
+            git switch --force-create "$CONFLICT_BRANCH" upstream/main
+            mkdir -p .patch-series-conflict
+            cp -R "$RUNNER_TEMP/zed-patches/." .patch-series-conflict/
+            printf '%s\n' "$failed_patch" > .patch-series-conflict/FAILED_PATCH
+            git add .patch-series-conflict
+            git commit -m "chore(gpui): record Zed patch-series conflict"
+            git push --force-with-lease origin "$CONFLICT_BRANCH"
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            echo "failed_patch=$failed_patch" >> "$GITHUB_OUTPUT"
+          else
+            git push --force-with-lease origin "$REBASE_BRANCH"
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open clean rebase pull request
+        if: steps.apply.outputs.result == 'clean'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$(gh pr list --head "$REBASE_BRANCH" --base main --json number --jq '.[0].number')" ]]; then
+            gh pr create \
+              --base main \
+              --head "$REBASE_BRANCH" \
+              --title "chore(gpui): rebase Theorem Zed patch series" \
+              --body "Automated monthly replay of the hard-fork patch series onto zed-industries/zed main. This is a fork-maintenance PR and is not intended for upstream."
+          fi
+
+      - name: Open conflict pull request
+        if: steps.apply.outputs.result == 'conflict'
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed_patch="${{ steps.apply.outputs.failed_patch }}"
+          if [[ -z "$(gh pr list --head "$CONFLICT_BRANCH" --base main --json number --jq '.[0].number')" ]]; then
+            gh pr create \
+              --base main \
+              --head "$CONFLICT_BRANCH" \
+              --title "chore(gpui): repair Zed patch-series conflict" \
+              --body "The monthly replay stopped at ${failed_patch}. The branch retains the exact ordered patch payload under .patch-series-conflict for repair inside this fork; do not offer it upstream."
+          fi
+          exit 1

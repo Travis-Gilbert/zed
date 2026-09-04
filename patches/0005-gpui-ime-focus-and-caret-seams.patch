@@ -1,0 +1,82 @@
+From d1b4d315a21774ad51cd72cd2c231488bd81da22 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Wed, 2 Sep 2026 12:01:30 -0400
+Subject: [PATCH 5/5] fix(gpui): drive the two IME seams the platform layer
+ declares
+
+`PlatformWindow` declares `text_input_state_changed` and
+`update_ime_position`, and a platform that implements them still hears
+nothing. `text_input_state_changed` has no caller anywhere in GPUI.
+`update_ime_position` has exactly one, inside
+`Window::invalidate_character_coordinates`, which is not called by the
+framework but by hand from application code -- `editor/src/selection.rs`,
+`terminal_view`, `workspace`, `buffer_search`. An application that is not
+one of those, or a platform that needs the focus edge rather than a
+caret nudge, is given neither.
+
+The web is where this shows. A browser has no OS text field to inherit
+from: an editable that never reports focus gets no software keyboard on
+a phone and no `inputmode` on the element, and a composition popup with
+no position opens at the window origin instead of on the caret. Both
+methods were implemented in `gpui_web` and both were dead.
+
+Whether an editable is focused is exactly whether the frame just drawn
+asked for an input handler, and the end of `Window::draw` is the only
+place that is known. So report the edge from there, and on the way in
+push the caret rectangle so the first candidate window opens in the
+right place. `selected_bounds` is the same rectangle
+`invalidate_character_coordinates` computes, so the two agree by
+construction and that method remains the explicit nudge for a caller
+that moved a caret without redrawing.
+
+Neither call runs per frame. The edge is one `is_some()` comparison, and
+the position is pushed only when the rectangle changes, so a still caret
+costs a comparison and a platform is never handed the same rectangle
+twice.
+---
+ crates/gpui/src/window.rs | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index e3f259314f..0f0ba71108 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -1174,6 +1174,9 @@ pub struct Window {
+     /// input session can restart the IME connection).
+     last_text_input_configuration: Option<TextInputConfiguration>,
+     focused_text_input_active: bool,
++    /// The caret rectangle last pushed to the platform, so the push happens
++    /// on change rather than every frame.
++    last_ime_bounds: Option<Bounds<Pixels>>,
+     pub(crate) image_cache_stack: Vec<AnyImageCache>,
+     pub(crate) rendered_frame: Frame,
+     pub(crate) next_frame: Frame,
+@@ -2001,6 +2004,7 @@ impl Window {
+             requested_autoscroll: None,
+             last_text_input_configuration: None,
+             focused_text_input_active: false,
++            last_ime_bounds: None,
+             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+             next_frame_callbacks,
+@@ -3085,9 +3089,20 @@ impl Window {
+             .find_map(|h| h.take())
+         {
+             let accepts_text_input = input_handler.accepts_text_input(self, cx);
++            if accepts_text_input {
++                if let Some(bounds) = input_handler.selected_bounds(self, cx)
++                    && self.last_ime_bounds != Some(bounds)
++                {
++                    self.last_ime_bounds = Some(bounds);
++                    self.platform_window.update_ime_position(bounds);
++                }
++            } else {
++                self.last_ime_bounds = None;
++            }
+             self.platform_window.set_input_handler(input_handler);
+             accepts_text_input
+         } else {
++            self.last_ime_bounds = None;
+             false
+         };
+         self.apply_text_input_configuration(cx);

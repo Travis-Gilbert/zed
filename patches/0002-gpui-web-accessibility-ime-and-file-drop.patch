@@ -1,0 +1,1127 @@
+From fb73ad2bfeeaa52c75c899f31edea0f64e0c93cd Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Wed, 2 Sep 2026 09:58:39 -0400
+Subject: [PATCH 2/5] feat(gpui_web): mirror accessibility, position the IME
+ caret, deliver file drops
+
+Three web-platform gaps that HANDOFF-THEOREMWEB-SHELL-1.1 (M1, M2, M3) needs
+closed before a GPUI canvas can be the whole product surface in a browser.
+
+M1 -- accessibility. GPUI already builds a complete accesskit TreeUpdate every
+frame; on wasm nothing consumed it, because `a11y_init` was gated out of the
+wasm build. Removing that gate is the wiring; `gpui_web::a11y::WebA11yAdapter`
+is the consumer. It maintains a hidden DOM subtree beside the canvas -- one
+element per node, ARIA role mapped from `accesskit::Role`, plus label,
+description, value, state and absolute bounds so assistive technology
+hit-tests where the pixels are. `pointer-events: none` keeps pointer input on
+the canvas. Focus ownership stays on the hidden input, with
+`aria-activedescendant` tracking `TreeUpdate.focus`, matching GPUI's own
+active-descendant model. DOM `click` and `focusin` dispatch back as
+`accesskit::Action::Click` and `Focus` through one delegated listener each, so
+node churn allocates no closures. One polite live region announces label
+changes on nodes flagged live.
+
+The adapter diffs against its own retained map rather than through
+`accesskit_consumer`. `A11yNodeBuilder::finalize` always emits a whole tree --
+`tree: Some(...)` and every node, every frame -- so a consumer whose purpose is
+applying incremental updates to a retained tree would have nothing to apply.
+Diffing where the DOM writes happen is what actually keeps a steady frame free.
+
+M2 -- IME. `update_ime_position` was a no-op, so the browser opened candidate
+windows at the hidden input's 1x1 box in the viewport corner. It now moves that
+input to the caret. `text_input_state_changed` sets `inputmode`/`enterkeyhint`
+so mobile browsers raise the software keyboard only for editable content.
+
+M3 -- file drops. `PlatformInput::FileDrop` carries `ExternalPaths`, and a
+browser has no path to give. Rather than synthesize one no consumer could open,
+`drop` reads `DataTransfer.files`, awaits each `File.arrayBuffer`, and delivers
+`WebFileDrop { name, mime, bytes, position }` on `web_file_drops()`, for a host
+to turn into whatever its native FileDrop handler produces.
+
+Upstream notes
+- `send_blocking` is gated off wasm; on an unbounded channel it can never
+  block, so these three sites use `try_send`, which says the same thing and
+  compiles everywhere. Worth taking upstream on its own.
+- The honest fix for M3 is a `PlatformInput::FileDrop` that can carry bytes
+  instead of paths. That is a GPUI API change; this channel is the same
+  delivery without it.
+- `TextInputStateChange` carries no input *kind*, so `inputmode` can only be
+  "text" or "none". A per-field hint needs the input handler to describe
+  itself.
+---
+ Cargo.lock                       |   1 +
+ crates/gpui/src/window.rs        |  12 +-
+ crates/gpui_web/Cargo.toml       |   3 +
+ crates/gpui_web/src/a11y.rs      | 625 +++++++++++++++++++++++++++++++
+ crates/gpui_web/src/events.rs    |  40 ++
+ crates/gpui_web/src/file_drop.rs |  81 ++++
+ crates/gpui_web/src/gpui_web.rs  |   4 +
+ crates/gpui_web/src/window.rs    | 125 ++++++-
+ 8 files changed, 880 insertions(+), 11 deletions(-)
+ create mode 100644 crates/gpui_web/src/a11y.rs
+ create mode 100644 crates/gpui_web/src/file_drop.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index fdbdfe63e0..f9193983f8 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7725,6 +7725,7 @@ name = "gpui_web"
+ version = "0.1.0"
+ dependencies = [
+  "anyhow",
++ "async-channel 2.5.0",
+  "console_error_panic_hook",
+  "futures 0.3.32",
+  "gpui",
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 6951e4e73c..e3f259314f 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -70,7 +70,6 @@ mod prompts;
+ pub use a11y::A11ySubtreeBuilder;
+
+ use self::a11y::A11y;
+-#[cfg(not(target_family = "wasm"))]
+ use self::a11y::ROOT_NODE_ID;
+ use crate::util::{
+     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
+@@ -1589,7 +1588,6 @@ impl Window {
+         let accessibility_force_disabled = cx.accessibility_force_disabled;
+         let a11y_active_flag = Arc::new(AtomicBool::new(false));
+
+-        #[cfg(not(target_family = "wasm"))]
+         if !accessibility_force_disabled {
+             let mut initial_root_node = accesskit::Node::new(accesskit::Role::Window);
+             if let Some(title) = &initial_window_title {
+@@ -1601,6 +1599,9 @@ impl Window {
+                 tree_id: accesskit::TreeId::ROOT,
+                 focus: ROOT_NODE_ID,
+             };
++            // Unbounded, so `try_send` can only fail once the receiver is
++            // gone; `send_blocking` would say the same thing but does not
++            // exist on wasm, where blocking the only thread is forbidden.
+             let (activation_sender, activation_receiver) = async_channel::unbounded::<()>();
+             let (deactivation_sender, deactivation_receiver) = async_channel::unbounded::<()>();
+             let (action_sender, action_receiver) =
+@@ -1612,19 +1613,19 @@ impl Window {
+                     Box::new(move || {
+                         log::info!("Accessibility activated");
+                         active_flag.store(true, SeqCst);
+-                        activation_sender.send_blocking(()).log_err();
++                        activation_sender.try_send(()).log_err();
+                         Some(initial_tree.clone())
+                     })
+                 },
+                 action: Box::new(move |request| {
+-                    action_sender.send_blocking(request).log_err();
++                    action_sender.try_send(request).log_err();
+                 }),
+                 deactivation: {
+                     let active_flag = a11y_active_flag.clone();
+                     Box::new(move || {
+                         log::info!("Accessibility deactivated");
+                         active_flag.store(false, SeqCst);
+-                        deactivation_sender.send_blocking(()).log_err();
++                        deactivation_sender.try_send(()).log_err();
+                     })
+                 },
+             });
+@@ -6638,7 +6639,6 @@ impl Window {
+             .push((action, Box::new(listener)));
+     }
+
+-    #[cfg(not(target_family = "wasm"))]
+     pub(crate) fn handle_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
+         // Take listeners out temporarily so the closures can borrow Window
+         // mutably, then restore them afterward.
+diff --git a/crates/gpui_web/Cargo.toml b/crates/gpui_web/Cargo.toml
+index 613fbb55bb..8a9485df57 100644
+--- a/crates/gpui_web/Cargo.toml
++++ b/crates/gpui_web/Cargo.toml
+@@ -19,6 +19,7 @@ path = "src/gpui_web.rs"
+ [target.'cfg(target_family = "wasm")'.dependencies]
+ gpui.workspace = true
+ scheduler.workspace = true
++async-channel.workspace = true
+ parking_lot = { workspace = true, features = ["nightly"] }
+ gpui_wgpu.workspace = true
+ http_client.workspace = true
+@@ -54,6 +55,7 @@ web-sys = { version = "0.3", features = [
+     "Element",
+     "EventTarget",
+     "File",
++    "FileList",
+     "HtmlCanvasElement",
+     "HtmlElement",
+     "HtmlTextAreaElement",
+@@ -66,6 +68,7 @@ web-sys = { version = "0.3", features = [
+     "MediaQueryListEvent",
+     "MouseEvent",
+     "Navigator",
++    "Node",
+     "PointerEvent",
+     "ReadableStream",
+     "ReadableStreamDefaultReader",
+diff --git a/crates/gpui_web/src/a11y.rs b/crates/gpui_web/src/a11y.rs
+new file mode 100644
+index 0000000000..6a9002a341
+--- /dev/null
++++ b/crates/gpui_web/src/a11y.rs
+@@ -0,0 +1,625 @@
++//! Web accessibility adapter.
++//!
++//! Every other platform hands GPUI's per-frame [`TreeUpdate`] to an AccessKit
++//! platform adapter. The web has no such adapter, because the browser *is* the
++//! accessibility platform: assistive technology reads the DOM. A canvas has no
++//! DOM, so a canvas application is invisible to a screen reader.
++//!
++//! This adapter closes that gap by projecting the tree GPUI already builds into
++//! a hidden DOM subtree beside the canvas: one element per node, carrying the
++//! ARIA role, name, value, state and absolute bounds so assistive technology
++//! hit-tests where the pixels actually are. The subtree is `pointer-events:
++//! none` throughout, so ordinary pointer input still lands on the canvas, while
++//! an AT-synthesized `click()` or `focus()` still reaches our listeners and is
++//! dispatched back as an [`accesskit::Action`].
++//!
++//! Focus ownership does not move. The hidden input that owns keyboard focus
++//! keeps it, and `aria-activedescendant` on that input tracks
++//! [`TreeUpdate::focus`] -- which is the same active-descendant model GPUI uses
++//! internally, so the two agree by construction rather than by convention.
++//!
++//! The mirror is diffed against the previous frame, so a steady frame writes
++//! nothing to the DOM. That is what makes it affordable to leave on rather than
++//! gate behind a "screen reader detected" heuristic the web cannot answer.
++//!
++//! Upstream note: GPUI emits a *complete* tree every frame
++//! (`A11yNodeBuilder::finalize` always sets `tree: Some(..)` and pushes every
++//! node), so `accesskit_consumer` -- whose purpose is applying incremental
++//! updates to a retained tree -- would have nothing to do here. The retained
++//! `nodes` map below is the diff, and it holds the DOM element beside the values
++//! last written to it so a comparison is one struct compare, not a tree
++//! walk.
++
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::rc::Rc;
++
++use gpui::accesskit::{self, Action, ActionRequest, Live, NodeId, Rect, Role, Toggled, TreeUpdate};
++use wasm_bindgen::JsCast;
++use wasm_bindgen::prelude::*;
++
++/// The attribute that carries a node's AccessKit id on its mirror element.
++///
++/// One delegated listener on the container reads this rather than each element
++/// owning a closure, so node churn costs no allocations.
++const NODE_ATTRIBUTE: &str = "data-gpui-a11y-node";
++
++/// The id prefix for mirror elements. `aria-activedescendant` needs a document
++/// id to point at, so every mirrored node has one.
++const NODE_ID_PREFIX: &str = "gpui-a11y-";
++
++fn element_id(node_id: NodeId) -> String {
++    format!("{NODE_ID_PREFIX}{}", node_id.0)
++}
++
++fn node_id_from_element(element: &web_sys::Element) -> Option<NodeId> {
++    element
++        .get_attribute(NODE_ATTRIBUTE)?
++        .parse::<u64>()
++        .ok()
++        .map(NodeId)
++}
++
++/// The ARIA role for an AccessKit role.
++///
++/// `None` means "do not set a role attribute": a `<div>` with no role is a
++/// presentational grouping element, which is the correct projection for a node
++/// that only exists to hold children. Setting `role="generic"` instead would
++/// add a pointless stop for some screen readers.
++fn aria_role(role: Role) -> Option<&'static str> {
++    Some(match role {
++        Role::Unknown | Role::GenericContainer | Role::Pane | Role::TextRun => return None,
++
++        Role::Button | Role::DefaultButton => "button",
++        Role::CheckBox => "checkbox",
++        Role::RadioButton => "radio",
++        Role::Switch => "switch",
++        Role::Link => "link",
++        Role::Label | Role::Caption | Role::Legend => "caption",
++        Role::Image | Role::SvgRoot => "img",
++        Role::Heading => "heading",
++        Role::Paragraph | Role::Blockquote => "paragraph",
++        Role::Code => "code",
++        Role::Emphasis => "emphasis",
++        Role::Strong => "strong",
++        Role::Mark => "mark",
++
++        Role::TextInput
++        | Role::SearchInput
++        | Role::EmailInput
++        | Role::NumberInput
++        | Role::PasswordInput
++        | Role::PhoneNumberInput
++        | Role::UrlInput
++        | Role::DateInput
++        | Role::DateTimeInput
++        | Role::WeekInput
++        | Role::MonthInput
++        | Role::TimeInput => "textbox",
++        Role::MultilineTextInput => "textbox",
++        Role::ComboBox | Role::EditableComboBox => "combobox",
++        Role::SpinButton => "spinbutton",
++        Role::Slider => "slider",
++        Role::ColorWell => "button",
++
++        Role::List | Role::DescriptionList => "list",
++        Role::ListItem => "listitem",
++        Role::ListMarker => return None,
++        Role::ListBox => "listbox",
++        Role::ListBoxOption => "option",
++        Role::Grid => "grid",
++        Role::GridCell => "gridcell",
++        Role::Table | Role::LayoutTable => "table",
++        Role::Row | Role::LayoutTableRow => "row",
++        Role::RowGroup => "rowgroup",
++        Role::Cell | Role::LayoutTableCell => "cell",
++        Role::RowHeader => "rowheader",
++        Role::ColumnHeader => "columnheader",
++        Role::Tree => "tree",
++        Role::TreeItem => "treeitem",
++
++        Role::Menu | Role::MenuListPopup => "menu",
++        Role::MenuBar => "menubar",
++        Role::MenuItem | Role::MenuListOption => "menuitem",
++        Role::MenuItemCheckBox => "menuitemcheckbox",
++        Role::MenuItemRadio => "menuitemradio",
++        Role::Tab => "tab",
++        Role::TabList => "tablist",
++        Role::TabPanel => "tabpanel",
++        Role::Toolbar => "toolbar",
++        Role::RadioGroup => "radiogroup",
++        Role::Group | Role::Section | Role::Details | Role::Figure => "group",
++
++        Role::Dialog => "dialog",
++        Role::AlertDialog => "alertdialog",
++        Role::Alert => "alert",
++        Role::Status => "status",
++        Role::Log => "log",
++        Role::Marquee => "marquee",
++        Role::Timer => "timer",
++        Role::Tooltip => "tooltip",
++        Role::ProgressIndicator => "progressbar",
++        Role::Meter => "meter",
++        Role::ScrollBar => "scrollbar",
++        Role::Splitter => "separator",
++        Role::LineBreak => "separator",
++        Role::Search => "search",
++        Role::Form => "form",
++        Role::Banner | Role::Header => "banner",
++        Role::Navigation => "navigation",
++        Role::Main => "main",
++        Role::Complementary => "complementary",
++        Role::ContentInfo | Role::Footer => "contentinfo",
++        Role::Region => "region",
++        Role::Article => "article",
++        Role::Document | Role::RootWebArea => "document",
++        Role::Application => "application",
++        Role::Note => "note",
++        Role::Term => "term",
++        Role::Definition => "definition",
++        Role::Feed => "feed",
++        Role::FigureCaption => "figure",
++        Role::Comment => "comment",
++
++        // Everything else is structural or has no ARIA equivalent worth
++        // asserting; a wrong role is worse than no role, because assistive
++        // technology believes it.
++        _ => return None,
++    })
++}
++
++/// The subset of a node this adapter actually writes to the DOM.
++///
++/// Held beside the element so a frame that changed nothing compares equal and
++/// touches no DOM at all.
++#[derive(PartialEq)]
++struct Mirrored {
++    role: Option<&'static str>,
++    label: Option<String>,
++    description: Option<String>,
++    value: Option<String>,
++    bounds: Option<Rect>,
++    disabled: bool,
++    hidden: bool,
++    required: bool,
++    read_only: bool,
++    multiselectable: bool,
++    busy: bool,
++    selected: Option<bool>,
++    toggled: Option<Toggled>,
++    level: Option<usize>,
++    live: Option<Live>,
++    clickable: bool,
++    focusable: bool,
++    children: Vec<NodeId>,
++}
++
++impl Mirrored {
++    fn read(node: &accesskit::Node) -> Self {
++        Self {
++            role: aria_role(node.role()),
++            label: node.label().map(str::to_owned),
++            description: node.description().map(str::to_owned),
++            value: node.value().map(str::to_owned),
++            bounds: node.bounds(),
++            disabled: node.is_disabled(),
++            hidden: node.is_hidden(),
++            required: node.is_required(),
++            read_only: node.is_read_only(),
++            multiselectable: node.is_multiselectable(),
++            busy: node.is_busy(),
++            selected: node.is_selected(),
++            toggled: node.toggled(),
++            level: node.level(),
++            live: node.live(),
++            clickable: node.supports_action(Action::Click),
++            focusable: node.supports_action(Action::Focus),
++            children: node.children().to_vec(),
++        }
++    }
++}
++
++struct MirrorNode {
++    element: web_sys::Element,
++    applied: Mirrored,
++}
++
++/// Projects GPUI's accessibility tree into a hidden DOM subtree.
++pub(crate) struct WebA11yAdapter {
++    document: web_sys::Document,
++    container: web_sys::Element,
++    live_region: web_sys::Element,
++    input_element: web_sys::HtmlInputElement,
++    nodes: HashMap<NodeId, MirrorNode>,
++    focus: Option<NodeId>,
++    announced: String,
++    /// The delegated `click`/`focusin` listeners. Dropping the adapter removes
++    /// them, which is why they are owned here rather than forgotten.
++    _listeners: Vec<DelegatedListener>,
++}
++
++/// A delegated DOM listener that detaches itself when dropped.
++struct DelegatedListener {
++    target: web_sys::EventTarget,
++    kind: &'static str,
++    closure: Closure<dyn FnMut(web_sys::Event)>,
++}
++
++impl Drop for DelegatedListener {
++    fn drop(&mut self) {
++        let _ = self
++            .target
++            .remove_event_listener_with_callback(self.kind, self.closure.as_ref().unchecked_ref());
++    }
++}
++
++impl WebA11yAdapter {
++    /// Build the mirror subtree and wire the two delegated listeners that carry
++    /// assistive-technology activation back into GPUI.
++    pub(crate) fn new(
++        document: web_sys::Document,
++        input_element: web_sys::HtmlInputElement,
++        action: Rc<dyn Fn(ActionRequest)>,
++    ) -> anyhow::Result<Self> {
++        let body = document
++            .body()
++            .ok_or_else(|| anyhow::anyhow!("No `body` found on document"))?;
++
++        let container = document
++            .create_element("div")
++            .map_err(|error| anyhow::anyhow!("Failed to create a11y container: {error:?}"))?;
++        container.set_id("gpui-a11y-root");
++        // The mirror covers the canvas so absolute bounds land where the pixels
++        // are, and never intercepts pointer input.
++        set_style(
++            &container,
++            &[
++                ("position", "fixed"),
++                ("inset", "0"),
++                ("overflow", "hidden"),
++                ("pointer-events", "none"),
++                // Transparent rather than `display: none` or `visibility:
++                // hidden`, either of which would also hide it from assistive
++                // technology, which is the one reader it exists for.
++                ("color", "transparent"),
++                ("background", "transparent"),
++                ("user-select", "none"),
++                ("z-index", "0"),
++            ],
++        );
++        body.append_child(&container)
++            .map_err(|error| anyhow::anyhow!("Failed to append a11y container: {error:?}"))?;
++
++        let live_region = document
++            .create_element("div")
++            .map_err(|error| anyhow::anyhow!("Failed to create a11y live region: {error:?}"))?;
++        live_region.set_id("gpui-a11y-live");
++        let _ = live_region.set_attribute("aria-live", "polite");
++        let _ = live_region.set_attribute("aria-atomic", "true");
++        set_style(
++            &live_region,
++            &[
++                ("position", "absolute"),
++                ("width", "1px"),
++                ("height", "1px"),
++                ("overflow", "hidden"),
++                ("clip", "rect(0 0 0 0)"),
++                ("white-space", "nowrap"),
++            ],
++        );
++        container
++            .append_child(&live_region)
++            .map_err(|error| anyhow::anyhow!("Failed to append a11y live region: {error:?}"))?;
++
++        // One listener per event kind for the whole mirror. A node's id travels
++        // on the element, so adding or removing nodes costs no listener work.
++        let mut listeners = Vec::new();
++        for (kind, requested) in [("click", Action::Click), ("focusin", Action::Focus)] {
++            let action = action.clone();
++            let closure = Closure::wrap(Box::new(move |event: web_sys::Event| {
++                let Some(target) = event.target() else {
++                    return;
++                };
++                let Ok(element) = target.dyn_into::<web_sys::Element>() else {
++                    return;
++                };
++                let Some(node_id) = node_id_from_element(&element) else {
++                    return;
++                };
++                action(ActionRequest {
++                    action: requested,
++                    target_tree: accesskit::TreeId::ROOT,
++                    target_node: node_id,
++                    data: None,
++                });
++            }) as Box<dyn FnMut(web_sys::Event)>);
++            container
++                .add_event_listener_with_callback(kind, closure.as_ref().unchecked_ref())
++                .map_err(|error| anyhow::anyhow!("Failed to listen for {kind}: {error:?}"))?;
++            listeners.push(DelegatedListener {
++                target: container.clone().into(),
++                kind,
++                closure,
++            });
++        }
++
++        Ok(Self {
++            document,
++            container,
++            live_region,
++            input_element,
++            nodes: HashMap::default(),
++            focus: None,
++            announced: String::new(),
++            _listeners: listeners,
++        })
++    }
++
++    /// Apply one frame's tree to the mirror.
++    ///
++    /// `scale_factor` converts AccessKit's logical coordinates into CSS pixels,
++    /// which is what the mirror is positioned in.
++    pub(crate) fn apply(&mut self, update: &TreeUpdate, scale_factor: f32) {
++        let mut announcement: Option<String> = None;
++
++        for (node_id, node) in &update.nodes {
++            let read = Mirrored::read(node);
++
++            match self.nodes.get_mut(node_id) {
++                Some(existing) => {
++                    if existing.applied == read {
++                        continue;
++                    }
++                    // A live node whose name changed is the one thing worth
++                    // saying out loud; everything else the reader will reach by
++                    // navigating.
++                    if matches!(read.live, Some(Live::Polite) | Some(Live::Assertive))
++                        && existing.applied.label != read.label
++                        && let Some(label) = read.label.clone()
++                    {
++                        announcement = Some(label);
++                    }
++                    let reorder = existing.applied.children != read.children;
++                    write_node(&existing.element, &read, scale_factor);
++                    existing.applied = read;
++                    if reorder {
++                        self.reorder_children(*node_id);
++                    }
++                }
++                None => {
++                    let Ok(element) = self.document.create_element("div") else {
++                        continue;
++                    };
++                    element.set_id(&element_id(*node_id));
++                    let _ = element.set_attribute(NODE_ATTRIBUTE, &node_id.0.to_string());
++                    write_node(&element, &read, scale_factor);
++                    // Parented by the reorder pass below; appending here first
++                    // keeps it in the document so `aria-activedescendant` and
++                    // `getElementById` resolve even on the frame it appears.
++                    let _ = self.container.append_child(&element);
++                    self.nodes.insert(
++                        *node_id,
++                        MirrorNode {
++                            element,
++                            applied: read,
++                        },
++                    );
++                }
++            }
++        }
++
++        // Nodes absent from a full tree are gone, not merely unchanged: GPUI
++        // rebuilds the whole tree every frame.
++        let present: std::collections::HashSet<NodeId> =
++            update.nodes.iter().map(|(id, _)| *id).collect();
++        self.nodes.retain(|node_id, mirrored| {
++            if present.contains(node_id) {
++                return true;
++            }
++            if let Some(parent) = mirrored.element.parent_node() {
++                let _ = parent.remove_child(&mirrored.element);
++            }
++            false
++        });
++
++        // Newly created nodes were parked on the container; place every node
++        // that has children now that all of them exist.
++        for (node_id, node) in &update.nodes {
++            if !node.children().is_empty() {
++                self.reorder_children(*node_id);
++            }
++        }
++
++        if self.focus != Some(update.focus) {
++            self.focus = Some(update.focus);
++            if self.nodes.contains_key(&update.focus) {
++                let _ = self
++                    .input_element
++                    .set_attribute("aria-activedescendant", &element_id(update.focus));
++            } else {
++                let _ = self.input_element.remove_attribute("aria-activedescendant");
++            }
++        }
++
++        if let Some(announcement) = announcement
++            && announcement != self.announced
++        {
++            self.live_region.set_text_content(Some(&announcement));
++            self.announced = announcement;
++        }
++    }
++
++    /// Make the DOM children of `node_id` match its AccessKit children, in
++    /// order. Only called when that list actually changed.
++    fn reorder_children(&self, node_id: NodeId) {
++        let Some(parent) = self.nodes.get(&node_id) else {
++            return;
++        };
++        let children = parent.applied.children.clone();
++        for child_id in children {
++            let Some(child) = self.nodes.get(&child_id) else {
++                continue;
++            };
++            // `append_child` moves an already-parented node, so this both
++            // re-parents and orders in one pass.
++            let _ = parent.element.append_child(&child.element);
++        }
++    }
++}
++
++impl Drop for WebA11yAdapter {
++    fn drop(&mut self) {
++        if let Some(parent) = self.container.parent_node() {
++            let _ = parent.remove_child(&self.container);
++        }
++    }
++}
++
++fn set_style(element: &web_sys::Element, properties: &[(&str, &str)]) {
++    let Some(html) = element.dyn_ref::<web_sys::HtmlElement>() else {
++        return;
++    };
++    let style = html.style();
++    for (property, value) in properties {
++        let _ = style.set_property(property, value);
++    }
++}
++
++fn set_or_clear(element: &web_sys::Element, attribute: &str, value: Option<&str>) {
++    match value {
++        Some(value) => {
++            let _ = element.set_attribute(attribute, value);
++        }
++        None => {
++            let _ = element.remove_attribute(attribute);
++        }
++    }
++}
++
++fn set_flag(element: &web_sys::Element, attribute: &str, set: bool) {
++    set_or_clear(element, attribute, set.then_some("true"));
++}
++
++fn write_node(element: &web_sys::Element, node: &Mirrored, scale_factor: f32) {
++    set_or_clear(element, "role", node.role);
++    set_or_clear(element, "aria-label", node.label.as_deref());
++    set_or_clear(element, "aria-description", node.description.as_deref());
++    set_or_clear(element, "aria-valuetext", node.value.as_deref());
++
++    set_flag(element, "aria-disabled", node.disabled);
++    set_flag(element, "aria-required", node.required);
++    set_flag(element, "aria-readonly", node.read_only);
++    set_flag(element, "aria-multiselectable", node.multiselectable);
++    set_flag(element, "aria-busy", node.busy);
++    // `aria-hidden` is the projection of AccessKit's own hidden flag, so a node
++    // GPUI excluded from the tree stays excluded here too.
++    set_flag(element, "aria-hidden", node.hidden);
++
++    set_or_clear(
++        element,
++        "aria-selected",
++        node.selected
++            .map(|selected| if selected { "true" } else { "false" }),
++    );
++    set_or_clear(
++        element,
++        "aria-checked",
++        node.toggled.map(|toggled| match toggled {
++            Toggled::False => "false",
++            Toggled::True => "true",
++            Toggled::Mixed => "mixed",
++        }),
++    );
++    set_or_clear(
++        element,
++        "aria-level",
++        node.level.map(|level| level.to_string()).as_deref(),
++    );
++    set_or_clear(
++        element,
++        "aria-live",
++        node.live.and_then(|live| match live {
++            Live::Off => None,
++            Live::Polite => Some("polite"),
++            Live::Assertive => Some("assertive"),
++        }),
++    );
++
++    // A node the reader can activate must be reachable by the reader's own
++    // navigation. `tabindex="-1"` keeps it out of the tab ring -- the hidden
++    // input still owns the tab stop -- while making it a legal focus target for
++    // an AT-synthesized `focus()`.
++    set_or_clear(
++        element,
++        "tabindex",
++        (node.clickable || node.focusable).then_some("-1"),
++    );
++
++    match node.bounds {
++        Some(bounds) => {
++            let scale = f64::from(scale_factor.max(f32::EPSILON));
++            set_style(
++                element,
++                &[
++                    ("position", "absolute"),
++                    ("left", &format!("{}px", bounds.x0 / scale)),
++                    ("top", &format!("{}px", bounds.y0 / scale)),
++                    ("width", &format!("{}px", (bounds.x1 - bounds.x0) / scale)),
++                    ("height", &format!("{}px", (bounds.y1 - bounds.y0) / scale)),
++                    ("pointer-events", "none"),
++                    ("margin", "0"),
++                ],
++            );
++        }
++        None => {
++            // A node with no bounds is structural. It must still exist so the
++            // subtree keeps its shape, but it should not claim screen area.
++            set_style(
++                element,
++                &[
++                    ("position", "static"),
++                    ("width", "0"),
++                    ("height", "0"),
++                    ("pointer-events", "none"),
++                ],
++            );
++        }
++    }
++}
++
++/// The retained mirror, exposed so a host can assert that it agrees with
++/// `Window::debug_a11y_tree_json` for a fixture frame.
++#[derive(Debug, Default, PartialEq, Eq)]
++pub struct A11yMirrorSummary {
++    /// One entry per mirrored node.
++    pub node_count: usize,
++    /// The document id currently named by `aria-activedescendant`, if any.
++    pub focused_element_id: Option<String>,
++}
++
++impl WebA11yAdapter {
++    pub(crate) fn summary(&self) -> A11yMirrorSummary {
++        A11yMirrorSummary {
++            node_count: self.nodes.len(),
++            focused_element_id: self.input_element.get_attribute("aria-activedescendant"),
++        }
++    }
++}
++
++thread_local! {
++    /// The live adapter for the current window, so a host can read the mirror
++    /// summary without owning the window. There is exactly one window on the
++    /// web, and exactly one main thread.
++    static SUMMARY_SOURCE: RefCell<Option<Rc<dyn Fn() -> A11yMirrorSummary>>> =
++        const { RefCell::new(None) };
++}
++
++pub(crate) fn publish_summary_source(source: Rc<dyn Fn() -> A11yMirrorSummary>) {
++    SUMMARY_SOURCE.with(|cell| *cell.borrow_mut() = Some(source));
++}
++
++/// The current accessibility mirror, for oracles that compare it against
++/// GPUI's own `debug_a11y_tree_json`.
++pub fn a11y_mirror_summary() -> Option<A11yMirrorSummary> {
++    SUMMARY_SOURCE.with(|cell| cell.borrow().as_ref().map(|source| source()))
++}
+diff --git a/crates/gpui_web/src/events.rs b/crates/gpui_web/src/events.rs
+index a6a1b2f4be..15d5891a3d 100644
+--- a/crates/gpui_web/src/events.rs
++++ b/crates/gpui_web/src/events.rs
+@@ -682,10 +682,50 @@ impl WebWindowInner {
+         })
+     }
+
++    /// Reads the dropped files and delivers them on [`crate::web_file_drops`].
++    ///
++    /// `PlatformInput::FileDrop` carries `ExternalPaths`, and a browser has no
++    /// path to give: a `File` exposes bytes and a name, never a location. So
++    /// the drop is read here and delivered on its own channel rather than
++    /// synthesized into a path that no consumer could open. `preventDefault`
++    /// still runs first, because without it the browser navigates away from
++    /// the application to display the dropped file.
+     fn register_drop(self: &Rc<Self>) -> EventListenerHandle {
+         self.listen("drop", move |event: JsValue| {
+             let event: web_sys::DragEvent = event.unchecked_into();
+             event.prevent_default();
++
++            let position = mouse_position_in_element(&event);
++            let Some(files) = event.data_transfer().and_then(|transfer| transfer.files()) else {
++                return;
++            };
++            for index in 0..files.length() {
++                let Some(file) = files.item(index) else {
++                    continue;
++                };
++                // `File::array_buffer` is the only way to see the bytes, and it
++                // is asynchronous, so each file is delivered when its own read
++                // resolves rather than as one ordered batch.
++                wasm_bindgen_futures::spawn_local(async move {
++                    let name = file.name();
++                    let mime = file.type_();
++                    let buffer =
++                        match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
++                            Ok(buffer) => buffer,
++                            Err(error) => {
++                                log::warn!("failed to read dropped file {name}: {error:?}");
++                                return;
++                            }
++                        };
++                    let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
++                    crate::file_drop::deliver(crate::WebFileDrop {
++                        name,
++                        mime,
++                        bytes,
++                        position,
++                    });
++                });
++            }
+         })
+     }
+
+diff --git a/crates/gpui_web/src/file_drop.rs b/crates/gpui_web/src/file_drop.rs
+new file mode 100644
+index 0000000000..287a920760
+--- /dev/null
++++ b/crates/gpui_web/src/file_drop.rs
+@@ -0,0 +1,81 @@
++//! File drops, delivered.
++//!
++//! GPUI's cross-platform file drop is [`gpui::PlatformInput::FileDrop`], which
++//! carries `ExternalPaths` -- filesystem paths. A browser never gives us one: a
++//! `drop` event exposes `File` objects, whose bytes are readable but whose
++//! location is not. So the web platform historically intercepted `dragover` and
++//! `drop` only to stop the browser navigating to the dropped file, and threw the
++//! payload away.
++//!
++//! Rather than synthesize a path that no consumer could open, the drop is
++//! delivered on its own channel with the bytes already read. A host that wants
++//! web file drops subscribes with [`web_file_drops`] and turns each
++//! [`WebFileDrop`] into whatever its native `FileDrop` handler would have
++//! produced -- an attachment, a document, a task -- so the two paths converge in
++//! the host rather than in a fake path.
++//!
++//! Upstream note: the honest fix is a `PlatformInput::FileDrop` variant that can
++//! carry bytes instead of paths, which is a GPUI API change. This channel is the
++//! same delivery without that change.
++
++use std::cell::RefCell;
++
++use gpui::{Pixels, Point};
++
++/// A file dropped on the window, with its contents already read.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct WebFileDrop {
++    /// The file name as the browser reported it. It is a name, not a path:
++    /// there is no directory component and it is attacker-controlled, so treat
++    /// it as a label rather than as a place to write.
++    pub name: String,
++    /// The browser's MIME type, empty when it could not determine one.
++    pub mime: String,
++    /// The whole file. Browsers hand out files by value, so there is no
++    /// streaming variant to prefer here.
++    pub bytes: Vec<u8>,
++    /// Where the drop landed, in window coordinates, so a host can route it to
++    /// the surface under the pointer.
++    pub position: Point<Pixels>,
++}
++
++thread_local! {
++    /// One process-wide channel. The web has exactly one window and one main
++    /// thread, and the drop listener is installed by the window rather than by
++    /// the host, so the host needs somewhere to reach that does not require
++    /// holding the window.
++    static CHANNEL: RefCell<Option<(
++        async_channel::Sender<WebFileDrop>,
++        async_channel::Receiver<WebFileDrop>,
++    )>> = const { RefCell::new(None) };
++}
++
++fn with_channel<R>(
++    read: impl FnOnce(
++        &(
++            async_channel::Sender<WebFileDrop>,
++            async_channel::Receiver<WebFileDrop>,
++        ),
++    ) -> R,
++) -> R {
++    CHANNEL.with(|cell| {
++        let mut cell = cell.borrow_mut();
++        let channel = cell.get_or_insert_with(async_channel::unbounded);
++        read(channel)
++    })
++}
++
++/// Subscribe to file drops on the web window.
++///
++/// The channel is unbounded and the receiver is cloneable, so subscribing more
++/// than once is allowed; each subscriber competes for drops rather than each
++/// receiving a copy, which matches the single-consumer shape a host wants.
++pub fn web_file_drops() -> async_channel::Receiver<WebFileDrop> {
++    with_channel(|(_, receiver)| receiver.clone())
++}
++
++pub(crate) fn deliver(drop: WebFileDrop) {
++    // Unbounded, so this never blocks; a failure means every receiver is gone,
++    // which is the ordinary state of a host that does not want file drops.
++    let _ = with_channel(|(sender, _)| sender.try_send(drop));
++}
+diff --git a/crates/gpui_web/src/gpui_web.rs b/crates/gpui_web/src/gpui_web.rs
+index 6084804320..7d4fdd1069 100644
+--- a/crates/gpui_web/src/gpui_web.rs
++++ b/crates/gpui_web/src/gpui_web.rs
+@@ -5,9 +5,11 @@
+ //! force either backend with [`WebBackendPreference`]. Opening a second top-level window, or
+ //! reopening one after it closes, returns [`WebWindowError`].
+
++mod a11y;
+ mod dispatcher;
+ mod display;
+ mod events;
++mod file_drop;
+ mod http_client;
+ mod ime_mirror;
+ mod keyboard;
+@@ -15,8 +17,10 @@ mod logging;
+ mod platform;
+ mod window;
+
++pub use a11y::{A11yMirrorSummary, a11y_mirror_summary};
+ pub use dispatcher::WebDispatcher;
+ pub use display::WebDisplay;
++pub use file_drop::{WebFileDrop, web_file_drops};
+ pub use gpui_wgpu::WebBackendPreference;
+ pub use http_client::{FetchCredentials, FetchHttpClient};
+ pub use keyboard::WebKeyboardLayout;
+diff --git a/crates/gpui_web/src/window.rs b/crates/gpui_web/src/window.rs
+index 6ea3abb7bf..3e0ded9496 100644
+--- a/crates/gpui_web/src/window.rs
++++ b/crates/gpui_web/src/window.rs
+@@ -1,3 +1,4 @@
++use crate::a11y::WebA11yAdapter;
+ use crate::display::WebDisplay;
+ use crate::events::{
+     ClickState, EventListenerHandle, TouchIds, WebEventListeners, is_mac_platform,
+@@ -8,10 +9,10 @@ use std::sync::Arc;
+ use std::{cell::Cell, cell::RefCell, rc::Rc};
+
+ use gpui::{
+-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, DispatchEventResult,
+-    ExternalGpuSurfaceError, ExternalGpuSurfaceHandle, GpuSpecs, Modifiers, MouseButton, Pixels,
+-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+-    PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
++    A11yCallbacks, AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels,
++    DispatchEventResult, ExternalGpuSurfaceError, ExternalGpuSurfaceHandle, GpuSpecs, Modifiers,
++    MouseButton, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
++    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
+     TextInputConfiguration, TextInputStateChange, WindowAppearance,
+     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+     WindowParams, px,
+@@ -84,6 +85,9 @@ pub(crate) struct WebWindowInner {
+     /// pans must leave them untouched, or scrolling over editable content
+     /// flickers the keyboard and drags the caret around.
+     pub(crate) touch_tap_candidate: Cell<Option<(i32, Point<Pixels>)>>,
++    /// The accessibility mirror, present once assistive technology support is
++    /// initialized. `None` until then, and when accessibility is force-disabled.
++    pub(crate) a11y: RefCell<Option<WebA11yAdapter>>,
+     mql_handle: RefCell<Option<MqlHandle>>,
+     pending_physical_size: Cell<Option<(u32, u32)>>,
+     raf_id: Cell<Option<i32>>,
+@@ -210,6 +214,7 @@ impl WebWindow {
+             visual_viewport_probe: Cell::new((0.0, 0.0)),
+             gesture_start_visual_viewport_height: Cell::new(0.0),
+             touch_tap_candidate: Cell::new(None),
++            a11y: RefCell::new(None),
+             mql_handle: RefCell::new(None),
+             pending_physical_size: Cell::new(None),
+             raf_id: Cell::new(None),
+@@ -868,7 +873,117 @@ impl PlatformWindow for WebWindow {
+         Some(self.inner.state.borrow().renderer.gpu_specs())
+     }
+
+-    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
++    /// Move the hidden input to the caret.
++    ///
++    /// The input is the element the browser composes into, so the browser opens
++    /// the IME candidate window at the input's box -- which, before this, was a
++    /// 1x1 box pinned at the viewport origin. Composing Japanese anywhere in the
++    /// window put the candidate list in the top-left corner. Moving the input to
++    /// the caret is the whole fix; nothing else about focus or composition
++    /// changes.
++    fn update_ime_position(&self, bounds: Bounds<Pixels>) {
++        // `bounds` is in the window's logical coordinates, which on the web are
++        // CSS pixels -- the same units the input's style takes -- so there is no
++        // scale factor to divide out here.
++        let style = self.inner.input_element.style();
++        let _ = style.set_property("left", &format!("{}px", f32::from(bounds.origin.x)));
++        let _ = style.set_property("top", &format!("{}px", f32::from(bounds.origin.y)));
++        // Give the input the caret's height so the candidate window clears the
++        // line rather than overlapping it, but keep the width at 1px: a wide
++        // transparent input over the canvas would still swallow nothing (it is
++        // behind the canvas in paint order) yet would confuse hit-testing tools.
++        let _ = style.set_property(
++            "height",
++            &format!("{}px", f32::from(bounds.size.height).max(1.0)),
++        );
++    }
++
++    /// Track the focused editable so mobile browsers raise the software
++    /// keyboard only when something is actually editable.
++    ///
++    /// GPUI reports focus, selection and content transitions but not the *kind*
++    /// of the focused input, so `inputmode` can only be "there is text here" or
++    /// "there is not". A per-field hint (`numeric`, `email`, `url`) needs the
++    /// input handler to describe itself, which is a GPUI API change rather than
++    /// a platform one.
++    fn text_input_state_changed(&self, change: TextInputStateChange) {
++        let input = &self.inner.input_element;
++        match change {
++            TextInputStateChange::FocusGained => {
++                let _ = input.set_attribute("inputmode", "text");
++                let _ = input.set_attribute("enterkeyhint", "enter");
++            }
++            TextInputStateChange::FocusLost => {
++                let _ = input.set_attribute("inputmode", "none");
++                let _ = input.remove_attribute("enterkeyhint");
++                // Nothing is editable, so park the composition box back at the
++                // origin rather than leaving it over a stale caret.
++                let style = input.style();
++                let _ = style.set_property("left", "0");
++                let _ = style.set_property("top", "0");
++                let _ = style.set_property("height", "1px");
++            }
++            TextInputStateChange::SelectionChanged | TextInputStateChange::ContentChanged => {}
++        }
++    }
++
++    /// Stand up the accessibility mirror and turn accessibility on.
++    ///
++    /// Unlike a desktop adapter there is nothing to wait for: the browser is
++    /// always "connected", because assistive technology reads the DOM whether
++    /// or not we can detect it. There is no reliable screen-reader probe on the
++    /// web, and guessing wrong means shipping an inaccessible application to
++    /// the people who need it. So the mirror is built and activated eagerly,
++    /// and stays on -- it is diffed, so a steady frame costs nothing.
++    fn a11y_init(&self, callbacks: A11yCallbacks) {
++        let Some(document) = self.inner.browser_window.document() else {
++            log::error!("a11y: no document; the accessibility mirror was not created");
++            return;
++        };
++
++        let action = callbacks.action;
++        let action: Rc<dyn Fn(gpui::accesskit::ActionRequest)> =
++            Rc::new(move |request| action(request));
++
++        let adapter = match WebA11yAdapter::new(document, self.inner.input_element.clone(), action)
++        {
++            Ok(adapter) => adapter,
++            Err(error) => {
++                log::error!("a11y: failed to create the accessibility mirror: {error:?}");
++                return;
++            }
++        };
++
++        let initial = (callbacks.activation)();
++        *self.inner.a11y.borrow_mut() = Some(adapter);
++        if let Some(update) = initial {
++            let scale_factor = self.inner.state.borrow().scale_factor;
++            if let Some(adapter) = self.inner.a11y.borrow_mut().as_mut() {
++                adapter.apply(&update, scale_factor);
++            }
++        }
++
++        // Let an oracle read the mirror without owning the window. Weak so the
++        // published closure never keeps the window alive on its own.
++        let weak = Rc::downgrade(&self.inner);
++        crate::a11y::publish_summary_source(Rc::new(move || {
++            weak.upgrade()
++                .and_then(|inner| inner.a11y.borrow().as_ref().map(WebA11yAdapter::summary))
++                .unwrap_or_default()
++        }));
++    }
++
++    fn a11y_tree_update(&self, tree_update: gpui::accesskit::TreeUpdate) {
++        let scale_factor = self.inner.state.borrow().scale_factor;
++        if let Some(adapter) = self.inner.a11y.borrow_mut().as_mut() {
++            adapter.apply(&tree_update, scale_factor);
++        }
++    }
++
++    /// The mirror is positioned in the viewport, and the canvas fills the
++    /// viewport, so a resize needs no repositioning: the next frame's tree
++    /// carries the new bounds for every node.
++    fn a11y_update_window_bounds(&self) {}
+
+     fn request_decorations(&self, _decorations: WindowDecorations) {}
+
+--
+Theorem hard-fork patch series

@@ -1,0 +1,111 @@
+From 2c5c5ba19282bb12ab6d1b27f6a0471b55fc7877 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Wed, 2 Sep 2026 11:35:07 -0400
+Subject: [PATCH 4/5] fix(gpui_web): put a mirrored node where a reader will
+ look for it
+
+Two defects the mirror could not see itself.
+
+The rectangles were wrong. AccessKit reports every node's bounds in window
+coordinates, but the mirror nests its elements the way the tree nests its
+nodes, and an absolutely positioned element resolves against its nearest
+positioned ancestor -- here, its mirrored parent. Each level re-added its
+ancestor's origin: a tab inside a tab list at (249, 131) landed at (498,
+262), and the chat composer landed at (1770, 754), outside a 1280x720
+viewport entirely. `fixed` resolves against the viewport whatever it sits
+inside, which is the frame the coordinates are already in and the frame the
+root's `inset: 0` already assumes. The rectangle is where a screen reader
+draws its cursor and where touch exploration decides what it is over, so
+this was not cosmetic.
+
+The IME input had no id. It is the whole text surface on the web -- where
+composition happens, where `inputmode` is set, and what `update_ime_position`
+moves to the caret -- and the only way to find it from outside was its
+position in the body. Naming it makes it addressable by a host that wants to
+style it and by a test that wants to prove a candidate window opens at the
+caret.
+
+Node count, focus, and axe-core were all green while every nested rectangle
+was wrong, so the mirror's own assertions could not have caught this. The
+oracle now asserts that every mirrored rectangle is on screen.
+---
+ crates/gpui_web/src/a11y.rs       | 17 ++++++++++++++++-
+ crates/gpui_web/src/gpui_web.rs   |  2 +-
+ crates/gpui_web/src/ime_mirror.rs |  3 ++-
+ crates/gpui_web/src/window.rs     |  4 ++++
+ 4 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/crates/gpui_web/src/a11y.rs b/crates/gpui_web/src/a11y.rs
+index 9a3fa171f8..eea255e576 100644
+--- a/crates/gpui_web/src/a11y.rs
++++ b/crates/gpui_web/src/a11y.rs
+@@ -603,7 +603,22 @@ fn write_node(element: &web_sys::Element, node: &Mirrored, scale_factor: f32) {
+             set_style(
+                 element,
+                 &[
+-                    ("position", "absolute"),
++                    // `fixed`, not `absolute`. AccessKit reports every node's
++                    // bounds in window coordinates, but the mirror nests its
++                    // elements the way the tree nests its nodes -- and an
++                    // absolutely positioned element resolves against its
++                    // nearest positioned ancestor, which here is its mirrored
++                    // parent. Absolute coordinates written into a nested
++                    // absolute element accumulate their ancestors' origins:
++                    // a tab inside a tablist at (249, 131) landed at (498,
++                    // 262), and a node deeper still landed further out again.
++                    // A fixed element resolves against the viewport whatever
++                    // it sits inside, which is the frame these coordinates are
++                    // already in -- the same frame the root's `inset: 0`
++                    // assumes. The rectangle matters: it is where a screen
++                    // reader draws its cursor and where a touch exploration
++                    // gesture decides it is.
++                    ("position", "fixed"),
+                     ("left", &format!("{}px", bounds.x0 / scale)),
+                     ("top", &format!("{}px", bounds.y0 / scale)),
+                     ("width", &format!("{}px", (bounds.x1 - bounds.x0) / scale)),
+diff --git a/crates/gpui_web/src/gpui_web.rs b/crates/gpui_web/src/gpui_web.rs
+index 7d4fdd1069..5d0cbc14b2 100644
+--- a/crates/gpui_web/src/gpui_web.rs
++++ b/crates/gpui_web/src/gpui_web.rs
+@@ -26,4 +26,4 @@ pub use http_client::{FetchCredentials, FetchHttpClient};
+ pub use keyboard::WebKeyboardLayout;
+ pub use logging::init_logging;
+ pub use platform::{WebPlatform, WebWindowError};
+-pub use window::WebWindow;
++pub use window::{IME_INPUT_ELEMENT_ID, WebWindow};
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index 75ef807113..7e9d558004 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -20,7 +20,7 @@ use std::rc::Rc;
+ use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration};
+ use wasm_bindgen::JsCast;
+
+-use crate::window::WebWindowInner;
++use crate::window::{IME_INPUT_ELEMENT_ID, WebWindowInner};
+
+ /// UTF-16 code units of document text mirrored on each side of the
+ /// selection.
+@@ -105,6 +105,7 @@ impl ImeMirror {
+             .map_err(|e| anyhow::anyhow!("Failed to create textarea element: {e:?}"))?
+             .dyn_into()
+             .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
++        element.set_id(IME_INPUT_ELEMENT_ID);
+         let style = element.style();
+         style.set_property("position", "fixed").ok();
+         style.set_property("top", "0").ok();
+diff --git a/crates/gpui_web/src/window.rs b/crates/gpui_web/src/window.rs
+index 3e0ded9496..4c8e15a152 100644
+--- a/crates/gpui_web/src/window.rs
++++ b/crates/gpui_web/src/window.rs
+@@ -20,6 +20,10 @@ use gpui::{
+ use gpui_wgpu::{WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu};
+ use wasm_bindgen::prelude::*;
+
++/// The id of the hidden textarea that carries browser text input, IME
++/// composition, and caret positioning for GPUI's web platform.
++pub const IME_INPUT_ELEMENT_ID: &str = "gpui-ime-input";
++
+ #[derive(Default)]
+ pub(crate) struct WebWindowCallbacks {
+     pub(crate) request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
