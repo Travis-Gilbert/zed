@@ -705,7 +705,12 @@ impl PlatformWindow for WebWindow {
     fn text_input_state_changed(&self, change: TextInputStateChange) {
         match change {
             TextInputStateChange::FocusGained => self.inner.sync_virtual_keyboard(true),
-            TextInputStateChange::FocusLost => self.inner.sync_virtual_keyboard(false),
+            TextInputStateChange::FocusLost => {
+                self.inner.sync_virtual_keyboard(false);
+                // Nothing is editable, so park the composition box rather than
+                // leaving it over a caret that is no longer there.
+                self.inner.ime_mirror.park();
+            }
             TextInputStateChange::SelectionChanged | TextInputStateChange::ContentChanged => {}
         }
     }
@@ -877,58 +882,17 @@ impl PlatformWindow for WebWindow {
         Some(self.inner.state.borrow().renderer.gpu_specs())
     }
 
-    /// Move the hidden input to the caret.
+    /// Move the IME mirror to the caret, so the candidate window opens there.
     ///
-    /// The input is the element the browser composes into, so the browser opens
-    /// the IME candidate window at the input's box -- which, before this, was a
-    /// 1x1 box pinned at the viewport origin. Composing Japanese anywhere in the
-    /// window put the candidate list in the top-left corner. Moving the input to
-    /// the caret is the whole fix; nothing else about focus or composition
-    /// changes.
+    /// See [`ImeMirror::place_at_caret`] for why the element moves at all.
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         // `bounds` is in the window's logical coordinates, which on the web are
-        // CSS pixels -- the same units the input's style takes -- so there is no
+        // CSS pixels -- the units the mirror's style takes -- so there is no
         // scale factor to divide out here.
-        let style = self.inner.input_element.style();
-        let _ = style.set_property("left", &format!("{}px", f32::from(bounds.origin.x)));
-        let _ = style.set_property("top", &format!("{}px", f32::from(bounds.origin.y)));
-        // Give the input the caret's height so the candidate window clears the
-        // line rather than overlapping it, but keep the width at 1px: a wide
-        // transparent input over the canvas would still swallow nothing (it is
-        // behind the canvas in paint order) yet would confuse hit-testing tools.
-        let _ = style.set_property(
-            "height",
-            &format!("{}px", f32::from(bounds.size.height).max(1.0)),
+        self.inner.ime_mirror.place_at_caret(
+            (f32::from(bounds.origin.x), f32::from(bounds.origin.y)),
+            f32::from(bounds.size.height),
         );
-    }
-
-    /// Track the focused editable so mobile browsers raise the software
-    /// keyboard only when something is actually editable.
-    ///
-    /// GPUI reports focus, selection and content transitions but not the *kind*
-    /// of the focused input, so `inputmode` can only be "there is text here" or
-    /// "there is not". A per-field hint (`numeric`, `email`, `url`) needs the
-    /// input handler to describe itself, which is a GPUI API change rather than
-    /// a platform one.
-    fn text_input_state_changed(&self, change: TextInputStateChange) {
-        let input = &self.inner.input_element;
-        match change {
-            TextInputStateChange::FocusGained => {
-                let _ = input.set_attribute("inputmode", "text");
-                let _ = input.set_attribute("enterkeyhint", "enter");
-            }
-            TextInputStateChange::FocusLost => {
-                let _ = input.set_attribute("inputmode", "none");
-                let _ = input.remove_attribute("enterkeyhint");
-                // Nothing is editable, so park the composition box back at the
-                // origin rather than leaving it over a stale caret.
-                let style = input.style();
-                let _ = style.set_property("left", "0");
-                let _ = style.set_property("top", "0");
-                let _ = style.set_property("height", "1px");
-            }
-            TextInputStateChange::SelectionChanged | TextInputStateChange::ContentChanged => {}
-        }
     }
 
     /// Stand up the accessibility mirror and turn accessibility on.
@@ -949,7 +913,7 @@ impl PlatformWindow for WebWindow {
         let action: Rc<dyn Fn(gpui::accesskit::ActionRequest)> =
             Rc::new(move |request| action(request));
 
-        let adapter = match WebA11yAdapter::new(document, self.inner.input_element.clone(), action)
+        let adapter = match WebA11yAdapter::new(document, self.inner.ime_mirror.host().clone(), action)
         {
             Ok(adapter) => adapter,
             Err(error) => {

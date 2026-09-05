@@ -264,7 +264,7 @@ pub(crate) struct WebA11yAdapter {
     document: web_sys::Document,
     container: web_sys::Element,
     live_region: web_sys::Element,
-    input_element: web_sys::HtmlInputElement,
+    ime_host: web_sys::HtmlElement,
     nodes: HashMap<NodeId, MirrorNode>,
     focus: Option<NodeId>,
     announced: String,
@@ -293,7 +293,7 @@ impl WebA11yAdapter {
     /// assistive-technology activation back into GPUI.
     pub(crate) fn new(
         document: web_sys::Document,
-        input_element: web_sys::HtmlInputElement,
+        ime_host: web_sys::HtmlElement,
         action: Rc<dyn Fn(ActionRequest)>,
     ) -> anyhow::Result<Self> {
         let body = document
@@ -382,7 +382,7 @@ impl WebA11yAdapter {
             document,
             container,
             live_region,
-            input_element,
+            ime_host,
             nodes: HashMap::default(),
             focus: None,
             announced: String::new(),
@@ -469,10 +469,10 @@ impl WebA11yAdapter {
             self.focus = Some(update.focus);
             if self.nodes.contains_key(&update.focus) {
                 let _ = self
-                    .input_element
+                    .ime_host
                     .set_attribute("aria-activedescendant", &element_id(update.focus));
             } else {
-                let _ = self.input_element.remove_attribute("aria-activedescendant");
+                let _ = self.ime_host.remove_attribute("aria-activedescendant");
             }
         }
 
@@ -658,7 +658,7 @@ impl WebA11yAdapter {
     pub(crate) fn summary(&self) -> A11yMirrorSummary {
         A11yMirrorSummary {
             node_count: self.nodes.len(),
-            focused_element_id: self.input_element.get_attribute("aria-activedescendant"),
+            focused_element_id: self.ime_host.get_attribute("aria-activedescendant"),
         }
     }
 }

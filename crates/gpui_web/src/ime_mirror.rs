@@ -189,6 +189,49 @@ impl ImeMirror {
         self.element.as_ref()
     }
 
+    /// The mirror's element, for callers that position it or write ARIA on it.
+    ///
+    /// The invariant this module holds is over the element's *value and
+    /// selection*, which stay private. Its box and its attributes are another
+    /// matter, and two callers outside this module need them: the IME composes
+    /// into this element, so the browser opens its candidate window at this
+    /// element's box, and assistive technology reports focus through the
+    /// `aria-activedescendant` written here.
+    pub(crate) fn host(&self) -> &web_sys::HtmlElement {
+        self.element.as_ref()
+    }
+
+    /// Move the mirror to the caret so the IME candidate window opens there.
+    ///
+    /// `new` leaves the element pinned at the viewport origin, which put the
+    /// candidate list in the top-left corner no matter where composition
+    /// happened. Moving the element is the whole fix; nothing about focus or
+    /// composition changes.
+    ///
+    /// `origin` and `height` are in CSS pixels, which are also the window's
+    /// logical coordinates on the web, so there is no scale factor to divide
+    /// out. The height is the caret's, so the candidate window clears the line
+    /// rather than overlapping it. The width stays at the 1px `new` set: a wide
+    /// transparent element over the canvas would still swallow nothing, because
+    /// it paints behind the canvas, but it would confuse hit-testing tools.
+    pub(crate) fn place_at_caret(&self, origin: (f32, f32), height: f32) {
+        let style = self.element.style();
+        let _ = style.set_property("left", &format!("{}px", origin.0));
+        let _ = style.set_property("top", &format!("{}px", origin.1));
+        let _ = style.set_property("height", &format!("{}px", height.max(1.0)));
+    }
+
+    /// Park the mirror back at the origin.
+    ///
+    /// Called when nothing is editable, so the composition box does not sit
+    /// over a caret that is no longer there.
+    pub(crate) fn park(&self) {
+        let style = self.element.style();
+        let _ = style.set_property("left", "0");
+        let _ = style.set_property("top", "0");
+        let _ = style.set_property("height", "1px");
+    }
+
     pub(crate) fn focus(&self) {
         self.element.focus().ok();
     }
