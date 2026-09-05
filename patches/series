@@ -10,3 +10,4 @@
 0010-gpui-web-ime-mirror-integration.patch
 0011-gpui-windows-core-lock-edge.patch
 0012-gpui-linux-rust-1.90-ashpd.patch
+0013-gpui-desktop-ime-keyboard-focus.patch

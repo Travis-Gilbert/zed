@@ -39,3 +39,10 @@ scheduled runs retain that maintenance behavior automatically.
 The ASHPD patch selects 0.13.6, the first 0.13 patch declaring Rust 1.87
 compatibility. It retains the dependency graph and GPUI portal APIs from 0.13.2,
 whose Rust 1.92 minimum prevented the required Rust 1.90 Linux check.
+
+The desktop focus patch keeps the read-only IME mirror focused when an editor
+closes, because it also receives GPUI keyboard shortcuts. Coarse-pointer
+environments retain the existing blur path for software-keyboard dismissal;
+the same pointer-capability query serves both policies. TheoremWeb browser
+interaction and direct DOM focus checks validate this prerequisite separately
+from the source/locked Linux compiler gate.
