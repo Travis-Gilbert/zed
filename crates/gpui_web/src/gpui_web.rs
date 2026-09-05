@@ -12,6 +12,7 @@ mod events;
 mod file_drop;
 mod http_client;
 mod ime_mirror;
+mod input_edit;
 mod keyboard;
 mod logging;
 mod platform;

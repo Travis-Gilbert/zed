@@ -264,7 +264,7 @@ pub(crate) struct WebA11yAdapter {
     document: web_sys::Document,
     container: web_sys::Element,
     live_region: web_sys::Element,
-    input_element: web_sys::HtmlInputElement,
+    input_element: web_sys::HtmlElement,
     nodes: HashMap<NodeId, MirrorNode>,
     focus: Option<NodeId>,
     announced: String,
@@ -293,7 +293,7 @@ impl WebA11yAdapter {
     /// assistive-technology activation back into GPUI.
     pub(crate) fn new(
         document: web_sys::Document,
-        input_element: web_sys::HtmlInputElement,
+        input_element: web_sys::HtmlElement,
         action: Rc<dyn Fn(ActionRequest)>,
     ) -> anyhow::Result<Self> {
         let body = document

@@ -1,14 +1,22 @@
 name: Zed patch series
 
 on:
+  pull_request:
+    paths:
+      - .github/workflows/zed-patch-series.yml
+      - patches/**
+      - crates/gpui_web/**
   workflow_dispatch:
+    inputs:
+      rebase_upstream:
+        description: Also rebase the series onto upstream and publish a maintenance PR
+        type: boolean
+        default: false
   schedule:
     - cron: "17 9 1 * *"
 
 permissions:
-  contents: write
-  issues: write
-  pull-requests: write
+  contents: read
 
 jobs:
   linux-rust-1-90:
@@ -43,6 +51,11 @@ jobs:
         with:
           toolchain: "1.90"
 
+      - name: Test the browser IME edit shape
+        run: |
+          rustc --edition 2024 --test crates/gpui_web/src/input_edit.rs -o "$RUNNER_TEMP/gpui-input-edit-tests"
+          "$RUNNER_TEMP/gpui-input-edit-tests"
+
       - name: Install Linux dependencies
         run: ./script/linux
 
@@ -50,6 +63,11 @@ jobs:
         run: cargo check --locked -p gpui_platform
 
   rebase-series:
+    if: github.event_name == 'schedule' || inputs.rebase_upstream
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
     runs-on: macos-15
     env:
       GH_TOKEN: ${{ github.token }}

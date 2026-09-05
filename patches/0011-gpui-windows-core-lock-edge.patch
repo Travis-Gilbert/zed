@@ -1,0 +1,25 @@
+From eeebc13c90b1afcd103d91887876073702332948 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Fri, 4 Sep 2026 23:48:33 -0400
+Subject: [PATCH] fix(gpui): align the Windows Core lock edge with its manifest
+
+---
+ Cargo.lock | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 60a8e041e7..ea533b811f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7793,7 +7793,7 @@ dependencies = [
+  "smallvec",
+  "uuid",
+  "windows 0.62.2",
+- "windows-core 0.57.0",
++ "windows-core 0.62.2",
+  "windows-numerics 0.3.1",
+  "windows-registry 0.6.1",
+  "zed-scap",
+-- 
+2.53.0
+
