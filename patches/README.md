@@ -46,3 +46,12 @@ environments retain the existing blur path for software-keyboard dismissal;
 the same pointer-capability query serves both policies. TheoremWeb browser
 interaction and direct DOM focus checks validate this prerequisite separately
 from the source/locked Linux compiler gate.
+
+The selected-text replacement patch prevents common-prefix/suffix trimming from
+removing text inside the mirror's pre-edit selection. It retains the existing
+post-edit-caret disambiguation and resolves editor coordinates through fresh
+selection anchors. The same helper protects UTF-16 surrogate boundaries. Its
+five production-helper tests cover selection replacement, repeated text,
+autocorrection, emoji, and exhaustive bounded edits after a remote anchor shift.
+The browser Wikia edit oracle exposed the original failure; its real DOM and
+canonical document retry remains a separate consumer acceptance gate.

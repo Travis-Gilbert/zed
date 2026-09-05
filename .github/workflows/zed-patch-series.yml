@@ -51,6 +51,11 @@ jobs:
         with:
           toolchain: "1.90"
 
+      - name: Test the browser IME edit shape
+        run: |
+          rustc --edition 2024 --test crates/gpui_web/src/input_edit.rs -o "$RUNNER_TEMP/gpui-input-edit-tests"
+          "$RUNNER_TEMP/gpui-input-edit-tests"
+
       - name: Install Linux dependencies
         run: ./script/linux
 
