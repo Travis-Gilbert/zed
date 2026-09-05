@@ -22,6 +22,10 @@ The IME integration patch reconciles the retained accessibility and caret seams
 with the upstream textarea-owning `ImeMirror`. It removes the duplicate legacy
 focus callback and preserves configuration, composition and text ownership.
 
+The final lock correction restores `gpui_windows` to the Windows Core 0.62
+family required by its manifest. The earlier keyring patch accidentally changed
+that unrelated edge to 0.57, preventing locked workspace resolution.
+
 Regenerate the files from the rebased commits with `git format-patch`, preserve
 their order in `series`, and run the patch-series workflow before moving a
 consumer pin. If upstream makes a patch redundant, remove it from the series
