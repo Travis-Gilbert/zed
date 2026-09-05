@@ -383,6 +383,14 @@ impl WebWindowInner {
             .map_or(0.0, |viewport| viewport.height() * viewport.scale())
     }
 
+    fn has_coarse_pointer(&self) -> bool {
+        self.browser_window
+            .match_media("(pointer: coarse)")
+            .ok()
+            .flatten()
+            .is_some_and(|media_query_list| media_query_list.matches())
+    }
+
     /// Whether the software keyboard is likely hidden — a heuristic, since
     /// no cross-browser keyboard-visibility signal exists. It infers from
     /// the visual viewport: a shown keyboard shrinks its height well below
@@ -399,13 +407,7 @@ impl WebWindowInner {
     /// fool it; tracking `visualViewport` resize events around focus
     /// transitions would be sturdier.
     fn keyboard_likely_dismissed(&self) -> bool {
-        let coarse_pointer = self
-            .browser_window
-            .match_media("(pointer: coarse)")
-            .ok()
-            .flatten()
-            .is_some_and(|media_query_list| media_query_list.matches());
-        if !coarse_pointer {
+        if !self.has_coarse_pointer() {
             return false;
         }
         let Some(viewport) = self.browser_window.visual_viewport() else {
@@ -502,9 +504,12 @@ impl WebWindowInner {
                     self.ime_mirror.blur();
                 }
                 self.ime_mirror.focus();
-            } else {
+            } else if self.has_coarse_pointer() {
                 self.ime_mirror.blur();
             }
+            // Desktop shortcuts also arrive through the mirror. Keep its
+            // read-only focus when leaving an editor; blurring it would send
+            // the next key to the document body instead of GPUI.
             self.suppress_focus_status_events.set(false);
 
             if editable {
