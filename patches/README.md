@@ -35,3 +35,7 @@ Pull requests changing the series, its workflow, or GPUI Web verify the recorded
 series. Manual workflow runs also verify the recorded series by default. Enable
 `rebase_upstream` to also publish an upstream-rebase maintenance branch and PR;
 scheduled runs retain that maintenance behavior automatically.
+
+The ASHPD patch selects 0.13.6, the first 0.13 patch declaring Rust 1.87
+compatibility. It retains the dependency graph and GPUI portal APIs from 0.13.2,
+whose Rust 1.92 minimum prevented the required Rust 1.90 Linux check.

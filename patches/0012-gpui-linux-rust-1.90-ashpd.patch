@@ -1,0 +1,28 @@
+From 03d4924f40f2560a558d252cc66bf7391db0937e Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Sat, 5 Sep 2026 00:00:21 -0400
+Subject: [PATCH] fix(gpui): select the Rust 1.90 compatible ASHPD patch
+
+---
+ Cargo.lock | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index ea533b811f..c5c1c17eaa 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -896,9 +896,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "ashpd"
+-version = "0.13.2"
++version = "0.13.6"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "0848bedd08067dca1c02c31cbb371a94ad4f2f8a61a82f2c43d96ec36a395244"
++checksum = "2db8976f2184938619146d8416140cea548c91256158f59258849069ce7787c0"
+ dependencies = [
+  "enumflags2",
+  "futures-channel",
+-- 
+2.53.0
+
