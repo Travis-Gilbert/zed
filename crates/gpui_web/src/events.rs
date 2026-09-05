@@ -874,58 +874,13 @@ impl WebWindowInner {
                 return;
             }
 
-            let old_units: Vec<u16> = old_value.encode_utf16().collect();
-            let new_units: Vec<u16> = new_value.encode_utf16().collect();
-
-            // A prefix/suffix diff is ambiguous when the inserted text
-            // shares characters with what follows it (inserting "pactor "
-            // before "pact" also reads as inserting "or pact" four units
-            // later). The edit's true position is not ambiguous: the browser
-            // leaves the caret at the end of an IME edit, so the suffix is
-            // anchored as "everything after the post-edit caret", and the
-            // prefix is capped to fit. Greedy matching is only a fallback
-            // for edits where the anchored suffix doesn't verify.
-            let post_edit_caret = this
-                .ime_mirror
-                .selection_start()
-                .map(|caret| caret as usize);
-            let anchored_suffix_length = post_edit_caret
-                .map(|caret| new_units.len().saturating_sub(caret))
-                .filter(|&suffix_length| {
-                    suffix_length <= old_units.len()
-                        && old_units[old_units.len() - suffix_length..]
-                            == new_units[new_units.len() - suffix_length..]
-                });
-            let suffix_length = anchored_suffix_length.unwrap_or_else(|| {
-                old_units
-                    .iter()
-                    .rev()
-                    .zip(new_units.iter().rev())
-                    .take_while(|(old_unit, new_unit)| old_unit == new_unit)
-                    .count()
-            });
-            let prefix_length = old_units
-                .iter()
-                .zip(&new_units)
-                .take_while(|(old_unit, new_unit)| old_unit == new_unit)
-                .count()
-                .min(old_units.len() - suffix_length)
-                .min(new_units.len() - suffix_length);
-
-            let inserted_text = String::from_utf16_lossy(
-                &new_units[prefix_length..new_units.len() - suffix_length],
+            let (selection_start, selection_end) = this.ime_mirror.stored_selection();
+            let edit = crate::input_edit::input_edit(
+                &old_value,
+                &new_value,
+                selection_start as usize..selection_end as usize,
+                this.ime_mirror.selection_start().map(|caret| caret as usize),
             );
-            let replaced_old_end = old_units.len() - suffix_length;
-
-            // The edit's shape relative to the element's pre-edit selection.
-            // The element is private to the IME and these syncs, so the
-            // stored selection is exact.
-            let (element_selection_start, element_selection_end) =
-                this.ime_mirror.stored_selection();
-            let removed_before_selection =
-                (element_selection_start as usize).saturating_sub(prefix_length);
-            let removed_after_selection =
-                replaced_old_end.saturating_sub(element_selection_end as usize);
 
             let applied = this.with_input_handler(|handler| {
                 let Some(selection) = handler.selected_text_range(false) else {
@@ -934,9 +889,9 @@ impl WebWindowInner {
                 let range = selection
                     .range
                     .start
-                    .saturating_sub(removed_before_selection)
-                    ..selection.range.end + removed_after_selection;
-                handler.replace_text_in_range(Some(range), &inserted_text);
+                    .saturating_sub(edit.removed_before_selection)
+                    ..selection.range.end + edit.removed_after_selection;
+                handler.replace_text_in_range(Some(range), &edit.inserted_text);
                 true
             });
             if applied != Some(true) {
