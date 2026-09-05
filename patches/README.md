@@ -27,6 +27,7 @@ their order in `series`, and run the patch-series workflow before moving a
 consumer pin. If upstream makes a patch redundant, remove it from the series
 instead of retaining an empty compatibility patch.
 
-Manual workflow runs verify the recorded series by default. Enable
+Pull requests changing the series, its workflow, or GPUI Web verify the recorded
+series. Manual workflow runs also verify the recorded series by default. Enable
 `rebase_upstream` to also publish an upstream-rebase maintenance branch and PR;
 scheduled runs retain that maintenance behavior automatically.
