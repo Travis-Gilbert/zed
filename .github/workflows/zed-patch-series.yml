@@ -2,6 +2,11 @@ name: Zed patch series
 
 on:
   workflow_dispatch:
+    inputs:
+      rebase_upstream:
+        description: Also rebase the series onto upstream and publish a maintenance PR
+        type: boolean
+        default: false
   schedule:
     - cron: "17 9 1 * *"
 
@@ -50,6 +55,7 @@ jobs:
         run: cargo check --locked -p gpui_platform
 
   rebase-series:
+    if: github.event_name == 'schedule' || inputs.rebase_upstream
     runs-on: macos-15
     env:
       GH_TOKEN: ${{ github.token }}
