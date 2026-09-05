@@ -18,6 +18,10 @@ truncation without the newer `std::hint::cold_path` and
 `str::ceil_char_boundary` helpers. The final MSRV patch applies the same cold
 branch compatibility to action profiling.
 
+The IME integration patch reconciles the retained accessibility and caret seams
+with the upstream textarea-owning `ImeMirror`. It removes the duplicate legacy
+focus callback and preserves configuration, composition and text ownership.
+
 Regenerate the files from the rebased commits with `git format-patch`, preserve
 their order in `series`, and run the patch-series workflow before moving a
 consumer pin. If upstream makes a patch redundant, remove it from the series
