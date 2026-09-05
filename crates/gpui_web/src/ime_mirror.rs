@@ -86,7 +86,7 @@ pub(crate) struct ImeMirror {
 /// Whether the device's primary pointer is coarse (a touch screen). The
 /// distinction drives virtual-keyboard policy: touch-first browsers summon
 /// the keyboard for any focused editable element on a user gesture.
-fn primary_pointer_is_coarse() -> bool {
+pub(crate) fn primary_pointer_is_coarse() -> bool {
     web_sys::window()
         .and_then(|window| window.match_media("(pointer: coarse)").ok().flatten())
         .is_some_and(|media_query_list| media_query_list.matches())

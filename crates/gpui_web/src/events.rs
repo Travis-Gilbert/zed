@@ -502,7 +502,14 @@ impl WebWindowInner {
                     self.ime_mirror.blur();
                 }
                 self.ime_mirror.focus();
-            } else {
+            } else if crate::ime_mirror::primary_pointer_is_coarse() {
+                // Only a touch-first browser needs the blur. The hidden input
+                // is also where `keydown` and `keyup` are listened for, so on
+                // a device with a physical keyboard blurring it here would
+                // end every keyboard shortcut the moment a pointer landed on
+                // anything that does not take text. `read_only` already
+                // suppresses a virtual keyboard, and there is none to
+                // suppress on a fine pointer.
                 self.ime_mirror.blur();
             }
             self.suppress_focus_status_events.set(false);
