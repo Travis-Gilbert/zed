@@ -7793,7 +7793,7 @@ dependencies = [
  "smallvec",
  "uuid",
  "windows 0.62.2",
- "windows-core 0.57.0",
+ "windows-core 0.62.2",
  "windows-numerics 0.3.1",
  "windows-registry 0.6.1",
  "zed-scap",
