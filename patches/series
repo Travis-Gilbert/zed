@@ -7,3 +7,8 @@
 0007-gpui-util-rust-1.90-slice-conversion.patch
 0008-gpui-rust-1.90-stdlib-compat.patch
 0009-gpui-rust-1.90-action-profiling.patch
+0010-gpui-web-ime-mirror-integration.patch
+0011-gpui-windows-core-lock-edge.patch
+0012-gpui-linux-rust-1.90-ashpd.patch
+0013-gpui-desktop-ime-keyboard-focus.patch
+0014-gpui-web-selected-text-replacement.patch

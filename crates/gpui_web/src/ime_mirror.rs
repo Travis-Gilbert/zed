@@ -185,6 +185,38 @@ impl ImeMirror {
         };
     }
 
+    /// Give the accessibility adapter attribute access without exposing the
+    /// textarea's value or selection APIs outside this module.
+    pub(crate) fn accessibility_element(&self) -> web_sys::HtmlElement {
+        self.element.clone().unchecked_into()
+    }
+
+    /// Browser caret bounds use CSS pixels, matching GPUI's logical coordinates.
+    pub(crate) fn update_position(&self, bounds: gpui::Bounds<gpui::Pixels>) {
+        let style = self.element.style();
+        for (name, value) in [
+            ("left", format!("{}px", f32::from(bounds.origin.x))),
+            ("top", format!("{}px", f32::from(bounds.origin.y))),
+            (
+                "height",
+                format!("{}px", f32::from(bounds.size.height).max(1.0)),
+            ),
+        ] {
+            if let Err(error) = style.set_property(name, &value) {
+                log::warn!("Failed to position IME mirror {name}: {error:?}");
+            }
+        }
+    }
+
+    pub(crate) fn reset_position(&self) {
+        let style = self.element.style();
+        for (name, value) in [("left", "0"), ("top", "0"), ("height", "1px")] {
+            if let Err(error) = style.set_property(name, value) {
+                log::warn!("Failed to reset IME mirror {name}: {error:?}");
+            }
+        }
+    }
+
     pub(crate) fn event_target(&self) -> &web_sys::EventTarget {
         self.element.as_ref()
     }
