@@ -14,7 +14,8 @@ use crate::{
     KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex,
     Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
     MouseUpEvent, PaintSurface, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PlatformInputHandler, PlatformNativeElement, PlatformWindow, Point, PolychromeSprite,
+    Priority, PromptButton,
     PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
     Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
     ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
@@ -4844,6 +4845,17 @@ impl Window {
     ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
         self.platform_window
             .create_external_gpu_surface(width, height, format)
+    }
+
+    /// What this platform hands an editable leaf in place of painted pixels.
+    ///
+    /// An editable element asks before it paints a caret or a selection, so
+    /// that it does not draw a second one over the platform's own. Everything
+    /// else about the element -- its identity, its layout, its focus, its
+    /// state, its lifetime -- is the same on both answers, which is what lets
+    /// one element implementation serve both.
+    pub fn native_element(&self) -> PlatformNativeElement {
+        self.platform_window.native_element()
     }
 
     /// Removes an image from the sprite atlas.

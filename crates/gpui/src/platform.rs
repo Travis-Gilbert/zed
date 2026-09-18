@@ -814,6 +814,45 @@ pub enum TextInputStateChange {
 }
 
 #[expect(missing_docs)]
+/// What a platform can hand a GPUI leaf in place of painted pixels.
+///
+/// A painted leaf is GPUI's entirely: it owns the pixels, and every behaviour
+/// a person expects of the control is GPUI's to reproduce. That reproduction
+/// is cheap for a button and expensive for an editable control, because caret
+/// placement, selection, input-method composition, autocorrect, spellcheck,
+/// the virtual keyboard and the accessibility tree are not things a renderer
+/// can approximate from the outside -- they are properties a platform grants
+/// to its own controls.
+///
+/// A platform that can grant them says so here, and the leaf then stops
+/// drawing what the platform is already drawing. What does *not* move is
+/// element identity, layout, logical focus, application state, visibility,
+/// clipping policy and component lifecycle: those stay GPUI's on both paths,
+/// which is what keeps the two paths substitutable.
+///
+/// This is deliberately one question rather than a create/place/destroy
+/// protocol. Placement already flows through the platform's existing caret
+/// bounds, and a second geometry channel would be a second authority for one
+/// rectangle. The only thing a leaf cannot work out for itself is whether the
+/// platform is drawing the control, so that is the only thing it is told.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlatformNativeElement {
+    /// GPUI paints the leaf and reproduces its behaviour.
+    #[default]
+    None,
+    /// The platform realizes an editable leaf as a real control of its own,
+    /// positioned at the bounds GPUI laid out.
+    EditableLeaf,
+}
+
+impl PlatformNativeElement {
+    /// Whether an editable leaf should leave caret, selection and text
+    /// assistance to the platform.
+    pub const fn realizes_editable_leaf(self) -> bool {
+        matches!(self, Self::EditableLeaf)
+    }
+}
+
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
@@ -876,6 +915,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         _format: wgpu::TextureFormat,
     ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
         Err(ExternalGpuSurfaceError::Unsupported)
+    }
+    /// What this window can hand an editable leaf in place of painted pixels.
+    ///
+    /// Defaults to [`PlatformNativeElement::None`], which is what every
+    /// platform other than the web answers and what the web answers on every
+    /// browser shipping today.
+    fn native_element(&self) -> PlatformNativeElement {
+        PlatformNativeElement::None
     }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
