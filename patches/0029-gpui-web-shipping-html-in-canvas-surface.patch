@@ -1,0 +1,274 @@
+From 4f759b86f7c02d999125818d52dc833dbb622b37 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Fri, 18 Sep 2026 15:12:16 -0400
+Subject: [PATCH] fix(gpui-web): detect the HTML-in-Canvas surface a browser
+ actually ships
+
+The detection keyed on `updateElementGeometry`, which the proposal's prose
+names and no implementation defines. Because `complete()` required all four
+probes, the native path was unreachable on every browser -- including one
+that implements the proposal -- and the geometry push in the paint loop was
+a call into nothing.
+
+Measured against Chrome 151.0.7922.34 with
+`--enable-blink-features=CanvasDrawElement`:
+
+  HTMLCanvasElement.prototype   layoutSubtree, onpaint, requestPaint,
+                                captureElementImage, getElementTransform
+  CanvasRenderingContext2D      drawElementImage
+  absent                        updateElementGeometry, placeElement
+
+`getElementTransform(element, DOMMatrix)` is the geometry seam that replaced
+the prose's call, and it points the other way: the browser reports a drawn
+element's transform to the page. Probe that instead.
+
+Input does not follow the draw. A click inside a drawn copy at (90, 72)
+reached `body`; a click on the same element's layout box at (60, 12) focused
+it and accepted typing. `drawElementImage` and `captureElementImage` also
+refuse outside a `paint` event -- "No cached paint record for element" -- so
+the draw stays where it already was, inside the paint listener.
+
+That makes the element's own CSS box the only correct draw position: pixels
+and hit region are then one rectangle by construction rather than two kept
+in agreement. Drop the push and draw at the element's border box.
+
+Also stop the native path painting a white box over the scene. A textarea's
+default appearance contributes an opaque background, a border, a focus ring
+and a second copy of the text in the user agent's font. Section 11 gives the
+browser caret, selection, spellcheck and autocorrect, and nothing else, so
+turn the rest off; `color: transparent` suppresses the duplicate glyphs
+while leaving the selection highlight and the caret, which are painted by
+other properties.
+---
+ crates/gpui_web/src/ime_mirror.rs     |  26 ++++++
+ crates/gpui_web/src/native_element.rs | 109 ++++++++++++++++----------
+ 2 files changed, 94 insertions(+), 41 deletions(-)
+
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index 5bc8b022ee..45e7aef66d 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -140,6 +140,32 @@ impl ImeMirror {
+         // can never zoom back out, so keep the hidden IME input at 16px.
+         style.set_property("font-size", "16px").ok();
+         if let Some(layer) = layer.as_deref() {
++            // Section 11 divides the editable leaf: GPUI keeps the content and
++            // the browser contributes caret, selection, spellcheck and
++            // autocorrect. A textarea's default appearance contributes more
++            // than that -- an opaque background, a border, a focus ring and a
++            // second copy of the text in the user agent's font -- and on this
++            // path those are drawn over the scene GPUI just painted.
++            //
++            // So everything the browser would draw *except* the caret and the
++            // selection is turned off. `color: transparent` is the load-
++            // bearing one: it suppresses the duplicate glyphs while leaving
++            // the selection highlight, which paints behind text, and the
++            // caret, whose color is a separate property. The element stays a
++            // real, focused, hit-testable textarea throughout, so nothing
++            // about IME changes.
++            for (name, value) in [
++                ("background", "transparent"),
++                ("border", "none"),
++                ("outline", "none"),
++                ("padding", "0"),
++                ("margin", "0"),
++                ("resize", "none"),
++                ("overflow", "hidden"),
++                ("color", "transparent"),
++            ] {
++                style.set_property(name, value).ok();
++            }
+             // Into the element layer, not into the canvas wgpu owns. A
+             // canvas's element children are its fallback content, which the
+             // HTML specification already says is laid out but never painted,
+diff --git a/crates/gpui_web/src/native_element.rs b/crates/gpui_web/src/native_element.rs
+index 29e5b29c7c..4631a1e755 100644
+--- a/crates/gpui_web/src/native_element.rs
++++ b/crates/gpui_web/src/native_element.rs
+@@ -7,8 +7,15 @@
+ //! IME, autocorrect, spellcheck or the virtual keyboard as primitives. It
+ //! offers them only as properties of real elements.
+ //!
+-//! The HTML-in-Canvas proposal closes that gap: a real element, laid out by
+-//! the browser, drawn where the application wants it, and hit-tested there.
++//! The HTML-in-Canvas proposal closes that gap, though not by the route its
++//! prose suggests. What a browser ships is a canvas that lays its descendants
++//! out (`layoutsubtree`) and can draw one of them into itself
++//! (`drawElementImage`, inside a `paint` event). Input, focus, IME and
++//! accessibility keep following the element's ordinary CSS box; no call moves
++//! them to where the canvas drew. So the element is real, the browser owns
++//! every behavior GPUI would otherwise reproduce, and the draw exists to put
++//! its pixels in the scene's compositing order rather than above it.
++//!
+ //! This module decides whether that path is available and owns the layer that
+ //! draws it. It is the only place in GPUI that names the proposal's entry
+ //! points, so an application never reaches them and never learns which path it
+@@ -44,16 +51,23 @@ use std::rc::Rc;
+ use wasm_bindgen::prelude::Closure;
+ use wasm_bindgen::{JsCast, JsValue};
+ 
+-/// The proposal's entry points.
++/// The proposal's entry points, as a browser actually ships them.
++///
++/// These are not the names the specification's prose uses, and the difference
++/// is not cosmetic. Measured against Chrome 151.0.7922.34 with
++/// `--enable-blink-features=CanvasDrawElement`, the shipping surface is
++/// `requestPaint` and `layoutSubtree` and `captureElementImage` and
++/// `getElementTransform` on `HTMLCanvasElement`, and `drawElementImage` on the
++/// 2D context. The prose's `updateElementGeometry` exists under no spelling.
+ ///
+-/// These are the names the proposal actually ships, which are not quite the
+-/// names the specification's prose uses: the draw call is `drawElementImage`
+-/// on the 2D context, the invalidation signal is `requestPaint` on the canvas,
+-/// and the element's layout participation is the `layoutsubtree` content
+-/// attribute reflected as `layoutSubtree`.
++/// `getElementTransform` is the geometry seam that replaced it, and it points
++/// the other way: the browser reports the element's transform to the page
++/// rather than the page declaring the element's rectangle to the browser.
++/// Section 16 is satisfied anyway, and by a shorter argument -- see
++/// [`paint_layer`].
+ const REQUEST_PAINT: &str = "requestPaint";
+ const DRAW_ELEMENT_IMAGE: &str = "drawElementImage";
+-const UPDATE_ELEMENT_GEOMETRY: &str = "updateElementGeometry";
++const GET_ELEMENT_TRANSFORM: &str = "getElementTransform";
+ const LAYOUT_SUBTREE: &str = "layoutSubtree";
+ 
+ /// The event the browser fires when the layer canvas needs its contents again.
+@@ -74,10 +88,11 @@ const OVERRIDE_GLOBAL: &str = "__gpui_html_in_canvas";
+ /// What this browser can do with an element a canvas draws.
+ ///
+ /// Recorded as four separate answers rather than one boolean because the
+-/// proposal is still moving, and a browser that ships the draw call before the
+-/// geometry call is a real intermediate state. Treating that as support would
+-/// place a control the browser cannot hit-test, which is worse than painting
+-/// it: a person would see the element and be unable to click it.
++/// proposal is still moving and ships in pieces. Chrome 151 is itself such a
++/// piece: it has the four below and does not have `placeElement`, the
++/// proposal's interactive half. Four answers say which piece a browser is, so
++/// a refusal can be read rather than guessed at, and so the summary an oracle
++/// reads distinguishes "no proposal at all" from "a version we decline".
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+ pub(crate) struct HtmlInCanvas {
+     /// `HTMLCanvasElement.prototype.requestPaint`. The "something moved"
+@@ -86,11 +101,12 @@ pub(crate) struct HtmlInCanvas {
+     requests_paint: bool,
+     /// `CanvasRenderingContext2D.prototype.drawElementImage`. The draw itself.
+     draws_elements: bool,
+-    /// `HTMLCanvasElement.prototype.updateElementGeometry`. Tells the browser
+-    /// where the canvas drew the element, which is what gives it a hit region
+-    /// and an accessibility rectangle at the drawn position rather than at its
+-    /// own layout box.
+-    places_elements: bool,
++    /// `HTMLCanvasElement.prototype.getElementTransform`. The geometry seam:
++    /// it reports the transform the browser has for a drawn element, which is
++    /// how an oracle confirms that the browser and GPUI agree about where the
++    /// control is. Probed rather than called here, because calling it is only
++    /// legal inside a paint event.
++    reads_transform: bool,
+     /// The `layoutsubtree` attribute reflecting. Without it the canvas's
+     /// descendants are ordinary fallback content: laid out by nothing, and so
+     /// drawn as nothing.
+@@ -109,7 +125,7 @@ impl HtmlInCanvas {
+         Self {
+             requests_paint: prototype_has("HTMLCanvasElement", REQUEST_PAINT),
+             draws_elements: prototype_has("CanvasRenderingContext2D", DRAW_ELEMENT_IMAGE),
+-            places_elements: prototype_has("HTMLCanvasElement", UPDATE_ELEMENT_GEOMETRY),
++            reads_transform: prototype_has("HTMLCanvasElement", GET_ELEMENT_TRANSFORM),
+             lays_out_subtree: prototype_has("HTMLCanvasElement", LAYOUT_SUBTREE),
+         }
+     }
+@@ -120,8 +136,13 @@ impl HtmlInCanvas {
+     /// drawable element whose pixels are never drawn is an invisible control,
+     /// and section 10 requires Theorem to work without the feature rather than
+     /// to work badly with half of it.
++    ///
++    /// Each of the four is a member a shipping browser has: keying on a name
++    /// the proposal's prose uses but no implementation defines would refuse
++    /// the native path on every browser forever, which is a silent, permanent
++    /// fallback dressed up as feature detection.
+     pub(crate) const fn complete(self) -> bool {
+-        self.requests_paint && self.draws_elements && self.places_elements && self.lays_out_subtree
++        self.requests_paint && self.draws_elements && self.reads_transform && self.lays_out_subtree
+     }
+ }
+ 
+@@ -234,7 +255,7 @@ impl NativeElements {
+             supported: self.support.complete(),
+             requests_paint: self.support.requests_paint,
+             draws_elements: self.support.draws_elements,
+-            places_elements: self.support.places_elements,
++            reads_transform: self.support.reads_transform,
+             lays_out_subtree: self.support.lays_out_subtree,
+             forced: self.forced.map(Forced::as_str),
+             realization: self.realization.as_str(),
+@@ -428,11 +449,32 @@ fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlEl
+         &[JsValue::from_f64(ratio), JsValue::from_f64(ratio)],
+     );
+     for element in drawables {
+-        // The element's own border box is where GPUI put it. Asking the
+-        // browser rather than replaying a stored rectangle keeps one
+-        // authority for the geometry, and it is the same box the browser will
+-        // hit-test once `updateElementGeometry` names it.
++        // The element's own border box is where GPUI put it, through the
++        // inline `left`/`top`/`width`/`height` the IME mirror writes. Asking
++        // the browser for that box rather than replaying a stored rectangle
++        // keeps one authority for the geometry.
+         let rect = element.get_bounding_client_rect();
++        // Drawing at the element's own box is what satisfies section 16, and
++        // it is worth writing down why, because the obvious reading of the
++        // proposal is that a separate call is needed to move the hit region.
++        //
++        // It is not, and there is no such call: `updateElementGeometry` is
++        // prose, and no browser defines it. What a browser does instead is
++        // hit-test, focus, route IME to and report to assistive technology the
++        // element at its *layout* box -- verified against Chrome 151, where a
++        // click inside a drawn copy at (90, 72) reached `body` and a click on
++        // the same element's layout box at (60, 12) focused it and accepted
++        // typing. The picture a canvas draws is a picture. Input follows CSS.
++        //
++        // So drawing at `rect` is not one of several defensible choices. It is
++        // the only one under which the pixels a person sees and the box the
++        // browser routes to are the same rectangle, and it makes them the same
++        // rectangle by construction rather than by keeping two in agreement.
++        //
++        // The layer is `position: fixed; inset: 0`, so its origin is the
++        // viewport origin and this viewport-relative rect is already in the
++        // canvas's own coordinate space. That is load-bearing: a layer placed
++        // any other way would need the difference subtracted here.
+         call_void(
+             &context,
+             DRAW_ELEMENT_IMAGE,
+@@ -442,21 +484,6 @@ fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlEl
+                 JsValue::from_f64(rect.y()),
+             ],
+         );
+-        // Section 16: GPUI stays the layout authority, and this is the call
+-        // that makes the browser agree. Without it the element is hit-tested
+-        // and reported to assistive technology at its own layout box inside
+-        // the canvas, not at the box it was drawn into.
+-        call_void(
+-            canvas,
+-            UPDATE_ELEMENT_GEOMETRY,
+-            &[
+-                element.into(),
+-                JsValue::from_f64(rect.x()),
+-                JsValue::from_f64(rect.y()),
+-                JsValue::from_f64(rect.width()),
+-                JsValue::from_f64(rect.height()),
+-            ],
+-        );
+     }
+ }
+ 
+@@ -542,7 +569,7 @@ pub struct NativeElementSummary {
+     pub supported: bool,
+     pub requests_paint: bool,
+     pub draws_elements: bool,
+-    pub places_elements: bool,
++    pub reads_transform: bool,
+     pub lays_out_subtree: bool,
+     /// The path a test demanded, if one did.
+     pub forced: Option<&'static str>,
+-- 
+2.53.0
+

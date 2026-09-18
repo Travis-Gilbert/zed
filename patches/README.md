@@ -82,3 +82,31 @@ ratio so an element's CSS box lands where it was laid out. It also sets
 `pointer-events: auto` on each adopted element, since the layer's own
 `pointer-events: none` inherits and would otherwise make the drawn control
 unclickable.
+
+The shipping-surface patch corrects what the detection asks for. The prose's
+`updateElementGeometry` is defined by no implementation, and because the
+support gate required all four probes, the native path could never be reached
+-- the fallback was permanent and looked like feature detection. Chrome
+151.0.7922.34 with `--enable-blink-features=CanvasDrawElement` ships
+`requestPaint`, `layoutSubtree`, `captureElementImage` and
+`getElementTransform` on `HTMLCanvasElement` and `drawElementImage` on the 2D
+context, and ships neither `updateElementGeometry` nor `placeElement`. The
+fourth probe is now `getElementTransform`, which is the geometry seam that
+replaced the prose's call and reports a drawn element's transform to the page
+rather than taking a rectangle from it.
+
+Input does not follow the draw: a click inside a drawn copy at (90, 72) reaches
+`body`, while a click on the same element's layout box at (60, 12) focuses it
+and accepts typing. A browser hit-tests, focuses, routes IME to and reports to
+assistive technology the element's CSS box, and the canvas draw is a picture.
+Drawing at the element's own border box is therefore the only position under
+which the pixels and the hit region are one rectangle. The draw also refuses
+outside a `paint` event, so it stays in the paint listener where it already
+was.
+
+The same patch stops the native path painting a white box over the scene. A
+textarea contributes an opaque background, a border, a focus ring and a second
+copy of the text in the user agent's font; section 11 grants the browser caret,
+selection, spellcheck and autocorrect and nothing more. `color: transparent`
+removes the duplicate glyphs and keeps the selection highlight, which paints
+behind text, and the caret, which has its own color property.

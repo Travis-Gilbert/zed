@@ -15,3 +15,4 @@
 0015-gpui-platform-native-element-seam.patch
 0016-gpui-web-native-editable-leaf.patch
 0028-gpui-web-element-layer-surface.patch
+0029-gpui-web-shipping-html-in-canvas-surface.patch
