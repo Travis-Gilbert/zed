@@ -1,0 +1,103 @@
+From 85645a71d3ebf8623ef69c2216e4a9f02e63dd7c Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Fri, 18 Sep 2026 15:06:13 -0400
+Subject: [PATCH] fix(gpui-web): give the element layer a real drawing surface
+
+Two faults, both invisible to the compiler and both fatal to the one
+element the layer exists for.
+
+A canvas's backing store is 300x150 until something says otherwise, and CSS
+only stretches it. The layer was styled to fill the viewport and left at the
+default, so every element would have been drawn into a thumbnail and scaled
+across the window. It now takes the same physical size the renderer takes,
+at the same moment, which also makes the two canvases one coordinate space.
+The backing store is physical pixels and an element's own box is CSS pixels,
+so the paint scales by the device pixel ratio once rather than converting at
+each call site.
+
+`pointer-events` inherits. The layer must not intercept, or the empty space
+around a control would swallow pointers aimed at the scene below; its drawn
+elements must, or the control is drawn and unclickable. Setting it on
+adoption puts the exception next to the rule it answers.
+---
+ crates/gpui_web/src/native_element.rs | 37 +++++++++++++++++++++++++++
+ crates/gpui_web/src/window.rs         |  7 +++++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/crates/gpui_web/src/native_element.rs b/crates/gpui_web/src/native_element.rs
+index 22c008d944..29e5b29c7c 100644
+--- a/crates/gpui_web/src/native_element.rs
++++ b/crates/gpui_web/src/native_element.rs
+@@ -339,10 +339,36 @@ impl ElementLayer {
+             log::warn!("html-in-canvas: could not adopt an element into the layer");
+             return;
+         }
++        // `pointer-events` inherits, so the layer's `none` would reach the
++        // element and make the one control the layer exists for the one
++        // control nobody can click. The layer must not intercept; its drawn
++        // elements must. Set on adoption rather than where the element is
++        // built, because it is the layer's policy that makes it necessary.
++        if let Err(error) = element.style().set_property("pointer-events", "auto") {
++            log::warn!("html-in-canvas: could not make the element hittable: {error:?}");
++        }
+         self.drawables.borrow_mut().push(element.clone());
+         self.request_paint();
+     }
+ 
++    /// Match the drawing surface to the window's.
++    ///
++    /// A canvas's backing store is 300x150 until something says otherwise, and
++    /// CSS only stretches that, so a layer left at the default would draw
++    /// every element into a 300x150 image scaled across the viewport. The
++    /// layer takes the same physical size the renderer takes, which also makes
++    /// the two canvases one coordinate space.
++    pub(crate) fn resize(&self, width: u32, height: u32) {
++        if self.canvas.width() == width && self.canvas.height() == height {
++            return;
++        }
++        self.canvas.set_width(width);
++        self.canvas.set_height(height);
++        // Resizing a canvas clears it, so the elements have to be drawn again
++        // whether or not they moved.
++        self.request_paint();
++    }
++
+     /// Ask for a repaint because something moved.
+     ///
+     /// The layer is otherwise only redrawn when the browser decides to, and a
+@@ -390,6 +416,17 @@ fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlEl
+     // state the next frame must not inherit, and a reset is one call instead
+     // of a clear plus a transform restore.
+     call_void(&context, "reset", &[]);
++    // The backing store is in physical pixels and every rectangle below is in
++    // CSS pixels, because that is the space GPUI lays out in and the space an
++    // element's own box is reported in. One scale reconciles them, and doing
++    // it here rather than at each call site means no coordinate is ever
++    // converted twice.
++    let ratio = web_sys::window().map_or(1.0, |window| window.device_pixel_ratio());
++    call_void(
++        &context,
++        "scale",
++        &[JsValue::from_f64(ratio), JsValue::from_f64(ratio)],
++    );
+     for element in drawables {
+         // The element's own border box is where GPUI put it. Asking the
+         // browser rather than replaying a stored rectangle keeps one
+diff --git a/crates/gpui_web/src/window.rs b/crates/gpui_web/src/window.rs
+index d747404d3a..d4a166e137 100644
+--- a/crates/gpui_web/src/window.rs
++++ b/crates/gpui_web/src/window.rs
+@@ -891,6 +891,13 @@ impl PlatformWindow for WebWindow {
+                 self.inner.canvas.set_width(width);
+                 self.inner.canvas.set_height(height);
+             }
++            // The element layer is the same window seen from above, so it
++            // takes the same physical size at the same moment. Sized here
++            // rather than from its own observer so the two canvases can never
++            // disagree for a frame.
++            if let Some(layer) = self.inner.element_layer.as_deref() {
++                layer.resize(width, height);
++            }
+ 
+             let mut state = self.inner.state.borrow_mut();
+             state.renderer.update_drawable_size(Size {

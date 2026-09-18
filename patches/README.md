@@ -74,3 +74,11 @@ once. `window.__gpui_html_in_canvas` forces either path for tests; forcing the
 native path on a browser that cannot draw the element is refused, not honored.
 On every browser shipping today the feature is absent, the layer is never
 built, and the cost is four prototype lookups at window creation.
+
+The element layer surface patch sizes the layer canvas to the renderer's
+physical size, because a canvas left at its 300x150 default draws into a
+thumbnail whatever its CSS size says, and scales the paint by the device pixel
+ratio so an element's CSS box lands where it was laid out. It also sets
+`pointer-events: auto` on each adopted element, since the layer's own
+`pointer-events: none` inherits and would otherwise make the drawn control
+unclickable.
