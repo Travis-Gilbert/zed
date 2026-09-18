@@ -152,6 +152,16 @@ impl WebPlatform {
     ) -> Self {
         let browser_window =
             web_sys::window().expect("must be running in a browser window context");
+        // Tell GPUI what `secondary` means here, before anything binds a key.
+        // One wasm binary is served to a Mac and to a Windows PC and
+        // `cfg!(target_os = "macos")` is false for both, so without this a Mac
+        // user finds that Command does nothing and Control does everything.
+        // The browser is the only thing that knows.
+        //
+        // Here rather than at window creation because a keymap is registered
+        // before a window exists: `Application::run`'s callback binds keys and
+        // then opens one.
+        gpui::set_secondary_modifier_is_platform(crate::events::is_mac_platform(&browser_window));
         let dispatcher = Arc::new(WebDispatcher::new(
             browser_window.clone(),
             allow_multi_threading,

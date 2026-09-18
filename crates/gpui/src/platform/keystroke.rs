@@ -3,9 +3,55 @@ use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
     fmt::{Display, Write},
+    sync::atomic::{AtomicU8, Ordering},
 };
 
 use crate::PlatformKeyboardMapper;
+
+/// Unset, platform, or control. Read and written as a `u8` so the default
+/// stays a compile-time constant that no caller has to initialize.
+static SECONDARY_MODIFIER: AtomicU8 = AtomicU8::new(SECONDARY_UNSET);
+const SECONDARY_UNSET: u8 = 0;
+const SECONDARY_PLATFORM: u8 = 1;
+const SECONDARY_CONTROL: u8 = 2;
+
+/// Declare what the `secondary` modifier means on the machine in front of the
+/// person.
+///
+/// `secondary` is Command on macOS and Control everywhere else, and every
+/// target but one can answer that at compile time. The web cannot: one wasm
+/// binary is served to a Mac and to a Windows PC, `target_os` is `unknown` for
+/// both, and a `cfg!` there silently picks Control for everyone. A Mac user
+/// then finds that Command does nothing.
+///
+/// So the browser platform tells GPUI once, at startup, and `secondary`
+/// becomes a runtime answer on the one target that needs it. Until something
+/// calls this the compile-time answer stands, so no existing platform changes
+/// behavior.
+pub fn set_secondary_modifier_is_platform(is_platform: bool) {
+    SECONDARY_MODIFIER.store(
+        if is_platform {
+            SECONDARY_PLATFORM
+        } else {
+            SECONDARY_CONTROL
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether `secondary` means the platform key (Command) rather than Control.
+///
+/// Also the right question for anything choosing between a macOS keymap and
+/// the other one, which is why it is public: a caller that reached for
+/// `cfg!(target_os = "macos")` instead would be wrong on the web in exactly
+/// the way this exists to fix.
+pub fn secondary_modifier_is_platform() -> bool {
+    match SECONDARY_MODIFIER.load(Ordering::Relaxed) {
+        SECONDARY_PLATFORM => true,
+        SECONDARY_CONTROL => false,
+        _ => cfg!(target_os = "macos"),
+    }
+}
 
 /// This is a helper trait so that we can simplify the implementation of some functions
 pub trait AsKeystroke {
@@ -141,7 +187,7 @@ impl Keystroke {
                 continue;
             }
             if component.eq_ignore_ascii_case("secondary") {
-                if cfg!(target_os = "macos") {
+                if secondary_modifier_is_platform() {
                     modifiers.platform = true;
                 } else {
                     modifiers.control = true;
