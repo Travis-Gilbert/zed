@@ -891,6 +891,13 @@ impl PlatformWindow for WebWindow {
                 self.inner.canvas.set_width(width);
                 self.inner.canvas.set_height(height);
             }
+            // The element layer is the same window seen from above, so it
+            // takes the same physical size at the same moment. Sized here
+            // rather than from its own observer so the two canvases can never
+            // disagree for a frame.
+            if let Some(layer) = self.inner.element_layer.as_deref() {
+                layer.resize(width, height);
+            }
 
             let mut state = self.inner.state.borrow_mut();
             state.renderer.update_drawable_size(Size {

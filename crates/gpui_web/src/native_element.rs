@@ -339,7 +339,33 @@ impl ElementLayer {
             log::warn!("html-in-canvas: could not adopt an element into the layer");
             return;
         }
+        // `pointer-events` inherits, so the layer's `none` would reach the
+        // element and make the one control the layer exists for the one
+        // control nobody can click. The layer must not intercept; its drawn
+        // elements must. Set on adoption rather than where the element is
+        // built, because it is the layer's policy that makes it necessary.
+        if let Err(error) = element.style().set_property("pointer-events", "auto") {
+            log::warn!("html-in-canvas: could not make the element hittable: {error:?}");
+        }
         self.drawables.borrow_mut().push(element.clone());
+        self.request_paint();
+    }
+
+    /// Match the drawing surface to the window's.
+    ///
+    /// A canvas's backing store is 300x150 until something says otherwise, and
+    /// CSS only stretches that, so a layer left at the default would draw
+    /// every element into a 300x150 image scaled across the viewport. The
+    /// layer takes the same physical size the renderer takes, which also makes
+    /// the two canvases one coordinate space.
+    pub(crate) fn resize(&self, width: u32, height: u32) {
+        if self.canvas.width() == width && self.canvas.height() == height {
+            return;
+        }
+        self.canvas.set_width(width);
+        self.canvas.set_height(height);
+        // Resizing a canvas clears it, so the elements have to be drawn again
+        // whether or not they moved.
         self.request_paint();
     }
 
@@ -390,6 +416,17 @@ fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlEl
     // state the next frame must not inherit, and a reset is one call instead
     // of a clear plus a transform restore.
     call_void(&context, "reset", &[]);
+    // The backing store is in physical pixels and every rectangle below is in
+    // CSS pixels, because that is the space GPUI lays out in and the space an
+    // element's own box is reported in. One scale reconciles them, and doing
+    // it here rather than at each call site means no coordinate is ever
+    // converted twice.
+    let ratio = web_sys::window().map_or(1.0, |window| window.device_pixel_ratio());
+    call_void(
+        &context,
+        "scale",
+        &[JsValue::from_f64(ratio), JsValue::from_f64(ratio)],
+    );
     for element in drawables {
         // The element's own border box is where GPUI put it. Asking the
         // browser rather than replaying a stored rectangle keeps one
