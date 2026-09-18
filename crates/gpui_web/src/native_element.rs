@@ -7,8 +7,15 @@
 //! IME, autocorrect, spellcheck or the virtual keyboard as primitives. It
 //! offers them only as properties of real elements.
 //!
-//! The HTML-in-Canvas proposal closes that gap: a real element, laid out by
-//! the browser, drawn where the application wants it, and hit-tested there.
+//! The HTML-in-Canvas proposal closes that gap, though not by the route its
+//! prose suggests. What a browser ships is a canvas that lays its descendants
+//! out (`layoutsubtree`) and can draw one of them into itself
+//! (`drawElementImage`, inside a `paint` event). Input, focus, IME and
+//! accessibility keep following the element's ordinary CSS box; no call moves
+//! them to where the canvas drew. So the element is real, the browser owns
+//! every behavior GPUI would otherwise reproduce, and the draw exists to put
+//! its pixels in the scene's compositing order rather than above it.
+//!
 //! This module decides whether that path is available and owns the layer that
 //! draws it. It is the only place in GPUI that names the proposal's entry
 //! points, so an application never reaches them and never learns which path it
@@ -44,16 +51,23 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 
-/// The proposal's entry points.
+/// The proposal's entry points, as a browser actually ships them.
 ///
-/// These are the names the proposal actually ships, which are not quite the
-/// names the specification's prose uses: the draw call is `drawElementImage`
-/// on the 2D context, the invalidation signal is `requestPaint` on the canvas,
-/// and the element's layout participation is the `layoutsubtree` content
-/// attribute reflected as `layoutSubtree`.
+/// These are not the names the specification's prose uses, and the difference
+/// is not cosmetic. Measured against Chrome 151.0.7922.34 with
+/// `--enable-blink-features=CanvasDrawElement`, the shipping surface is
+/// `requestPaint` and `layoutSubtree` and `captureElementImage` and
+/// `getElementTransform` on `HTMLCanvasElement`, and `drawElementImage` on the
+/// 2D context. The prose's `updateElementGeometry` exists under no spelling.
+///
+/// `getElementTransform` is the geometry seam that replaced it, and it points
+/// the other way: the browser reports the element's transform to the page
+/// rather than the page declaring the element's rectangle to the browser.
+/// Section 16 is satisfied anyway, and by a shorter argument -- see
+/// [`paint_layer`].
 const REQUEST_PAINT: &str = "requestPaint";
 const DRAW_ELEMENT_IMAGE: &str = "drawElementImage";
-const UPDATE_ELEMENT_GEOMETRY: &str = "updateElementGeometry";
+const GET_ELEMENT_TRANSFORM: &str = "getElementTransform";
 const LAYOUT_SUBTREE: &str = "layoutSubtree";
 
 /// The event the browser fires when the layer canvas needs its contents again.
@@ -74,10 +88,11 @@ const OVERRIDE_GLOBAL: &str = "__gpui_html_in_canvas";
 /// What this browser can do with an element a canvas draws.
 ///
 /// Recorded as four separate answers rather than one boolean because the
-/// proposal is still moving, and a browser that ships the draw call before the
-/// geometry call is a real intermediate state. Treating that as support would
-/// place a control the browser cannot hit-test, which is worse than painting
-/// it: a person would see the element and be unable to click it.
+/// proposal is still moving and ships in pieces. Chrome 151 is itself such a
+/// piece: it has the four below and does not have `placeElement`, the
+/// proposal's interactive half. Four answers say which piece a browser is, so
+/// a refusal can be read rather than guessed at, and so the summary an oracle
+/// reads distinguishes "no proposal at all" from "a version we decline".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct HtmlInCanvas {
     /// `HTMLCanvasElement.prototype.requestPaint`. The "something moved"
@@ -86,11 +101,12 @@ pub(crate) struct HtmlInCanvas {
     requests_paint: bool,
     /// `CanvasRenderingContext2D.prototype.drawElementImage`. The draw itself.
     draws_elements: bool,
-    /// `HTMLCanvasElement.prototype.updateElementGeometry`. Tells the browser
-    /// where the canvas drew the element, which is what gives it a hit region
-    /// and an accessibility rectangle at the drawn position rather than at its
-    /// own layout box.
-    places_elements: bool,
+    /// `HTMLCanvasElement.prototype.getElementTransform`. The geometry seam:
+    /// it reports the transform the browser has for a drawn element, which is
+    /// how an oracle confirms that the browser and GPUI agree about where the
+    /// control is. Probed rather than called here, because calling it is only
+    /// legal inside a paint event.
+    reads_transform: bool,
     /// The `layoutsubtree` attribute reflecting. Without it the canvas's
     /// descendants are ordinary fallback content: laid out by nothing, and so
     /// drawn as nothing.
@@ -109,7 +125,7 @@ impl HtmlInCanvas {
         Self {
             requests_paint: prototype_has("HTMLCanvasElement", REQUEST_PAINT),
             draws_elements: prototype_has("CanvasRenderingContext2D", DRAW_ELEMENT_IMAGE),
-            places_elements: prototype_has("HTMLCanvasElement", UPDATE_ELEMENT_GEOMETRY),
+            reads_transform: prototype_has("HTMLCanvasElement", GET_ELEMENT_TRANSFORM),
             lays_out_subtree: prototype_has("HTMLCanvasElement", LAYOUT_SUBTREE),
         }
     }
@@ -120,8 +136,13 @@ impl HtmlInCanvas {
     /// drawable element whose pixels are never drawn is an invisible control,
     /// and section 10 requires Theorem to work without the feature rather than
     /// to work badly with half of it.
+    ///
+    /// Each of the four is a member a shipping browser has: keying on a name
+    /// the proposal's prose uses but no implementation defines would refuse
+    /// the native path on every browser forever, which is a silent, permanent
+    /// fallback dressed up as feature detection.
     pub(crate) const fn complete(self) -> bool {
-        self.requests_paint && self.draws_elements && self.places_elements && self.lays_out_subtree
+        self.requests_paint && self.draws_elements && self.reads_transform && self.lays_out_subtree
     }
 }
 
@@ -234,7 +255,7 @@ impl NativeElements {
             supported: self.support.complete(),
             requests_paint: self.support.requests_paint,
             draws_elements: self.support.draws_elements,
-            places_elements: self.support.places_elements,
+            reads_transform: self.support.reads_transform,
             lays_out_subtree: self.support.lays_out_subtree,
             forced: self.forced.map(Forced::as_str),
             realization: self.realization.as_str(),
@@ -428,11 +449,32 @@ fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlEl
         &[JsValue::from_f64(ratio), JsValue::from_f64(ratio)],
     );
     for element in drawables {
-        // The element's own border box is where GPUI put it. Asking the
-        // browser rather than replaying a stored rectangle keeps one
-        // authority for the geometry, and it is the same box the browser will
-        // hit-test once `updateElementGeometry` names it.
+        // The element's own border box is where GPUI put it, through the
+        // inline `left`/`top`/`width`/`height` the IME mirror writes. Asking
+        // the browser for that box rather than replaying a stored rectangle
+        // keeps one authority for the geometry.
         let rect = element.get_bounding_client_rect();
+        // Drawing at the element's own box is what satisfies section 16, and
+        // it is worth writing down why, because the obvious reading of the
+        // proposal is that a separate call is needed to move the hit region.
+        //
+        // It is not, and there is no such call: `updateElementGeometry` is
+        // prose, and no browser defines it. What a browser does instead is
+        // hit-test, focus, route IME to and report to assistive technology the
+        // element at its *layout* box -- verified against Chrome 151, where a
+        // click inside a drawn copy at (90, 72) reached `body` and a click on
+        // the same element's layout box at (60, 12) focused it and accepted
+        // typing. The picture a canvas draws is a picture. Input follows CSS.
+        //
+        // So drawing at `rect` is not one of several defensible choices. It is
+        // the only one under which the pixels a person sees and the box the
+        // browser routes to are the same rectangle, and it makes them the same
+        // rectangle by construction rather than by keeping two in agreement.
+        //
+        // The layer is `position: fixed; inset: 0`, so its origin is the
+        // viewport origin and this viewport-relative rect is already in the
+        // canvas's own coordinate space. That is load-bearing: a layer placed
+        // any other way would need the difference subtracted here.
         call_void(
             &context,
             DRAW_ELEMENT_IMAGE,
@@ -440,21 +482,6 @@ fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlEl
                 element.into(),
                 JsValue::from_f64(rect.x()),
                 JsValue::from_f64(rect.y()),
-            ],
-        );
-        // Section 16: GPUI stays the layout authority, and this is the call
-        // that makes the browser agree. Without it the element is hit-tested
-        // and reported to assistive technology at its own layout box inside
-        // the canvas, not at the box it was drawn into.
-        call_void(
-            canvas,
-            UPDATE_ELEMENT_GEOMETRY,
-            &[
-                element.into(),
-                JsValue::from_f64(rect.x()),
-                JsValue::from_f64(rect.y()),
-                JsValue::from_f64(rect.width()),
-                JsValue::from_f64(rect.height()),
             ],
         );
     }
@@ -542,7 +569,7 @@ pub struct NativeElementSummary {
     pub supported: bool,
     pub requests_paint: bool,
     pub draws_elements: bool,
-    pub places_elements: bool,
+    pub reads_transform: bool,
     pub lays_out_subtree: bool,
     /// The path a test demanded, if one did.
     pub forced: Option<&'static str>,

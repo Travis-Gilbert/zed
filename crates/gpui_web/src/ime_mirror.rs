@@ -140,6 +140,32 @@ impl ImeMirror {
         // can never zoom back out, so keep the hidden IME input at 16px.
         style.set_property("font-size", "16px").ok();
         if let Some(layer) = layer.as_deref() {
+            // Section 11 divides the editable leaf: GPUI keeps the content and
+            // the browser contributes caret, selection, spellcheck and
+            // autocorrect. A textarea's default appearance contributes more
+            // than that -- an opaque background, a border, a focus ring and a
+            // second copy of the text in the user agent's font -- and on this
+            // path those are drawn over the scene GPUI just painted.
+            //
+            // So everything the browser would draw *except* the caret and the
+            // selection is turned off. `color: transparent` is the load-
+            // bearing one: it suppresses the duplicate glyphs while leaving
+            // the selection highlight, which paints behind text, and the
+            // caret, whose color is a separate property. The element stays a
+            // real, focused, hit-testable textarea throughout, so nothing
+            // about IME changes.
+            for (name, value) in [
+                ("background", "transparent"),
+                ("border", "none"),
+                ("outline", "none"),
+                ("padding", "0"),
+                ("margin", "0"),
+                ("resize", "none"),
+                ("overflow", "hidden"),
+                ("color", "transparent"),
+            ] {
+                style.set_property(name, value).ok();
+            }
             // Into the element layer, not into the canvas wgpu owns. A
             // canvas's element children are its fallback content, which the
             // HTML specification already says is laid out but never painted,
