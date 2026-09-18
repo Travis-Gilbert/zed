@@ -69,6 +69,7 @@ web-sys = { version = "0.3", features = [
     "MouseEvent",
     "Navigator",
     "Node",
+    "Performance",
     "PointerEvent",
     "ReadableStream",
     "ReadableStreamDefaultReader",

@@ -899,6 +899,23 @@ impl WebWindowInner {
             }
 
             this.ime_mirror.adopt_element_state();
+
+            // SPEC-THEOREMWEB-PWA-HTML-CANVAS-1.1 section 58 tracks
+            // "HTML-native editor input latency" as its own row. This is that
+            // number: the browser stamps `timeStamp` on the same timeline
+            // `performance.now()` reads, so the difference is the whole of
+            // what the product spent between the browser having the input and
+            // the editor holding it -- the mirror read, the edit computation,
+            // the replacement, and the write back.
+            //
+            // Sampled here rather than at the listener's first line because an
+            // early return is not an applied input, and a number that counted
+            // them would report the cost of deciding to do nothing.
+            if let Some(performance) = web_sys::window().and_then(|window| window.performance()) {
+                crate::native_element::record_input_latency(
+                    performance.now() - event.time_stamp(),
+                );
+            }
         })
     }
 

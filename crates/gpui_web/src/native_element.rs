@@ -260,6 +260,8 @@ impl NativeElements {
             forced: self.forced.map(Forced::as_str),
             realization: self.realization.as_str(),
             editable_bounds,
+            last_draw_ms: LAST_DRAW_MS.with(Cell::get),
+            last_input_latency_ms: LAST_INPUT_LATENCY_MS.with(Cell::get),
         }
     }
 }
@@ -433,6 +435,12 @@ fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlEl
     let Ok(Some(context)) = canvas.get_context("2d") else {
         return;
     };
+    // SPEC-THEOREMWEB-PWA-HTML-CANVAS-1.1 section 58 tracks "HTML snapshot
+    // upload cost" as its own row. This is that cost: the whole of what the
+    // browser does to put the element's rendering into the canvas, measured
+    // where it happens rather than inferred from a frame time that also
+    // contains everything wgpu drew.
+    let started = performance_now();
     // `reset` rather than `clearRect`: the proposal's element draws carry
     // state the next frame must not inherit, and a reset is one call instead
     // of a clear plus a transform restore.
@@ -485,6 +493,21 @@ fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlEl
             ],
         );
     }
+    // Only when something was drawn. A layer with no drawables costs the reset
+    // and the scale, and reporting that as a snapshot cost would put a number
+    // near zero against a row that is meant to say what a snapshot costs.
+    if let (Some(started), false) = (started, drawables.is_empty())
+        && let Some(now) = performance_now()
+    {
+        LAST_DRAW_MS.with(|cell| cell.set(Some(now - started)));
+    }
+}
+
+/// `performance.now()`, or nothing where there is no performance timeline.
+fn performance_now() -> Option<f64> {
+    web_sys::window()
+        .and_then(|window| window.performance())
+        .map(|performance| performance.now())
 }
 
 /// Call a method the proposal defines and web-sys does not bind.
@@ -579,6 +602,14 @@ pub struct NativeElementSummary {
     /// `[x, y, width, height]`. Section 51 compares these against GPUI's own
     /// bounds and against where the browser reports the element.
     pub editable_bounds: Option<[f32; 4]>,
+    /// Section 58: the most recent HTML snapshot upload cost, in milliseconds.
+    /// `None` until the layer has drawn at least one element, which on the
+    /// painted path is never.
+    pub last_draw_ms: Option<f64>,
+    /// Section 58: the most recent editor input latency, in milliseconds --
+    /// from the browser stamping the input event to GPUI having applied it.
+    /// `None` until something has been typed.
+    pub last_input_latency_ms: Option<f64>,
 }
 
 thread_local! {
@@ -586,6 +617,23 @@ thread_local! {
     /// thread, which is what lets an oracle read this without owning it.
     static SUMMARY_SOURCE: RefCell<Option<Rc<dyn Fn() -> NativeElementSummary>>> =
         const { RefCell::new(None) };
+
+    /// Section 58's two HTML-in-Canvas rows, as the most recent sample of
+    /// each. The most recent rather than an average, because an average hides
+    /// the frame that was slow and section 58's point is that these costs are
+    /// tracked separately rather than folded into one another.
+    static LAST_DRAW_MS: Cell<Option<f64>> = const { Cell::new(None) };
+    static LAST_INPUT_LATENCY_MS: Cell<Option<f64>> = const { Cell::new(None) };
+}
+
+/// Record how long the browser took to apply one input to the editor.
+///
+/// Section 58's "HTML-native editor input latency". Called from the input
+/// path, which runs on both realizations; the reader publishes it under that
+/// name only where the leaf really is browser-native, and the realization
+/// travels in the same report so the two cannot be read apart.
+pub(crate) fn record_input_latency(milliseconds: f64) {
+    LAST_INPUT_LATENCY_MS.with(|cell| cell.set(Some(milliseconds)));
 }
 
 pub(crate) fn publish_summary_source(source: Rc<dyn Fn() -> NativeElementSummary>) {
