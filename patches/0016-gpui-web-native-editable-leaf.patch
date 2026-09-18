@@ -1,0 +1,1091 @@
+From ae36fc10b5842bd24c84af4f6e61349e2df60747 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Fri, 18 Sep 2026 14:51:43 -0400
+Subject: [PATCH 2/2] feat(gpui-web): realize an editable leaf as a real
+ browser control
+
+A browser does not offer caret, selection, input-method composition,
+autocorrect, spellcheck or the virtual keyboard as primitives. It offers
+them only as properties of real elements, which is why reproducing them
+over a painted canvas costs what it costs. The HTML-in-Canvas proposal
+closes that gap, and this takes it where it exists.
+
+The elements are drawn on a second transparent canvas stacked over the one
+wgpu owns, not into wgpu's own output. The proposal's 2D call cannot get a
+2D context on a canvas wgpu already holds, and its WebGL call needs the GL
+texture name behind a `wgpu::Texture`, which wgpu exposes through no public
+API; reaching it means transmuting `wgpu-hal` internals across a pinned
+dependency. Two canvases and the browser's own compositor leave the
+renderer untouched.
+
+Support means all four entry points, because a partial implementation must
+answer unsupported: an element that is laid out and never drawn is an
+invisible control, which is worse than painting it. On every browser
+shipping today the answer is unsupported, the layer is never built, and the
+cost is four prototype lookups at window creation.
+
+The accessibility mirror stands down for a leaf the browser realizes.
+A real editable element already carries its own name, role and value to
+assistive technology, so mirroring it would put the same control in the
+tree twice and a screen reader would meet it twice.
+
+A test may force either path through `window.__gpui_html_in_canvas`.
+Forcing the native path on a browser that cannot draw the element is
+reported and refused rather than honoured into an invisible control.
+---
+ crates/gpui_web/src/a11y.rs           | 114 +++++-
+ crates/gpui_web/src/gpui_web.rs       |   2 +
+ crates/gpui_web/src/ime_mirror.rs     | 110 +++++-
+ crates/gpui_web/src/native_element.rs | 534 ++++++++++++++++++++++++++
+ crates/gpui_web/src/window.rs         |  61 ++-
+ 5 files changed, 806 insertions(+), 15 deletions(-)
+ create mode 100644 crates/gpui_web/src/native_element.rs
+
+diff --git a/crates/gpui_web/src/a11y.rs b/crates/gpui_web/src/a11y.rs
+index 52a78328ae..f069a44a41 100644
+--- a/crates/gpui_web/src/a11y.rs
++++ b/crates/gpui_web/src/a11y.rs
+@@ -199,6 +199,18 @@ struct Mirrored {
+     children: Vec<NodeId>,
+ }
+ 
++/// Whether a real browser input element can stand for this role.
++///
++/// Only the text roles, and only because the element that owns focus on this
++/// platform is a `<textarea>`: an element can realize the control it actually
++/// is. Section 11 lists other capabilities a browser could own, and each of
++/// them needs its own element before it can appear here. Section 12 is
++/// explicit that the editable leaf comes first and nothing generalizes until
++/// that proof holds.
++const fn realizable_natively(role: Role) -> bool {
++    matches!(role, Role::TextInput | Role::MultilineTextInput)
++}
++
+ /// The ARIA roles that take `aria-valuetext`.
+ ///
+ /// Everywhere else -- a textbox above all -- the value is the element's
+@@ -268,6 +280,15 @@ pub(crate) struct WebA11yAdapter {
+     nodes: HashMap<NodeId, MirrorNode>,
+     focus: Option<NodeId>,
+     announced: String,
++    /// Whether this browser realizes an editable leaf as the real input
++    /// element rather than as pixels. Section 15: when it does, that element
++    /// *is* the accessibility realization of the focused text node, and this
++    /// mirror must not project a second control for the same node.
++    native_editable: bool,
++    /// The node the input element currently stands for, if any. Kept so the
++    /// attributes written onto a shared element can be taken back off it when
++    /// focus leaves.
++    natively_realized: Option<NodeId>,
+     /// The delegated `click`/`focusin` listeners. Dropping the adapter removes
+     /// them, which is why they are owned here rather than forgotten.
+     _listeners: Vec<DelegatedListener>,
+@@ -294,6 +315,7 @@ impl WebA11yAdapter {
+     pub(crate) fn new(
+         document: web_sys::Document,
+         input_element: web_sys::HtmlElement,
++        native_editable: bool,
+         action: Rc<dyn Fn(ActionRequest)>,
+     ) -> anyhow::Result<Self> {
+         let body = document
+@@ -386,6 +408,8 @@ impl WebA11yAdapter {
+             nodes: HashMap::default(),
+             focus: None,
+             announced: String::new(),
++            native_editable,
++            natively_realized: None,
+             _listeners: listeners,
+         })
+     }
+@@ -397,7 +421,33 @@ impl WebA11yAdapter {
+     pub(crate) fn apply(&mut self, update: &TreeUpdate, scale_factor: f32) {
+         let mut announcement: Option<String> = None;
+ 
++        // Section 15. On a browser that realizes editable leaves natively, the
++        // focused text node is already a control a screen reader can reach:
++        // the input element itself, with its own native role, its own caret
++        // and its own selection. Mirroring it as well would put two textboxes
++        // in the tree for one semantic node, and a reader would encounter the
++        // control twice. So the node is claimed here, before the mirror loop,
++        // and the loop skips it.
++        let claimed = self.native_editable.then(|| {
++            update
++                .nodes
++                .iter()
++                .find(|(node_id, node)| *node_id == update.focus && realizable_natively(node.role()))
++                .map(|(node_id, node)| (*node_id, Mirrored::read(node)))
++        });
++        let claimed = claimed.flatten();
++        self.apply_native_realization(claimed.as_ref());
++
+         for (node_id, node) in &update.nodes {
++            if Some(*node_id) == self.natively_realized {
++                // It may have been an ordinary mirrored node last frame.
++                if let Some(stale) = self.nodes.remove(node_id)
++                    && let Some(parent) = stale.element.parent_node()
++                {
++                    let _ = parent.remove_child(&stale.element);
++                }
++                continue;
++            }
+             let read = Mirrored::read(node);
+ 
+             match self.nodes.get_mut(node_id) {
+@@ -444,7 +494,9 @@ impl WebA11yAdapter {
+         }
+ 
+         // Nodes absent from a full tree are gone, not merely unchanged: GPUI
+-        // rebuilds the whole tree every frame.
++        // rebuilds the whole tree every frame. The natively realized node is
++        // present in the tree and deliberately absent from the mirror, so it
++        // is never in `self.nodes` to be retained or removed here.
+         let present: std::collections::HashSet<NodeId> =
+             update.nodes.iter().map(|(id, _)| *id).collect();
+         self.nodes.retain(|node_id, mirrored| {
+@@ -467,7 +519,12 @@ impl WebA11yAdapter {
+ 
+         if self.focus != Some(update.focus) {
+             self.focus = Some(update.focus);
+-            if self.nodes.contains_key(&update.focus) {
++            if self.natively_realized == Some(update.focus) {
++                // There is no descendant to be active: the focused element is
++                // the control. Pointing at one would be the duplicate again,
++                // in attribute form.
++                let _ = self.input_element.remove_attribute("aria-activedescendant");
++            } else if self.nodes.contains_key(&update.focus) {
+                 let _ = self
+                     .input_element
+                     .set_attribute("aria-activedescendant", &element_id(update.focus));
+@@ -484,6 +541,44 @@ impl WebA11yAdapter {
+         }
+     }
+ 
++    /// Move the input element onto, or off, the node it stands for.
++    ///
++    /// The element is shared -- it is the IME conduit on every browser and the
++    /// realized control on some -- so everything written here is written back
++    /// off when the claim ends. Geometry is deliberately not among it: section
++    /// 16 makes GPUI the layout authority and the IME mirror the one writer of
++    /// this element's box, so a second writer here would be two authorities
++    /// for one rectangle.
++    fn apply_native_realization(&mut self, claimed: Option<&(NodeId, Mirrored)>) {
++        let element: &web_sys::Element = self.input_element.as_ref();
++        match claimed {
++            Some((node_id, read)) => {
++                self.natively_realized = Some(*node_id);
++                let _ = element.set_attribute(NODE_ATTRIBUTE, &node_id.0.to_string());
++                set_or_clear(element, "aria-label", read.label.as_deref());
++                set_or_clear(element, "aria-description", read.description.as_deref());
++                set_flag(element, "aria-disabled", read.disabled);
++                set_flag(element, "aria-required", read.required);
++                set_flag(element, "aria-readonly", read.read_only);
++            }
++            None => {
++                if self.natively_realized.take().is_none() {
++                    return;
++                }
++                for attribute in [
++                    NODE_ATTRIBUTE,
++                    "aria-label",
++                    "aria-description",
++                    "aria-disabled",
++                    "aria-required",
++                    "aria-readonly",
++                ] {
++                    let _ = element.remove_attribute(attribute);
++                }
++            }
++        }
++    }
++
+     /// Make the DOM children of `node_id` match its AccessKit children, in
+     /// order. Only called when that list actually changed.
+     fn reorder_children(&self, node_id: NodeId) {
+@@ -652,6 +747,14 @@ pub struct A11yMirrorSummary {
+     pub node_count: usize,
+     /// The document id currently named by `aria-activedescendant`, if any.
+     pub focused_element_id: Option<String>,
++    /// The AccessKit node the real input element stands for, when this browser
++    /// realizes an editable leaf natively. Section 50's oracle reads this and
++    /// then asserts the mirror holds no element for the same node.
++    pub natively_realized_node: Option<u64>,
++    /// Document ids of mirror elements whose ARIA role is `textbox`. Section
++    /// 50: with a node realized natively, this must not also contain a mirror
++    /// of that node, or a reader meets the control twice.
++    pub textbox_element_ids: Vec<String>,
+ }
+ 
+ impl WebA11yAdapter {
+@@ -659,6 +762,13 @@ impl WebA11yAdapter {
+         A11yMirrorSummary {
+             node_count: self.nodes.len(),
+             focused_element_id: self.input_element.get_attribute("aria-activedescendant"),
++            natively_realized_node: self.natively_realized.map(|node_id| node_id.0),
++            textbox_element_ids: self
++                .nodes
++                .iter()
++                .filter(|(_, mirrored)| mirrored.applied.role == Some("textbox"))
++                .map(|(node_id, _)| element_id(*node_id))
++                .collect(),
+         }
+     }
+ }
+diff --git a/crates/gpui_web/src/gpui_web.rs b/crates/gpui_web/src/gpui_web.rs
+index b07b93c402..ae0fac3f13 100644
+--- a/crates/gpui_web/src/gpui_web.rs
++++ b/crates/gpui_web/src/gpui_web.rs
+@@ -15,6 +15,7 @@ mod ime_mirror;
+ mod input_edit;
+ mod keyboard;
+ mod logging;
++mod native_element;
+ mod platform;
+ mod window;
+ 
+@@ -26,5 +27,6 @@ pub use gpui_wgpu::WebBackendPreference;
+ pub use http_client::{FetchCredentials, FetchHttpClient};
+ pub use keyboard::WebKeyboardLayout;
+ pub use logging::init_logging;
++pub use native_element::{NativeElementSummary, native_element_summary};
+ pub use platform::{WebPlatform, WebWindowError};
+ pub use window::{IME_INPUT_ELEMENT_ID, WebWindow};
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index f8c643b8af..5bc8b022ee 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -20,6 +20,7 @@ use std::rc::Rc;
+ use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration};
+ use wasm_bindgen::JsCast;
+ 
++use crate::native_element::{ElementLayer, Realization};
+ use crate::window::{IME_INPUT_ELEMENT_ID, WebWindowInner};
+ 
+ /// UTF-16 code units of document text mirrored on each side of the
+@@ -55,6 +56,23 @@ const MIN_EDGE_CHARS: usize = 64;
+ /// read-only control, and [`ImeMirror::schedule_sync`].
+ pub(crate) struct ImeMirror {
+     element: web_sys::HtmlTextAreaElement,
++    /// The layer that draws this element, on the browser-native path only.
++    /// Holding it here is what lets a move publish a repaint: the browser has
++    /// no reason to redraw a canvas because a descendant's style changed.
++    layer: Option<Rc<ElementLayer>>,
++    /// Which implementation this leaf got, decided once at window creation.
++    ///
++    /// The two paths differ in exactly two places -- where the element is
++    /// parented and what size it is given -- and in nothing else. Every
++    /// value, selection, IME and configuration path below is shared, which is
++    /// what makes section 19's "the draft format is identical" true by
++    /// construction rather than by a second implementation that agrees.
++    realization: Realization,
++    /// The editable leaf's last published bounds in CSS pixels, for section
++    /// 51's geometry oracle. Held here rather than recomputed from the
++    /// element's style, because what the oracle must check is that the
++    /// browser agrees with the bounds GPUI *sent*.
++    published_bounds: Cell<Option<[f32; 4]>>,
+     /// The mirror text most recently synced to (or observed in) the hidden
+     /// element. `input` events diff the element's new value against this to
+     /// recover what edit the IME performed.
+@@ -96,6 +114,8 @@ impl ImeMirror {
+     pub(crate) fn new(
+         document: &web_sys::Document,
+         body: &web_sys::HtmlElement,
++        layer: Option<Rc<ElementLayer>>,
++        realization: Realization,
+     ) -> anyhow::Result<Self> {
+         // A textarea rather than an input: single-line inputs silently strip
+         // newlines from assigned values, which would make the mirror text
+@@ -107,18 +127,36 @@ impl ImeMirror {
+             .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
+         element.set_id(IME_INPUT_ELEMENT_ID);
+         let style = element.style();
++        // Both paths place the element in viewport coordinates, because the
++        // canvas fills the viewport: one `update_position` then serves both,
++        // and the caret bounds GPUI sends need no second transform.
+         style.set_property("position", "fixed").ok();
+         style.set_property("top", "0").ok();
+         style.set_property("left", "0").ok();
+         style.set_property("width", "1px").ok();
+         style.set_property("height", "1px").ok();
+-        style.set_property("opacity", "0").ok();
+         // Android Chrome zooms the visual viewport onto a focused text input
+         // whose font is smaller than 16px; with page zoom disabled the user
+         // can never zoom back out, so keep the hidden IME input at 16px.
+         style.set_property("font-size", "16px").ok();
+-        body.append_child(&element)
+-            .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
++        if let Some(layer) = layer.as_deref() {
++            // Into the element layer, not into the canvas wgpu owns. A
++            // canvas's element children are its fallback content, which the
++            // HTML specification already says is laid out but never painted,
++            // and which the HTML-in-Canvas proposal makes drawable -- but only
++            // the canvas that draws them can draw them, and wgpu holds the
++            // other canvas's context for its own output. So the element's
++            // parent is the transparent layer stacked above the scene, and the
++            // browser composites the two.
++            layer.adopt(element.as_ref());
++        } else {
++            // Painted: the element exists only to hold the IME's attention,
++            // so it is one transparent pixel that nothing can see and nothing
++            // can reach.
++            style.set_property("opacity", "0").ok();
++            body.append_child(&element)
++                .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
++        }
+         element.focus().ok();
+         // The element must stay focused to receive hardware-key and IME
+         // events, but on touch-first devices a focused *editable* element
+@@ -131,6 +169,9 @@ impl ImeMirror {
+ 
+         let this = Self {
+             element,
++            layer,
++            realization,
++            published_bounds: Cell::new(None),
+             text: RefCell::new(String::new()),
+             selection: Cell::new((0, 0)),
+             window_hint: Cell::new(0),
+@@ -192,29 +233,74 @@ impl ImeMirror {
+     }
+ 
+     /// Browser caret bounds use CSS pixels, matching GPUI's logical coordinates.
++    ///
++    /// Section 16 makes GPUI the layout authority on both paths, so both take
++    /// the bounds GPUI prepainted and neither lets the browser decide where
++    /// the control sits. They differ only in width, and for a reason: a
++    /// painted mirror is one pixel wide because a wider invisible textarea
++    /// would swallow pointer events over the control GPUI drew, while a
++    /// browser-native element must occupy the control's real box or the
++    /// browser lays out its text, hit-tests its caret and reports its
++    /// accessibility geometry against the wrong rectangle.
+     pub(crate) fn update_position(&self, bounds: gpui::Bounds<gpui::Pixels>) {
++        let x = f32::from(bounds.origin.x);
++        let y = f32::from(bounds.origin.y);
++        let width = f32::from(bounds.size.width).max(1.0);
++        let height = f32::from(bounds.size.height).max(1.0);
+         let style = self.element.style();
+-        for (name, value) in [
+-            ("left", format!("{}px", f32::from(bounds.origin.x))),
+-            ("top", format!("{}px", f32::from(bounds.origin.y))),
+-            (
+-                "height",
+-                format!("{}px", f32::from(bounds.size.height).max(1.0)),
+-            ),
+-        ] {
++        let mut properties = vec![
++            ("left", format!("{x}px")),
++            ("top", format!("{y}px")),
++            ("height", format!("{height}px")),
++        ];
++        if self.realization.is_browser_native() {
++            properties.push(("width", format!("{width}px")));
++        }
++        for (name, value) in properties {
+             if let Err(error) = style.set_property(name, &value) {
+                 log::warn!("Failed to position IME mirror {name}: {error:?}");
+             }
+         }
++        self.published_bounds.set(Some([x, y, width, height]));
++        // GPUI prepainted a caret box, so there is a live editable leaf and
++        // it is here. That is both the visibility signal and the repaint
++        // signal: the element moved, so its pixels are in the wrong place
++        // until the layer draws again, and nothing else would ask -- a canvas
++        // is not invalidated by a descendant's layout.
++        if let Some(layer) = self.layer.as_deref() {
++            layer.set_visible(true);
++            layer.request_paint();
++        }
+     }
+ 
+     pub(crate) fn reset_position(&self) {
+         let style = self.element.style();
+-        for (name, value) in [("left", "0"), ("top", "0"), ("height", "1px")] {
++        let mut properties = vec![("left", "0"), ("top", "0"), ("height", "1px")];
++        if self.realization.is_browser_native() {
++            properties.push(("width", "1px"));
++        }
++        for (name, value) in properties {
+             if let Err(error) = style.set_property(name, value) {
+                 log::warn!("Failed to reset IME mirror {name}: {error:?}");
+             }
+         }
++        self.published_bounds.set(None);
++        // Focus left the leaf, so GPUI says there is nothing to draw. Section
++        // 11 keeps that judgement on GPUI's side, and it has to: the layer
++        // composites above the scene, so an element the renderer had covered
++        // would otherwise still show through whatever GPUI drew over it.
++        if let Some(layer) = self.layer.as_deref() {
++            layer.set_visible(false);
++        }
++    }
++
++    /// The bounds last sent to the element, for section 51's oracle.
++    pub(crate) fn published_bounds(&self) -> Option<[f32; 4]> {
++        self.published_bounds.get()
++    }
++
++    pub(crate) const fn realization(&self) -> Realization {
++        self.realization
+     }
+ 
+     pub(crate) fn event_target(&self) -> &web_sys::EventTarget {
+diff --git a/crates/gpui_web/src/native_element.rs b/crates/gpui_web/src/native_element.rs
+new file mode 100644
+index 0000000000..22c008d944
+--- /dev/null
++++ b/crates/gpui_web/src/native_element.rs
+@@ -0,0 +1,534 @@
++//! Browser-native realization of a GPUI leaf.
++//!
++//! A GPUI leaf is ordinarily painted: its contents become vertices and
++//! textures in the scene, and every behavior a person expects of the control
++//! is GPUI's to reproduce. For an editable leaf that reproduction is where the
++//! browser costs the most, because a browser does not offer caret, selection,
++//! IME, autocorrect, spellcheck or the virtual keyboard as primitives. It
++//! offers them only as properties of real elements.
++//!
++//! The HTML-in-Canvas proposal closes that gap: a real element, laid out by
++//! the browser, drawn where the application wants it, and hit-tested there.
++//! This module decides whether that path is available and owns the layer that
++//! draws it. It is the only place in GPUI that names the proposal's entry
++//! points, so an application never reaches them and never learns which path it
++//! got.
++//!
++//! # Why a second canvas
++//!
++//! The specification's section 17 describes element snapshot to WebGL texture
++//! to GPUI scene. This platform cannot take that route. It renders through
++//! wgpu (`WebPlatform::new_with_backend(_, WebBackendPreference::WebGl)`), and
++//! wgpu owns the canvas's GL context: the proposal's 2D call cannot get a 2D
++//! context on a canvas wgpu already holds, and its WebGL call needs the GL
++//! texture name behind a `wgpu::Texture`, which wgpu exposes through no public
++//! API. Reaching it means transmuting `wgpu-hal` internals across a pinned
++//! dependency.
++//!
++//! So the elements live on a second, transparent canvas stacked over the one
++//! wgpu owns, and the browser composites the two. That is the proposal's own
++//! demonstrated mechanism, it leaves `WgpuRenderer` untouched, and it keeps
++//! this whole file inert on a browser that does not ship the proposal.
++//!
++//! # Why the decision is the platform's
++//!
++//! Nothing in the GPUI API changes. A leaf declares what it is through the
++//! configuration it already sends, and the same draft, the same events and the
++//! same semantic node come back on either path. A browser that ships the
++//! proposal and a browser that never does must be indistinguishable above this
++//! line, which is only true if nothing above this line is asked.
++
++use std::cell::{Cell, RefCell};
++use std::rc::Rc;
++
++use wasm_bindgen::prelude::Closure;
++use wasm_bindgen::{JsCast, JsValue};
++
++/// The proposal's entry points.
++///
++/// These are the names the proposal actually ships, which are not quite the
++/// names the specification's prose uses: the draw call is `drawElementImage`
++/// on the 2D context, the invalidation signal is `requestPaint` on the canvas,
++/// and the element's layout participation is the `layoutsubtree` content
++/// attribute reflected as `layoutSubtree`.
++const REQUEST_PAINT: &str = "requestPaint";
++const DRAW_ELEMENT_IMAGE: &str = "drawElementImage";
++const UPDATE_ELEMENT_GEOMETRY: &str = "updateElementGeometry";
++const LAYOUT_SUBTREE: &str = "layoutSubtree";
++
++/// The event the browser fires when the layer canvas needs its contents again.
++const PAINT_EVENT: &str = "paint";
++
++/// The layer canvas's document id, so an oracle can find it.
++pub const ELEMENT_LAYER_ID: &str = "gpui-element-layer";
++
++/// The global a test writes to force one path or the other.
++///
++/// Section 10 permits a test override and requires that ordinary operation
++/// need no user-facing setting. A global read once at window creation is both:
++/// invisible to a person, and reachable from a page's own bootstrap before
++/// anything has rendered. Deliberately not a URL parameter, which the
++/// application's route codec would see and rewrite.
++const OVERRIDE_GLOBAL: &str = "__gpui_html_in_canvas";
++
++/// What this browser can do with an element a canvas draws.
++///
++/// Recorded as four separate answers rather than one boolean because the
++/// proposal is still moving, and a browser that ships the draw call before the
++/// geometry call is a real intermediate state. Treating that as support would
++/// place a control the browser cannot hit-test, which is worse than painting
++/// it: a person would see the element and be unable to click it.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(crate) struct HtmlInCanvas {
++    /// `HTMLCanvasElement.prototype.requestPaint`. The "something moved"
++    /// signal. Without it the layer is only redrawn when the browser decides
++    /// to, and a control would lag the layout that moved it.
++    requests_paint: bool,
++    /// `CanvasRenderingContext2D.prototype.drawElementImage`. The draw itself.
++    draws_elements: bool,
++    /// `HTMLCanvasElement.prototype.updateElementGeometry`. Tells the browser
++    /// where the canvas drew the element, which is what gives it a hit region
++    /// and an accessibility rectangle at the drawn position rather than at its
++    /// own layout box.
++    places_elements: bool,
++    /// The `layoutsubtree` attribute reflecting. Without it the canvas's
++    /// descendants are ordinary fallback content: laid out by nothing, and so
++    /// drawn as nothing.
++    lays_out_subtree: bool,
++}
++
++impl HtmlInCanvas {
++    /// Probe the browser.
++    ///
++    /// Probed on the prototypes rather than on a live context. A canvas has
++    /// one context type for its lifetime, so probing a real context would mean
++    /// allocating a throwaway canvas and a throwaway context -- a real cost
++    /// against a browser's small context budget -- to learn something the
++    /// prototype already states.
++    pub(crate) fn detect() -> Self {
++        Self {
++            requests_paint: prototype_has("HTMLCanvasElement", REQUEST_PAINT),
++            draws_elements: prototype_has("CanvasRenderingContext2D", DRAW_ELEMENT_IMAGE),
++            places_elements: prototype_has("HTMLCanvasElement", UPDATE_ELEMENT_GEOMETRY),
++            lays_out_subtree: prototype_has("HTMLCanvasElement", LAYOUT_SUBTREE),
++        }
++    }
++
++    /// Section 10's "complete support?" branch.
++    ///
++    /// All four, because a partial implementation must answer unsupported: a
++    /// drawable element whose pixels are never drawn is an invisible control,
++    /// and section 10 requires Theorem to work without the feature rather than
++    /// to work badly with half of it.
++    pub(crate) const fn complete(self) -> bool {
++        self.requests_paint && self.draws_elements && self.places_elements && self.lays_out_subtree
++    }
++}
++
++/// Which implementation a leaf got.
++///
++/// Reported, never asked for. An application that branched on this would be
++/// the fork section 19 forbids.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Realization {
++    /// The browser owns the control's editing mechanics, and the layer draws
++    /// the browser's own rendering of it.
++    BrowserNative,
++    /// GPUI paints the control and drives editing through the hidden input
++    /// this platform has always used.
++    GpuiPainted,
++}
++
++impl Realization {
++    pub(crate) const fn is_browser_native(self) -> bool {
++        matches!(self, Self::BrowserNative)
++    }
++
++    const fn as_str(self) -> &'static str {
++        match self {
++            Self::BrowserNative => "browser-native",
++            Self::GpuiPainted => "gpui-painted",
++        }
++    }
++}
++
++/// A test's demand, if it made one.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Forced {
++    Native,
++    Painted,
++}
++
++impl Forced {
++    const fn as_str(self) -> &'static str {
++        match self {
++            Self::Native => "browser-native",
++            Self::Painted => "gpui-painted",
++        }
++    }
++}
++
++/// The decision, and the evidence behind it, made once per window.
++///
++/// Once, because capability cannot appear part-way through a session, and
++/// because a control that changed implementation under a person's caret would
++/// lose the composition they were in the middle of.
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct NativeElements {
++    support: HtmlInCanvas,
++    forced: Option<Forced>,
++    realization: Realization,
++}
++
++impl NativeElements {
++    pub(crate) fn decide() -> Self {
++        let support = HtmlInCanvas::detect();
++        let forced = read_override();
++        // Forcing the native path on a browser that cannot draw the element is
++        // a demand this platform cannot honour, so it is reported as forced
++        // and refused rather than silently producing an invisible control.
++        // Section 49's fallback oracle needs the opposite direction, and that
++        // one always works.
++        let realization = match forced {
++            Some(Forced::Painted) => Realization::GpuiPainted,
++            Some(Forced::Native) if support.complete() => Realization::BrowserNative,
++            Some(Forced::Native) => {
++                log::warn!(
++                    "html-in-canvas: forced native, but this browser answers {support:?}; painting instead"
++                );
++                Realization::GpuiPainted
++            }
++            None if support.complete() => Realization::BrowserNative,
++            None => Realization::GpuiPainted,
++        };
++        Self {
++            support,
++            forced,
++            realization,
++        }
++    }
++
++    pub(crate) const fn realization(self) -> Realization {
++        self.realization
++    }
++
++    /// Build the layer this decision calls for, if it calls for one.
++    ///
++    /// Routed through the decision rather than constructed beside it so that
++    /// one place honours the override: a test that forced the painted path on
++    /// a browser that supports the proposal must get no layer, and a check
++    /// against raw capability would hand it one.
++    pub(crate) fn create_layer(
++        self,
++        document: &web_sys::Document,
++        body: &web_sys::HtmlElement,
++    ) -> Option<Rc<ElementLayer>> {
++        if !self.realization.is_browser_native() {
++            return None;
++        }
++        ElementLayer::create(document, body, self.support).map(Rc::new)
++    }
++
++    pub(crate) fn summary(self, editable_bounds: Option<[f32; 4]>) -> NativeElementSummary {
++        NativeElementSummary {
++            supported: self.support.complete(),
++            requests_paint: self.support.requests_paint,
++            draws_elements: self.support.draws_elements,
++            places_elements: self.support.places_elements,
++            lays_out_subtree: self.support.lays_out_subtree,
++            forced: self.forced.map(Forced::as_str),
++            realization: self.realization.as_str(),
++            editable_bounds,
++        }
++    }
++}
++
++/// The transparent canvas the browser's own elements are drawn onto.
++///
++/// It is stacked over the canvas wgpu owns and composited by the browser, so
++/// the renderer never learns it exists. Nothing about GPUI's scene changes; a
++/// natively realized leaf simply leaves a hole in it and this layer fills the
++/// hole with the browser's rendering of the same control.
++pub(crate) struct ElementLayer {
++    canvas: web_sys::HtmlCanvasElement,
++    /// The drawable elements, in paint order. Their positions are not stored:
++    /// each element's own CSS box is where it is, written by whoever owns the
++    /// element, and a second copy here would be a second authority for one
++    /// rectangle.
++    ///
++    /// Shared with the paint listener rather than read back off the canvas,
++    /// because reading a canvas's children means `HTMLCollection`, a web-sys
++    /// feature this crate does not enable, to recover a list this side of the
++    /// boundary already has.
++    drawables: Rc<RefCell<Vec<web_sys::HtmlElement>>>,
++    /// Whether GPUI currently says the leaf is visible. Section 11 keeps
++    /// visibility and clipping policy on GPUI's side of the line, and it has
++    /// to: a GPUI overlay drawn above the leaf would otherwise still show the
++    /// browser's element through it, because the layer composites above the
++    /// scene rather than inside it.
++    visible: Cell<bool>,
++    _paint: Closure<dyn FnMut(web_sys::Event)>,
++}
++
++impl ElementLayer {
++    /// Build the layer, or report that this browser has no use for one.
++    ///
++    /// `None` is the ordinary answer today and costs nothing: no canvas, no
++    /// context, no listener, and every caller below already treats the absence
++    /// as "paint it yourself".
++    pub(crate) fn create(
++        document: &web_sys::Document,
++        body: &web_sys::HtmlElement,
++        support: HtmlInCanvas,
++    ) -> Option<Self> {
++        if !support.complete() {
++            return None;
++        }
++        let canvas: web_sys::HtmlCanvasElement = document
++            .create_element("canvas")
++            .ok()?
++            .dyn_into()
++            .ok()?;
++        canvas.set_id(ELEMENT_LAYER_ID);
++        // The attribute, not the IDL property: the property is what was
++        // probed, and setting the content attribute is what the proposal's own
++        // markup does.
++        canvas.set_attribute("layoutsubtree", "").ok()?;
++        let style = canvas.style();
++        for (name, value) in [
++            ("position", "fixed"),
++            ("inset", "0"),
++            ("width", "100%"),
++            ("height", "100%"),
++            // The layer must not eat pointer events. A drawable element inside
++            // it gets its own hit region from `updateElementGeometry`, which
++            // the browser applies when the element is drawn, so the element
++            // stays reachable while the empty space around it does not
++            // intercept anything aimed at the scene below.
++            ("pointer-events", "none"),
++        ] {
++            style.set_property(name, value).ok()?;
++        }
++        body.append_child(&canvas).ok()?;
++
++        let drawables: Rc<RefCell<Vec<web_sys::HtmlElement>>> = Rc::default();
++        let paint_canvas = canvas.clone();
++        let paint_drawables = Rc::clone(&drawables);
++        let paint = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event: web_sys::Event| {
++            paint_layer(&paint_canvas, &paint_drawables.borrow());
++        });
++        canvas
++            .add_event_listener_with_callback(PAINT_EVENT, paint.as_ref().unchecked_ref())
++            .ok()?;
++
++        Some(Self {
++            canvas,
++            drawables,
++            visible: Cell::new(true),
++            _paint: paint,
++        })
++    }
++
++    /// Move an element into the layer and start drawing it.
++    ///
++    /// The element becomes a descendant of the layer canvas, which under the
++    /// proposal is what makes it laid out but not painted by the page: the
++    /// layer draws it instead, exactly once, where GPUI put it.
++    pub(crate) fn adopt(&self, element: &web_sys::HtmlElement) {
++        if self.canvas.append_child(element).is_err() {
++            log::warn!("html-in-canvas: could not adopt an element into the layer");
++            return;
++        }
++        self.drawables.borrow_mut().push(element.clone());
++        self.request_paint();
++    }
++
++    /// Ask for a repaint because something moved.
++    ///
++    /// The layer is otherwise only redrawn when the browser decides to, and a
++    /// control that lagged the layout that moved it would smear across a
++    /// scroll.
++    pub(crate) fn request_paint(&self) {
++        call_void(&self.canvas, REQUEST_PAINT, &[]);
++    }
++
++    /// Follow GPUI's visibility for the leaf.
++    ///
++    /// Hiding the whole layer rather than one element is exact while there is
++    /// one drawable and is the reason section 12 says not to generalize to
++    /// many controls before the composer proof holds: a second drawable with a
++    /// different visibility needs this to become per element.
++    pub(crate) fn set_visible(&self, visible: bool) {
++        if self.visible.replace(visible) == visible {
++            return;
++        }
++        let _ = self
++            .canvas
++            .style()
++            .set_property("display", if visible { "block" } else { "none" });
++        if visible {
++            self.request_paint();
++        }
++    }
++
++    pub(crate) fn remove(&self) {
++        let canvas: &web_sys::Element = self.canvas.as_ref();
++        canvas.remove();
++    }
++}
++
++/// Redraw every drawable the layer holds, at the box it currently occupies.
++///
++/// Reached only from the browser's own `paint` event, which is the only moment
++/// the proposal permits the draw call: outside it the canvas has no valid
++/// drawing target for element content.
++fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlElement]) {
++    let Ok(Some(context)) = canvas.get_context("2d") else {
++        return;
++    };
++    // `reset` rather than `clearRect`: the proposal's element draws carry
++    // state the next frame must not inherit, and a reset is one call instead
++    // of a clear plus a transform restore.
++    call_void(&context, "reset", &[]);
++    for element in drawables {
++        // The element's own border box is where GPUI put it. Asking the
++        // browser rather than replaying a stored rectangle keeps one
++        // authority for the geometry, and it is the same box the browser will
++        // hit-test once `updateElementGeometry` names it.
++        let rect = element.get_bounding_client_rect();
++        call_void(
++            &context,
++            DRAW_ELEMENT_IMAGE,
++            &[
++                element.into(),
++                JsValue::from_f64(rect.x()),
++                JsValue::from_f64(rect.y()),
++            ],
++        );
++        // Section 16: GPUI stays the layout authority, and this is the call
++        // that makes the browser agree. Without it the element is hit-tested
++        // and reported to assistive technology at its own layout box inside
++        // the canvas, not at the box it was drawn into.
++        call_void(
++            canvas,
++            UPDATE_ELEMENT_GEOMETRY,
++            &[
++                element.into(),
++                JsValue::from_f64(rect.x()),
++                JsValue::from_f64(rect.y()),
++                JsValue::from_f64(rect.width()),
++                JsValue::from_f64(rect.height()),
++            ],
++        );
++    }
++}
++
++/// Call a method the proposal defines and web-sys does not bind.
++///
++/// A failure is logged and swallowed. Every call site here is a draw or an
++/// invalidation on a path that was already probed as supported, so a failure
++/// means the browser changed the proposal under us -- worth a line in the
++/// console, and not worth taking the window down over.
++fn call_void(target: &JsValue, name: &str, arguments: &[JsValue]) {
++    let Ok(method) = js_sys::Reflect::get(target, &JsValue::from_str(name)) else {
++        return;
++    };
++    let Ok(method) = method.dyn_into::<js_sys::Function>() else {
++        return;
++    };
++    let call = match arguments {
++        [] => method.call0(target),
++        [one] => method.call1(target, one),
++        [one, two] => method.call2(target, one, two),
++        [one, two, three] => method.call3(target, one, two, three),
++        _ => {
++            let array = js_sys::Array::new();
++            for argument in arguments {
++                array.push(argument);
++            }
++            js_sys::Reflect::apply(&method, target, &array)
++        }
++    };
++    if let Err(error) = call {
++        log::warn!("html-in-canvas: {name} failed: {error:?}");
++    }
++}
++
++/// Whether `<global>.prototype` answers to `name`.
++///
++/// `Reflect::has` is the `in` operator, so it walks the prototype chain and
++/// finds a member the browser installed on a base interface. A browser without
++/// the constructor at all answers `false` at the first step. Nothing is
++/// invoked: a capability probe that calls the capability is a probe that can
++/// break the page it is probing.
++fn prototype_has(global_name: &str, name: &str) -> bool {
++    let Some(window) = web_sys::window() else {
++        return false;
++    };
++    let Ok(constructor) = js_sys::Reflect::get(&window, &JsValue::from_str(global_name)) else {
++        return false;
++    };
++    if constructor.is_undefined() || constructor.is_null() {
++        return false;
++    }
++    let Ok(prototype) = js_sys::Reflect::get(&constructor, &JsValue::from_str("prototype")) else {
++        return false;
++    };
++    let Ok(prototype) = prototype.dyn_into::<js_sys::Object>() else {
++        return false;
++    };
++    js_sys::Reflect::has(&prototype, &JsValue::from_str(name)).unwrap_or(false)
++}
++
++fn read_override() -> Option<Forced> {
++    let window = web_sys::window()?;
++    let value = js_sys::Reflect::get(&window, &JsValue::from_str(OVERRIDE_GLOBAL)).ok()?;
++    match value.as_string()?.as_str() {
++        "native" => Some(Forced::Native),
++        "painted" => Some(Forced::Painted),
++        other => {
++            log::warn!("html-in-canvas: ignoring {OVERRIDE_GLOBAL}={other:?}");
++            None
++        }
++    }
++}
++
++/// What the platform decided and what it saw, for oracles.
++///
++/// Sections 49, 50 and 51 all need to assert against the path actually taken:
++/// a fallback oracle that cannot prove the fallback ran is asserting nothing.
++/// This is the same shape as [`crate::A11yMirrorSummary`] and is read the same
++/// way, through a host the window publishes into.
++#[derive(Clone, Debug, Default, PartialEq)]
++pub struct NativeElementSummary {
++    /// Whether this browser has every entry point the layer needs.
++    pub supported: bool,
++    pub requests_paint: bool,
++    pub draws_elements: bool,
++    pub places_elements: bool,
++    pub lays_out_subtree: bool,
++    /// The path a test demanded, if one did.
++    pub forced: Option<&'static str>,
++    /// The path in force.
++    pub realization: &'static str,
++    /// The editable leaf's last published bounds, in CSS pixels, as
++    /// `[x, y, width, height]`. Section 51 compares these against GPUI's own
++    /// bounds and against where the browser reports the element.
++    pub editable_bounds: Option<[f32; 4]>,
++}
++
++thread_local! {
++    /// The live window's report. There is one window on the web and one main
++    /// thread, which is what lets an oracle read this without owning it.
++    static SUMMARY_SOURCE: RefCell<Option<Rc<dyn Fn() -> NativeElementSummary>>> =
++        const { RefCell::new(None) };
++}
++
++pub(crate) fn publish_summary_source(source: Rc<dyn Fn() -> NativeElementSummary>) {
++    SUMMARY_SOURCE.with(|cell| *cell.borrow_mut() = Some(source));
++}
++
++/// The current native-element report, for oracles.
++pub fn native_element_summary() -> Option<NativeElementSummary> {
++    SUMMARY_SOURCE.with(|cell| cell.borrow().as_ref().map(|source| source()))
++}
+diff --git a/crates/gpui_web/src/window.rs b/crates/gpui_web/src/window.rs
+index bb2a323736..d747404d3a 100644
+--- a/crates/gpui_web/src/window.rs
++++ b/crates/gpui_web/src/window.rs
+@@ -4,6 +4,7 @@ use crate::events::{
+     ClickState, EventListenerHandle, TouchIds, WebEventListeners, is_mac_platform,
+ };
+ use crate::ime_mirror::ImeMirror;
++use crate::native_element::{ElementLayer, NativeElementSummary, NativeElements};
+ use crate::platform::WebWindowLifecycle;
+ use std::sync::Arc;
+ use std::{cell::Cell, cell::RefCell, rc::Rc};
+@@ -56,6 +57,14 @@ pub(crate) struct WebWindowInner {
+     pub(crate) browser_window: web_sys::Window,
+     pub(crate) canvas: web_sys::HtmlCanvasElement,
+     pub(crate) ime_mirror: ImeMirror,
++    /// Whether this browser realizes an editable leaf natively, decided once
++    /// and never revisited. Capability cannot appear part-way through a
++    /// session, and a control that changed implementation under a person's
++    /// caret would lose the composition they were in the middle of.
++    pub(crate) native_elements: NativeElements,
++    /// The transparent canvas that draws browser-native leaves, on a browser
++    /// that has them. Held so the window can take it down with the rest.
++    pub(crate) element_layer: Option<Rc<ElementLayer>>,
+     pub(crate) has_device_pixel_support: bool,
+     pub(crate) is_mac: bool,
+     pub(crate) state: RefCell<WebWindowMutableState>,
+@@ -173,7 +182,26 @@ impl WebWindow {
+         };
+         let renderer = WgpuRenderer::new_from_surface(context, surface, renderer_config)?;
+ 
+-        let ime_mirror = ImeMirror::new(&document, &body)?;
++        // Decided before the element exists, because the decision is what
++        // says where the element is parented.
++        let native_elements = NativeElements::decide();
++        log::info!(
++            "html-in-canvas: editable leaves are {}",
++            match native_elements.realization() {
++                crate::native_element::Realization::BrowserNative => "browser-native",
++                crate::native_element::Realization::GpuiPainted => "gpui-painted",
++            }
++        );
++        // The layer is created before the element it draws, because the
++        // element is parented into it. On every browser shipping today this
++        // is `None` and costs one prototype lookup.
++        let element_layer = native_elements.create_layer(&document, &body);
++        let ime_mirror = ImeMirror::new(
++            &document,
++            &body,
++            element_layer.clone(),
++            native_elements.realization(),
++        )?;
+ 
+         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
+ 
+@@ -203,6 +231,8 @@ impl WebWindow {
+             browser_window,
+             canvas,
+             ime_mirror,
++            native_elements,
++            element_layer,
+             has_device_pixel_support,
+             is_mac,
+             state: RefCell::new(mutable_state),
+@@ -224,6 +254,20 @@ impl WebWindow {
+             raf_function: RefCell::new(None),
+         });
+ 
++        // Published before the first frame: sections 49, 50 and 51 all begin
++        // by asserting which path is in force, and an oracle that has to wait
++        // for a render to learn that is an oracle that cannot check a browser
++        // where the render is the thing that went wrong. Weak, so the report
++        // never keeps the window alive on its own.
++        let weak = Rc::downgrade(&inner);
++        crate::native_element::publish_summary_source(Rc::new(move || {
++            weak.upgrade().map_or_else(NativeElementSummary::default, |inner| {
++                inner
++                    .native_elements
++                    .summary(inner.ime_mirror.published_bounds())
++            })
++        }));
++
+         let raf_closure = inner.create_raf_closure();
+         inner.wake_frame_loop();
+ 
+@@ -570,6 +614,9 @@ impl Drop for WebWindow {
+         let canvas: &web_sys::Element = self.inner.canvas.as_ref();
+         canvas.remove();
+         self.inner.ime_mirror.remove();
++        if let Some(layer) = self.inner.element_layer.as_deref() {
++            layer.remove();
++        }
+         self.active_window.borrow_mut().take();
+         self.lifecycle.set(WebWindowLifecycle::Closed);
+     }
+@@ -697,6 +744,17 @@ impl PlatformWindow for WebWindow {
+         self.inner.state.borrow_mut().input_handler.take()
+     }
+ 
++    /// The web is the one platform that can answer anything but `None`, and
++    /// it only does so on a browser that ships HTML-in-Canvas. The decision
++    /// was taken once at window creation; this reports it.
++    fn native_element(&self) -> gpui::PlatformNativeElement {
++        if self.inner.ime_mirror.realization().is_browser_native() {
++            gpui::PlatformNativeElement::EditableLeaf
++        } else {
++            gpui::PlatformNativeElement::None
++        }
++    }
++
+     fn set_text_input_configuration(&mut self, configuration: TextInputConfiguration) {
+         self.inner.ime_mirror.apply_configuration(&configuration);
+     }
+@@ -905,6 +963,7 @@ impl PlatformWindow for WebWindow {
+         let adapter = match WebA11yAdapter::new(
+             document,
+             self.inner.ime_mirror.accessibility_element(),
++            self.inner.ime_mirror.realization().is_browser_native(),
+             action,
+         ) {
+             Ok(adapter) => adapter,

@@ -62,3 +62,15 @@ create/place/destroy protocol, because placement already flows through the
 existing caret bounds and a second geometry channel would be a second authority
 for one rectangle. Every platform answers `None` by default, so the seam is
 inert until a platform overrides it.
+
+The native editable leaf patch draws browser-realized elements on a second
+transparent canvas stacked over the wgpu canvas, because wgpu holds that
+canvas's context and the proposal's draw calls need one of their own. Support
+requires all four entry points -- `requestPaint`, `drawElementImage`,
+`updateElementGeometry` and a reflecting `layoutsubtree` -- because an element
+that is laid out and never drawn is an invisible control. The accessibility
+mirror suppresses a natively realized node so a screen reader meets the control
+once. `window.__gpui_html_in_canvas` forces either path for tests; forcing the
+native path on a browser that cannot draw the element is refused, not honored.
+On every browser shipping today the feature is absent, the layer is never
+built, and the cost is four prototype lookups at window creation.
