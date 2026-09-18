@@ -15,6 +15,7 @@ mod ime_mirror;
 mod input_edit;
 mod keyboard;
 mod logging;
+mod native_element;
 mod platform;
 mod window;
 
@@ -26,5 +27,6 @@ pub use gpui_wgpu::WebBackendPreference;
 pub use http_client::{FetchCredentials, FetchHttpClient};
 pub use keyboard::WebKeyboardLayout;
 pub use logging::init_logging;
+pub use native_element::{NativeElementSummary, native_element_summary};
 pub use platform::{WebPlatform, WebWindowError};
 pub use window::{IME_INPUT_ELEMENT_ID, WebWindow};

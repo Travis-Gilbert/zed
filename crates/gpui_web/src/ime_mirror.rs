@@ -20,6 +20,7 @@ use std::rc::Rc;
 use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration};
 use wasm_bindgen::JsCast;
 
+use crate::native_element::{ElementLayer, Realization};
 use crate::window::{IME_INPUT_ELEMENT_ID, WebWindowInner};
 
 /// UTF-16 code units of document text mirrored on each side of the
@@ -55,6 +56,23 @@ const MIN_EDGE_CHARS: usize = 64;
 /// read-only control, and [`ImeMirror::schedule_sync`].
 pub(crate) struct ImeMirror {
     element: web_sys::HtmlTextAreaElement,
+    /// The layer that draws this element, on the browser-native path only.
+    /// Holding it here is what lets a move publish a repaint: the browser has
+    /// no reason to redraw a canvas because a descendant's style changed.
+    layer: Option<Rc<ElementLayer>>,
+    /// Which implementation this leaf got, decided once at window creation.
+    ///
+    /// The two paths differ in exactly two places -- where the element is
+    /// parented and what size it is given -- and in nothing else. Every
+    /// value, selection, IME and configuration path below is shared, which is
+    /// what makes section 19's "the draft format is identical" true by
+    /// construction rather than by a second implementation that agrees.
+    realization: Realization,
+    /// The editable leaf's last published bounds in CSS pixels, for section
+    /// 51's geometry oracle. Held here rather than recomputed from the
+    /// element's style, because what the oracle must check is that the
+    /// browser agrees with the bounds GPUI *sent*.
+    published_bounds: Cell<Option<[f32; 4]>>,
     /// The mirror text most recently synced to (or observed in) the hidden
     /// element. `input` events diff the element's new value against this to
     /// recover what edit the IME performed.
@@ -96,6 +114,8 @@ impl ImeMirror {
     pub(crate) fn new(
         document: &web_sys::Document,
         body: &web_sys::HtmlElement,
+        layer: Option<Rc<ElementLayer>>,
+        realization: Realization,
     ) -> anyhow::Result<Self> {
         // A textarea rather than an input: single-line inputs silently strip
         // newlines from assigned values, which would make the mirror text
@@ -107,18 +127,36 @@ impl ImeMirror {
             .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
         element.set_id(IME_INPUT_ELEMENT_ID);
         let style = element.style();
+        // Both paths place the element in viewport coordinates, because the
+        // canvas fills the viewport: one `update_position` then serves both,
+        // and the caret bounds GPUI sends need no second transform.
         style.set_property("position", "fixed").ok();
         style.set_property("top", "0").ok();
         style.set_property("left", "0").ok();
         style.set_property("width", "1px").ok();
         style.set_property("height", "1px").ok();
-        style.set_property("opacity", "0").ok();
         // Android Chrome zooms the visual viewport onto a focused text input
         // whose font is smaller than 16px; with page zoom disabled the user
         // can never zoom back out, so keep the hidden IME input at 16px.
         style.set_property("font-size", "16px").ok();
-        body.append_child(&element)
-            .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
+        if let Some(layer) = layer.as_deref() {
+            // Into the element layer, not into the canvas wgpu owns. A
+            // canvas's element children are its fallback content, which the
+            // HTML specification already says is laid out but never painted,
+            // and which the HTML-in-Canvas proposal makes drawable -- but only
+            // the canvas that draws them can draw them, and wgpu holds the
+            // other canvas's context for its own output. So the element's
+            // parent is the transparent layer stacked above the scene, and the
+            // browser composites the two.
+            layer.adopt(element.as_ref());
+        } else {
+            // Painted: the element exists only to hold the IME's attention,
+            // so it is one transparent pixel that nothing can see and nothing
+            // can reach.
+            style.set_property("opacity", "0").ok();
+            body.append_child(&element)
+                .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
+        }
         element.focus().ok();
         // The element must stay focused to receive hardware-key and IME
         // events, but on touch-first devices a focused *editable* element
@@ -131,6 +169,9 @@ impl ImeMirror {
 
         let this = Self {
             element,
+            layer,
+            realization,
+            published_bounds: Cell::new(None),
             text: RefCell::new(String::new()),
             selection: Cell::new((0, 0)),
             window_hint: Cell::new(0),
@@ -192,29 +233,74 @@ impl ImeMirror {
     }
 
     /// Browser caret bounds use CSS pixels, matching GPUI's logical coordinates.
+    ///
+    /// Section 16 makes GPUI the layout authority on both paths, so both take
+    /// the bounds GPUI prepainted and neither lets the browser decide where
+    /// the control sits. They differ only in width, and for a reason: a
+    /// painted mirror is one pixel wide because a wider invisible textarea
+    /// would swallow pointer events over the control GPUI drew, while a
+    /// browser-native element must occupy the control's real box or the
+    /// browser lays out its text, hit-tests its caret and reports its
+    /// accessibility geometry against the wrong rectangle.
     pub(crate) fn update_position(&self, bounds: gpui::Bounds<gpui::Pixels>) {
+        let x = f32::from(bounds.origin.x);
+        let y = f32::from(bounds.origin.y);
+        let width = f32::from(bounds.size.width).max(1.0);
+        let height = f32::from(bounds.size.height).max(1.0);
         let style = self.element.style();
-        for (name, value) in [
-            ("left", format!("{}px", f32::from(bounds.origin.x))),
-            ("top", format!("{}px", f32::from(bounds.origin.y))),
-            (
-                "height",
-                format!("{}px", f32::from(bounds.size.height).max(1.0)),
-            ),
-        ] {
+        let mut properties = vec![
+            ("left", format!("{x}px")),
+            ("top", format!("{y}px")),
+            ("height", format!("{height}px")),
+        ];
+        if self.realization.is_browser_native() {
+            properties.push(("width", format!("{width}px")));
+        }
+        for (name, value) in properties {
             if let Err(error) = style.set_property(name, &value) {
                 log::warn!("Failed to position IME mirror {name}: {error:?}");
             }
+        }
+        self.published_bounds.set(Some([x, y, width, height]));
+        // GPUI prepainted a caret box, so there is a live editable leaf and
+        // it is here. That is both the visibility signal and the repaint
+        // signal: the element moved, so its pixels are in the wrong place
+        // until the layer draws again, and nothing else would ask -- a canvas
+        // is not invalidated by a descendant's layout.
+        if let Some(layer) = self.layer.as_deref() {
+            layer.set_visible(true);
+            layer.request_paint();
         }
     }
 
     pub(crate) fn reset_position(&self) {
         let style = self.element.style();
-        for (name, value) in [("left", "0"), ("top", "0"), ("height", "1px")] {
+        let mut properties = vec![("left", "0"), ("top", "0"), ("height", "1px")];
+        if self.realization.is_browser_native() {
+            properties.push(("width", "1px"));
+        }
+        for (name, value) in properties {
             if let Err(error) = style.set_property(name, value) {
                 log::warn!("Failed to reset IME mirror {name}: {error:?}");
             }
         }
+        self.published_bounds.set(None);
+        // Focus left the leaf, so GPUI says there is nothing to draw. Section
+        // 11 keeps that judgement on GPUI's side, and it has to: the layer
+        // composites above the scene, so an element the renderer had covered
+        // would otherwise still show through whatever GPUI drew over it.
+        if let Some(layer) = self.layer.as_deref() {
+            layer.set_visible(false);
+        }
+    }
+
+    /// The bounds last sent to the element, for section 51's oracle.
+    pub(crate) fn published_bounds(&self) -> Option<[f32; 4]> {
+        self.published_bounds.get()
+    }
+
+    pub(crate) const fn realization(&self) -> Realization {
+        self.realization
     }
 
     pub(crate) fn event_target(&self) -> &web_sys::EventTarget {

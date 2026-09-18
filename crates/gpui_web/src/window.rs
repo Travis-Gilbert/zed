@@ -4,6 +4,7 @@ use crate::events::{
     ClickState, EventListenerHandle, TouchIds, WebEventListeners, is_mac_platform,
 };
 use crate::ime_mirror::ImeMirror;
+use crate::native_element::{ElementLayer, NativeElementSummary, NativeElements};
 use crate::platform::WebWindowLifecycle;
 use std::sync::Arc;
 use std::{cell::Cell, cell::RefCell, rc::Rc};
@@ -56,6 +57,14 @@ pub(crate) struct WebWindowInner {
     pub(crate) browser_window: web_sys::Window,
     pub(crate) canvas: web_sys::HtmlCanvasElement,
     pub(crate) ime_mirror: ImeMirror,
+    /// Whether this browser realizes an editable leaf natively, decided once
+    /// and never revisited. Capability cannot appear part-way through a
+    /// session, and a control that changed implementation under a person's
+    /// caret would lose the composition they were in the middle of.
+    pub(crate) native_elements: NativeElements,
+    /// The transparent canvas that draws browser-native leaves, on a browser
+    /// that has them. Held so the window can take it down with the rest.
+    pub(crate) element_layer: Option<Rc<ElementLayer>>,
     pub(crate) has_device_pixel_support: bool,
     pub(crate) is_mac: bool,
     pub(crate) state: RefCell<WebWindowMutableState>,
@@ -173,7 +182,26 @@ impl WebWindow {
         };
         let renderer = WgpuRenderer::new_from_surface(context, surface, renderer_config)?;
 
-        let ime_mirror = ImeMirror::new(&document, &body)?;
+        // Decided before the element exists, because the decision is what
+        // says where the element is parented.
+        let native_elements = NativeElements::decide();
+        log::info!(
+            "html-in-canvas: editable leaves are {}",
+            match native_elements.realization() {
+                crate::native_element::Realization::BrowserNative => "browser-native",
+                crate::native_element::Realization::GpuiPainted => "gpui-painted",
+            }
+        );
+        // The layer is created before the element it draws, because the
+        // element is parented into it. On every browser shipping today this
+        // is `None` and costs one prototype lookup.
+        let element_layer = native_elements.create_layer(&document, &body);
+        let ime_mirror = ImeMirror::new(
+            &document,
+            &body,
+            element_layer.clone(),
+            native_elements.realization(),
+        )?;
 
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
 
@@ -203,6 +231,8 @@ impl WebWindow {
             browser_window,
             canvas,
             ime_mirror,
+            native_elements,
+            element_layer,
             has_device_pixel_support,
             is_mac,
             state: RefCell::new(mutable_state),
@@ -223,6 +253,20 @@ impl WebWindow {
             raf_id: Cell::new(None),
             raf_function: RefCell::new(None),
         });
+
+        // Published before the first frame: sections 49, 50 and 51 all begin
+        // by asserting which path is in force, and an oracle that has to wait
+        // for a render to learn that is an oracle that cannot check a browser
+        // where the render is the thing that went wrong. Weak, so the report
+        // never keeps the window alive on its own.
+        let weak = Rc::downgrade(&inner);
+        crate::native_element::publish_summary_source(Rc::new(move || {
+            weak.upgrade().map_or_else(NativeElementSummary::default, |inner| {
+                inner
+                    .native_elements
+                    .summary(inner.ime_mirror.published_bounds())
+            })
+        }));
 
         let raf_closure = inner.create_raf_closure();
         inner.wake_frame_loop();
@@ -570,6 +614,9 @@ impl Drop for WebWindow {
         let canvas: &web_sys::Element = self.inner.canvas.as_ref();
         canvas.remove();
         self.inner.ime_mirror.remove();
+        if let Some(layer) = self.inner.element_layer.as_deref() {
+            layer.remove();
+        }
         self.active_window.borrow_mut().take();
         self.lifecycle.set(WebWindowLifecycle::Closed);
     }
@@ -695,6 +742,17 @@ impl PlatformWindow for WebWindow {
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.inner.state.borrow_mut().input_handler.take()
+    }
+
+    /// The web is the one platform that can answer anything but `None`, and
+    /// it only does so on a browser that ships HTML-in-Canvas. The decision
+    /// was taken once at window creation; this reports it.
+    fn native_element(&self) -> gpui::PlatformNativeElement {
+        if self.inner.ime_mirror.realization().is_browser_native() {
+            gpui::PlatformNativeElement::EditableLeaf
+        } else {
+            gpui::PlatformNativeElement::None
+        }
     }
 
     fn set_text_input_configuration(&mut self, configuration: TextInputConfiguration) {
@@ -905,6 +963,7 @@ impl PlatformWindow for WebWindow {
         let adapter = match WebA11yAdapter::new(
             document,
             self.inner.ime_mirror.accessibility_element(),
+            self.inner.ime_mirror.realization().is_browser_native(),
             action,
         ) {
             Ok(adapter) => adapter,

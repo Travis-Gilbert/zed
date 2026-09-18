@@ -199,6 +199,18 @@ struct Mirrored {
     children: Vec<NodeId>,
 }
 
+/// Whether a real browser input element can stand for this role.
+///
+/// Only the text roles, and only because the element that owns focus on this
+/// platform is a `<textarea>`: an element can realize the control it actually
+/// is. Section 11 lists other capabilities a browser could own, and each of
+/// them needs its own element before it can appear here. Section 12 is
+/// explicit that the editable leaf comes first and nothing generalizes until
+/// that proof holds.
+const fn realizable_natively(role: Role) -> bool {
+    matches!(role, Role::TextInput | Role::MultilineTextInput)
+}
+
 /// The ARIA roles that take `aria-valuetext`.
 ///
 /// Everywhere else -- a textbox above all -- the value is the element's
@@ -268,6 +280,15 @@ pub(crate) struct WebA11yAdapter {
     nodes: HashMap<NodeId, MirrorNode>,
     focus: Option<NodeId>,
     announced: String,
+    /// Whether this browser realizes an editable leaf as the real input
+    /// element rather than as pixels. Section 15: when it does, that element
+    /// *is* the accessibility realization of the focused text node, and this
+    /// mirror must not project a second control for the same node.
+    native_editable: bool,
+    /// The node the input element currently stands for, if any. Kept so the
+    /// attributes written onto a shared element can be taken back off it when
+    /// focus leaves.
+    natively_realized: Option<NodeId>,
     /// The delegated `click`/`focusin` listeners. Dropping the adapter removes
     /// them, which is why they are owned here rather than forgotten.
     _listeners: Vec<DelegatedListener>,
@@ -294,6 +315,7 @@ impl WebA11yAdapter {
     pub(crate) fn new(
         document: web_sys::Document,
         input_element: web_sys::HtmlElement,
+        native_editable: bool,
         action: Rc<dyn Fn(ActionRequest)>,
     ) -> anyhow::Result<Self> {
         let body = document
@@ -386,6 +408,8 @@ impl WebA11yAdapter {
             nodes: HashMap::default(),
             focus: None,
             announced: String::new(),
+            native_editable,
+            natively_realized: None,
             _listeners: listeners,
         })
     }
@@ -397,7 +421,33 @@ impl WebA11yAdapter {
     pub(crate) fn apply(&mut self, update: &TreeUpdate, scale_factor: f32) {
         let mut announcement: Option<String> = None;
 
+        // Section 15. On a browser that realizes editable leaves natively, the
+        // focused text node is already a control a screen reader can reach:
+        // the input element itself, with its own native role, its own caret
+        // and its own selection. Mirroring it as well would put two textboxes
+        // in the tree for one semantic node, and a reader would encounter the
+        // control twice. So the node is claimed here, before the mirror loop,
+        // and the loop skips it.
+        let claimed = self.native_editable.then(|| {
+            update
+                .nodes
+                .iter()
+                .find(|(node_id, node)| *node_id == update.focus && realizable_natively(node.role()))
+                .map(|(node_id, node)| (*node_id, Mirrored::read(node)))
+        });
+        let claimed = claimed.flatten();
+        self.apply_native_realization(claimed.as_ref());
+
         for (node_id, node) in &update.nodes {
+            if Some(*node_id) == self.natively_realized {
+                // It may have been an ordinary mirrored node last frame.
+                if let Some(stale) = self.nodes.remove(node_id)
+                    && let Some(parent) = stale.element.parent_node()
+                {
+                    let _ = parent.remove_child(&stale.element);
+                }
+                continue;
+            }
             let read = Mirrored::read(node);
 
             match self.nodes.get_mut(node_id) {
@@ -444,7 +494,9 @@ impl WebA11yAdapter {
         }
 
         // Nodes absent from a full tree are gone, not merely unchanged: GPUI
-        // rebuilds the whole tree every frame.
+        // rebuilds the whole tree every frame. The natively realized node is
+        // present in the tree and deliberately absent from the mirror, so it
+        // is never in `self.nodes` to be retained or removed here.
         let present: std::collections::HashSet<NodeId> =
             update.nodes.iter().map(|(id, _)| *id).collect();
         self.nodes.retain(|node_id, mirrored| {
@@ -467,7 +519,12 @@ impl WebA11yAdapter {
 
         if self.focus != Some(update.focus) {
             self.focus = Some(update.focus);
-            if self.nodes.contains_key(&update.focus) {
+            if self.natively_realized == Some(update.focus) {
+                // There is no descendant to be active: the focused element is
+                // the control. Pointing at one would be the duplicate again,
+                // in attribute form.
+                let _ = self.input_element.remove_attribute("aria-activedescendant");
+            } else if self.nodes.contains_key(&update.focus) {
                 let _ = self
                     .input_element
                     .set_attribute("aria-activedescendant", &element_id(update.focus));
@@ -481,6 +538,44 @@ impl WebA11yAdapter {
         {
             self.live_region.set_text_content(Some(&announcement));
             self.announced = announcement;
+        }
+    }
+
+    /// Move the input element onto, or off, the node it stands for.
+    ///
+    /// The element is shared -- it is the IME conduit on every browser and the
+    /// realized control on some -- so everything written here is written back
+    /// off when the claim ends. Geometry is deliberately not among it: section
+    /// 16 makes GPUI the layout authority and the IME mirror the one writer of
+    /// this element's box, so a second writer here would be two authorities
+    /// for one rectangle.
+    fn apply_native_realization(&mut self, claimed: Option<&(NodeId, Mirrored)>) {
+        let element: &web_sys::Element = self.input_element.as_ref();
+        match claimed {
+            Some((node_id, read)) => {
+                self.natively_realized = Some(*node_id);
+                let _ = element.set_attribute(NODE_ATTRIBUTE, &node_id.0.to_string());
+                set_or_clear(element, "aria-label", read.label.as_deref());
+                set_or_clear(element, "aria-description", read.description.as_deref());
+                set_flag(element, "aria-disabled", read.disabled);
+                set_flag(element, "aria-required", read.required);
+                set_flag(element, "aria-readonly", read.read_only);
+            }
+            None => {
+                if self.natively_realized.take().is_none() {
+                    return;
+                }
+                for attribute in [
+                    NODE_ATTRIBUTE,
+                    "aria-label",
+                    "aria-description",
+                    "aria-disabled",
+                    "aria-required",
+                    "aria-readonly",
+                ] {
+                    let _ = element.remove_attribute(attribute);
+                }
+            }
         }
     }
 
@@ -652,6 +747,14 @@ pub struct A11yMirrorSummary {
     pub node_count: usize,
     /// The document id currently named by `aria-activedescendant`, if any.
     pub focused_element_id: Option<String>,
+    /// The AccessKit node the real input element stands for, when this browser
+    /// realizes an editable leaf natively. Section 50's oracle reads this and
+    /// then asserts the mirror holds no element for the same node.
+    pub natively_realized_node: Option<u64>,
+    /// Document ids of mirror elements whose ARIA role is `textbox`. Section
+    /// 50: with a node realized natively, this must not also contain a mirror
+    /// of that node, or a reader meets the control twice.
+    pub textbox_element_ids: Vec<String>,
 }
 
 impl WebA11yAdapter {
@@ -659,6 +762,13 @@ impl WebA11yAdapter {
         A11yMirrorSummary {
             node_count: self.nodes.len(),
             focused_element_id: self.input_element.get_attribute("aria-activedescendant"),
+            natively_realized_node: self.natively_realized.map(|node_id| node_id.0),
+            textbox_element_ids: self
+                .nodes
+                .iter()
+                .filter(|(_, mirrored)| mirrored.applied.role == Some("textbox"))
+                .map(|(node_id, _)| element_id(*node_id))
+                .collect(),
         }
     }
 }
