@@ -262,12 +262,27 @@ impl ImeMirror {
     ///
     /// Section 16 makes GPUI the layout authority on both paths, so both take
     /// the bounds GPUI prepainted and neither lets the browser decide where
-    /// the control sits. They differ only in width, and for a reason: a
-    /// painted mirror is one pixel wide because a wider invisible textarea
-    /// would swallow pointer events over the control GPUI drew, while a
+    /// the control sits. They differ in width, and for a reason: a painted
+    /// mirror is one pixel wide because a wider invisible textarea would
+    /// swallow pointer events over the control GPUI drew, while a
     /// browser-native element must occupy the control's real box or the
     /// browser lays out its text, hit-tests its caret and reports its
     /// accessibility geometry against the wrong rectangle.
+    ///
+    /// They also differ in *how* they move, and that is the whole difficulty
+    /// of the native path. `layoutsubtree` gives the canvas layout authority
+    /// over its descendants, and it exercises it: measured against Chrome
+    /// 153.0.8010.12, a child of such a canvas ignores `left` and `top` under
+    /// `fixed`, `absolute` and `relative` alike, and ignores `margin` too. It
+    /// honours `width` and `height`, and every child lands on the canvas's
+    /// origin stacked on the last.
+    ///
+    /// A transform is applied after layout, so it is the one channel the
+    /// canvas does not consume. `transform: translate(x, y)` moves the
+    /// element, `getBoundingClientRect` reports the moved box, and
+    /// `elementFromPoint` and a real click both land on it there. So the
+    /// native path translates and the painted path offsets, and section 16
+    /// holds on both.
     pub(crate) fn update_position(&self, bounds: gpui::Bounds<gpui::Pixels>) {
         let x = f32::from(bounds.origin.x);
         let y = f32::from(bounds.origin.y);
@@ -281,6 +296,11 @@ impl ImeMirror {
         ];
         if self.realization.is_browser_native() {
             properties.push(("width", format!("{width}px")));
+            // `left` and `top` were still written above, because they cost
+            // nothing and a browser that later lays this subtree out the
+            // ordinary way would then place the element correctly without a
+            // second code path. The transform is what moves it today.
+            properties.push(("transform", format!("translate({x}px, {y}px)")));
         }
         for (name, value) in properties {
             if let Err(error) = style.set_property(name, &value) {
@@ -304,6 +324,7 @@ impl ImeMirror {
         let mut properties = vec![("left", "0"), ("top", "0"), ("height", "1px")];
         if self.realization.is_browser_native() {
             properties.push(("width", "1px"));
+            properties.push(("transform", "none"));
         }
         for (name, value) in properties {
             if let Err(error) = style.set_property(name, value) {
