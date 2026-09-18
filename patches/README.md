@@ -55,3 +55,10 @@ five production-helper tests cover selection replacement, repeated text,
 autocorrection, emoji, and exhaustive bounded edits after a remote anchor shift.
 The browser Wikia edit oracle exposed the original failure; its real DOM and
 canonical document retry remains a separate consumer acceptance gate.
+
+The platform native element seam lets an editable leaf ask whether the platform
+is already drawing the control. It is one question rather than a
+create/place/destroy protocol, because placement already flows through the
+existing caret bounds and a second geometry channel would be a second authority
+for one rectangle. Every platform answers `None` by default, so the seam is
+inert until a platform overrides it.

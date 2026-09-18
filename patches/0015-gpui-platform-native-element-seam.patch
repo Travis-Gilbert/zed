@@ -1,0 +1,121 @@
+From 81083da344d5d4cd24abde97ccfa3e7e467dde6c Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Fri, 18 Sep 2026 14:51:37 -0400
+Subject: [PATCH 1/2] feat(gpui): tell an editable leaf when the platform
+ realizes it
+
+An editable leaf that paints its own caret over a caret the platform is
+already drawing shows two. It cannot work out which case it is in, because
+nothing else about the leaf differs: identity, layout, focus, state and
+lifetime stay GPUI's on either path, which is the property that lets one
+element implementation serve both.
+
+`PlatformNativeElement` is that one question and nothing more. Placement
+already flows through the platform's existing caret bounds, so a
+create/place/destroy protocol would add a second authority for one
+rectangle without answering anything the leaf cannot already see.
+
+Every platform answers `None` by default, so this compiles everywhere and
+changes nothing until a platform overrides it.
+---
+ crates/gpui/src/platform.rs | 47 +++++++++++++++++++++++++++++++++++++
+ crates/gpui/src/window.rs   | 14 ++++++++++-
+ 2 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 527bddcbf5..0e973f8981 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -814,6 +814,45 @@ pub enum TextInputStateChange {
+ }
+ 
+ #[expect(missing_docs)]
++/// What a platform can hand a GPUI leaf in place of painted pixels.
++///
++/// A painted leaf is GPUI's entirely: it owns the pixels, and every behaviour
++/// a person expects of the control is GPUI's to reproduce. That reproduction
++/// is cheap for a button and expensive for an editable control, because caret
++/// placement, selection, input-method composition, autocorrect, spellcheck,
++/// the virtual keyboard and the accessibility tree are not things a renderer
++/// can approximate from the outside -- they are properties a platform grants
++/// to its own controls.
++///
++/// A platform that can grant them says so here, and the leaf then stops
++/// drawing what the platform is already drawing. What does *not* move is
++/// element identity, layout, logical focus, application state, visibility,
++/// clipping policy and component lifecycle: those stay GPUI's on both paths,
++/// which is what keeps the two paths substitutable.
++///
++/// This is deliberately one question rather than a create/place/destroy
++/// protocol. Placement already flows through the platform's existing caret
++/// bounds, and a second geometry channel would be a second authority for one
++/// rectangle. The only thing a leaf cannot work out for itself is whether the
++/// platform is drawing the control, so that is the only thing it is told.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum PlatformNativeElement {
++    /// GPUI paints the leaf and reproduces its behaviour.
++    #[default]
++    None,
++    /// The platform realizes an editable leaf as a real control of its own,
++    /// positioned at the bounds GPUI laid out.
++    EditableLeaf,
++}
++
++impl PlatformNativeElement {
++    /// Whether an editable leaf should leave caret, selection and text
++    /// assistance to the platform.
++    pub const fn realizes_editable_leaf(self) -> bool {
++        matches!(self, Self::EditableLeaf)
++    }
++}
++
+ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     fn bounds(&self) -> Bounds<Pixels>;
+     fn is_maximized(&self) -> bool;
+@@ -877,6 +916,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
+         Err(ExternalGpuSurfaceError::Unsupported)
+     }
++    /// What this window can hand an editable leaf in place of painted pixels.
++    ///
++    /// Defaults to [`PlatformNativeElement::None`], which is what every
++    /// platform other than the web answers and what the web answers on every
++    /// browser shipping today.
++    fn native_element(&self) -> PlatformNativeElement {
++        PlatformNativeElement::None
++    }
+     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+     fn is_subpixel_rendering_supported(&self) -> bool;
+ 
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 0f0ba71108..2a2840631c 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -14,7 +14,8 @@ use crate::{
+     KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex,
+     Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
+     MouseUpEvent, PaintSurface, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
++    PlatformInputHandler, PlatformNativeElement, PlatformWindow, Point, PolychromeSprite,
++    Priority, PromptButton,
+     PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+     Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+     ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+@@ -4846,6 +4847,17 @@ impl Window {
+             .create_external_gpu_surface(width, height, format)
+     }
+ 
++    /// What this platform hands an editable leaf in place of painted pixels.
++    ///
++    /// An editable element asks before it paints a caret or a selection, so
++    /// that it does not draw a second one over the platform's own. Everything
++    /// else about the element -- its identity, its layout, its focus, its
++    /// state, its lifetime -- is the same on both answers, which is what lets
++    /// one element implementation serve both.
++    pub fn native_element(&self) -> PlatformNativeElement {
++        self.platform_window.native_element()
++    }
++
+     /// Removes an image from the sprite atlas.
+     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
+         for frame_index in 0..data.frame_count() {
