@@ -746,10 +746,19 @@ impl PlatformWindow for WebWindow {
 
     /// The web is the one platform that can answer anything but `None`, and
     /// it only does so on a browser that ships HTML-in-Canvas. The decision
-    /// was taken once at window creation; this reports it.
-    fn native_element(&self) -> gpui::PlatformNativeElement {
-        if self.inner.ime_mirror.realization().is_browser_native() {
-            gpui::PlatformNativeElement::EditableLeaf
+    /// was taken once at window creation; this reports it per capability.
+    ///
+    /// Per capability rather than per window, because section 11 lists eight
+    /// and this platform has built one. A capability with no implementation
+    /// behind it answers `None` on its own account rather than inheriting the
+    /// editable leaf's answer, which would report a control as realized the
+    /// moment the proposal shipped.
+    fn native_element(
+        &self,
+        capability: gpui::PlatformNativeElement,
+    ) -> gpui::PlatformNativeElement {
+        if self.inner.native_elements.realizes(capability) {
+            capability
         } else {
             gpui::PlatformNativeElement::None
         }

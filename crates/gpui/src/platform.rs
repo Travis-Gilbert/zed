@@ -813,7 +813,6 @@ pub enum TextInputStateChange {
     ContentChanged,
 }
 
-#[expect(missing_docs)]
 /// What a platform can hand a GPUI leaf in place of painted pixels.
 ///
 /// A painted leaf is GPUI's entirely: it owns the pixels, and every behaviour
@@ -835,23 +834,157 @@ pub enum TextInputStateChange {
 /// bounds, and a second geometry channel would be a second authority for one
 /// rectangle. The only thing a leaf cannot work out for itself is whether the
 /// platform is drawing the control, so that is the only thing it is told.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// The variants are SPEC-THEOREMWEB-PWA-HTML-CANVAS-1.1 section 11's list of
+/// capabilities. [`Self::ALL`] holds them in that section's order, and
+/// [`Self::name`] returns that section's spelling, which is not always this
+/// one: the capability the specification calls `MultilineEditableText` is
+/// spelled [`Self::EditableLeaf`] here, because that name was in the tree
+/// before the specification enumerated the rest.
+///
+/// Enumerating all eight is what lets a leaf declare which one it is and lets
+/// a platform answer that declaration per capability. A platform that has not
+/// implemented one answers [`Self::None`] for it, which puts that leaf on the
+/// painted path -- a real path, not a branch the platform skipped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum PlatformNativeElement {
-    /// GPUI paints the leaf and reproduces its behaviour.
+    /// GPUI paints the leaf and reproduces its behaviour. The answer for a
+    /// capability a platform does not realize, and for a leaf that asks for
+    /// nothing.
     #[default]
     None,
-    /// The platform realizes an editable leaf as a real control of its own,
-    /// positioned at the bounds GPUI laid out.
+    /// Multiline editable text. The platform owns caret, selection, IME,
+    /// autocorrect, spellcheck and the virtual keyboard; GPUI keeps the text,
+    /// the layout and the focus. This is section 11's `MultilineEditableText`.
     EditableLeaf,
+    /// Single-line editable text. The same division as
+    /// [`Self::EditableLeaf`], for a leaf the platform must not wrap.
+    EditableText,
+    /// A search field: single-line text plus the platform's own search
+    /// affordances and semantics.
+    SearchField,
+    /// Text whose editing semantics the platform owns beyond plain character
+    /// editing.
+    RichText,
+    /// A push button. The platform owns activation semantics; GPUI owns the
+    /// label, the layout, and what the activation does.
+    NativeButton,
+    /// A checkbox. The platform owns the checked state's semantics and the
+    /// control's accessibility role.
+    NativeCheckbox,
+    /// A select. The platform owns the popup and the option list.
+    NativeSelect,
+    /// A hyperlink. The platform owns link semantics and navigation.
+    NativeLink,
 }
 
 impl PlatformNativeElement {
+    /// Every capability, in the order section 11 lists them.
+    ///
+    /// [`Self::EditableLeaf`] stands in the section's `MultilineEditableText`
+    /// position; [`Self::name`] is what reconciles the two spellings.
+    pub const ALL: [Self; 8] = [
+        Self::EditableText,
+        Self::EditableLeaf,
+        Self::SearchField,
+        Self::NativeButton,
+        Self::NativeCheckbox,
+        Self::NativeSelect,
+        Self::NativeLink,
+        Self::RichText,
+    ];
+
+    /// This capability under the name section 11 gives it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::EditableLeaf => "MultilineEditableText",
+            Self::EditableText => "EditableText",
+            Self::SearchField => "SearchField",
+            Self::RichText => "RichText",
+            Self::NativeButton => "NativeButton",
+            Self::NativeCheckbox => "NativeCheckbox",
+            Self::NativeSelect => "NativeSelect",
+            Self::NativeLink => "NativeLink",
+        }
+    }
+
+    /// The real element a platform realizes this capability with, or `None`
+    /// where no platform element is the realization.
+    ///
+    /// A name rather than a constructed element: the platform's own module is
+    /// the only place that may build one, and this exists so a report can say
+    /// what a capability would have delegated to without reaching for it.
+    pub const fn delegation(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::EditableLeaf => Some("textarea"),
+            Self::EditableText => Some("input[type=text]"),
+            Self::SearchField => Some("input[type=search]"),
+            Self::RichText => Some("contenteditable host"),
+            Self::NativeButton => Some("button"),
+            Self::NativeCheckbox => Some("input[type=checkbox]"),
+            Self::NativeSelect => Some("select"),
+            Self::NativeLink => Some("a[href]"),
+        }
+    }
+
+    /// Whether this capability is one of the four editable ones.
+    ///
+    /// The editable four share an IME conduit and one set of text-input hints;
+    /// the four controls share none of that. A per-capability gate keys on
+    /// this rather than re-deriving the split at each call site.
+    pub const fn is_editable(self) -> bool {
+        matches!(
+            self,
+            Self::EditableLeaf | Self::EditableText | Self::SearchField | Self::RichText
+        )
+    }
+
     /// Whether an editable leaf should leave caret, selection and text
     /// assistance to the platform.
     pub const fn realizes_editable_leaf(self) -> bool {
         matches!(self, Self::EditableLeaf)
     }
 }
+
+/// Section 11's list, checked where it is declared.
+///
+/// A capability added to the enum and forgotten in [`PlatformNativeElement::ALL`]
+/// is one the section asked for and no report would name, so the list is held
+/// to the section at compile time rather than by a test someone has to
+/// remember to run. The section enumerating the eight is what makes them
+/// requirements; an enumeration with a hole in it is the thing this asserts
+/// against, and it should not build.
+const _: () = {
+    let all = PlatformNativeElement::ALL;
+    assert!(all.len() == 8, "section 11 lists eight capabilities");
+    // In the order the section lists them, with `EditableLeaf` standing where
+    // the section says `MultilineEditableText`.
+    assert!(matches!(all[0], PlatformNativeElement::EditableText));
+    assert!(matches!(all[1], PlatformNativeElement::EditableLeaf));
+    assert!(matches!(all[2], PlatformNativeElement::SearchField));
+    assert!(matches!(all[3], PlatformNativeElement::NativeButton));
+    assert!(matches!(all[4], PlatformNativeElement::NativeCheckbox));
+    assert!(matches!(all[5], PlatformNativeElement::NativeSelect));
+    assert!(matches!(all[6], PlatformNativeElement::NativeLink));
+    assert!(matches!(all[7], PlatformNativeElement::RichText));
+    // Every listed capability names the element it delegates to and names
+    // itself; only `None`, which is not in the list, does neither.
+    let mut i = 0;
+    while i < all.len() {
+        assert!(all[i].delegation().is_some());
+        assert!(!all[i].name().is_empty());
+        i += 1;
+    }
+    // The four editable capabilities and the four controls split the way the
+    // section divides responsibilities: the editable four share caret,
+    // selection and IME, and the controls share none of that.
+    assert!(all[0].is_editable() && all[1].is_editable());
+    assert!(all[2].is_editable() && all[7].is_editable());
+    assert!(!all[3].is_editable() && !all[4].is_editable());
+    assert!(!all[5].is_editable() && !all[6].is_editable());
+};
 
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -916,12 +1049,18 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
         Err(ExternalGpuSurfaceError::Unsupported)
     }
-    /// What this window can hand an editable leaf in place of painted pixels.
+    /// What this window can hand a leaf declaring `capability` in place of
+    /// painted pixels.
     ///
-    /// Defaults to [`PlatformNativeElement::None`], which is what every
-    /// platform other than the web answers and what the web answers on every
-    /// browser shipping today.
-    fn native_element(&self) -> PlatformNativeElement {
+    /// Asked per capability rather than once per window, because section 11
+    /// lists eight and a platform may realize some and not others. The answer
+    /// is `capability` where the platform realizes it and
+    /// [`PlatformNativeElement::None`] where it does not.
+    ///
+    /// Defaults to `None` for every capability, which is what every platform
+    /// other than the web answers and what the web answers on a browser that
+    /// ships nothing this needs.
+    fn native_element(&self, _capability: PlatformNativeElement) -> PlatformNativeElement {
         PlatformNativeElement::None
     }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;

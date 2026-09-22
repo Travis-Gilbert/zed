@@ -48,6 +48,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use gpui::PlatformNativeElement;
 use wasm_bindgen::prelude::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 
@@ -233,6 +234,38 @@ impl NativeElements {
         self.realization
     }
 
+    /// Whether this window realizes `capability` as a real browser element.
+    ///
+    /// Section 11 lists eight capabilities and this platform has built one.
+    /// The other seven answer `false` from their own arm below rather than
+    /// from a shared default, so that a capability becoming real is a change
+    /// to one arm, and so that the gap is readable in the source rather than
+    /// inferred from an array that happens to be empty.
+    ///
+    /// A capability answers for itself. It does not inherit the editable
+    /// leaf's answer, which would report a control as realized the moment the
+    /// proposal shipped and would put that control's leaf on a native path
+    /// with nothing behind it.
+    pub(crate) const fn realizes(self, capability: PlatformNativeElement) -> bool {
+        match capability {
+            // Built: the composer's editable leaf, which section 12 asked for
+            // first and which section 13's proof is what earned the rest of
+            // this list.
+            PlatformNativeElement::EditableLeaf => self.realization.is_browser_native(),
+            // Enumerated by section 11 and not built. Answering `false` here
+            // keeps each of these on the painted path, which section 19
+            // requires to be a real path rather than an untested branch.
+            PlatformNativeElement::EditableText
+            | PlatformNativeElement::SearchField
+            | PlatformNativeElement::RichText
+            | PlatformNativeElement::NativeButton
+            | PlatformNativeElement::NativeCheckbox
+            | PlatformNativeElement::NativeSelect
+            | PlatformNativeElement::NativeLink => false,
+            PlatformNativeElement::None => false,
+        }
+    }
+
     /// Build the layer this decision calls for, if it calls for one.
     ///
     /// Routed through the decision rather than constructed beside it so that
@@ -259,11 +292,28 @@ impl NativeElements {
             lays_out_subtree: self.support.lays_out_subtree,
             forced: self.forced.map(Forced::as_str),
             realization: self.realization.as_str(),
+            capabilities: PlatformNativeElement::ALL
+                .into_iter()
+                .filter(|capability| self.realizes(*capability))
+                .map(|capability| capability.name())
+                .collect(),
             editable_bounds,
             last_draw_ms: LAST_DRAW_MS.with(Cell::get),
             last_input_latency_ms: LAST_INPUT_LATENCY_MS.with(Cell::get),
         }
     }
+}
+
+/// One element the layer draws, and whether GPUI currently says to show it.
+///
+/// Visibility is per element rather than per layer. With one drawable the two
+/// are the same thing, which is why the layer could hold the flag alone; but
+/// section 11 lists eight capabilities, a window may realize more than one of
+/// them, and a second drawable with a different visibility needs the flag
+/// here.
+struct Drawable {
+    element: web_sys::HtmlElement,
+    visible: bool,
 }
 
 /// The transparent canvas the browser's own elements are drawn onto.
@@ -283,13 +333,7 @@ pub(crate) struct ElementLayer {
     /// because reading a canvas's children means `HTMLCollection`, a web-sys
     /// feature this crate does not enable, to recover a list this side of the
     /// boundary already has.
-    drawables: Rc<RefCell<Vec<web_sys::HtmlElement>>>,
-    /// Whether GPUI currently says the leaf is visible. Section 11 keeps
-    /// visibility and clipping policy on GPUI's side of the line, and it has
-    /// to: a GPUI overlay drawn above the leaf would otherwise still show the
-    /// browser's element through it, because the layer composites above the
-    /// scene rather than inside it.
-    visible: Cell<bool>,
+    drawables: Rc<RefCell<Vec<Drawable>>>,
     _paint: Closure<dyn FnMut(web_sys::Event)>,
 }
 
@@ -334,7 +378,7 @@ impl ElementLayer {
         }
         body.append_child(&canvas).ok()?;
 
-        let drawables: Rc<RefCell<Vec<web_sys::HtmlElement>>> = Rc::default();
+        let drawables: Rc<RefCell<Vec<Drawable>>> = Rc::default();
         let paint_canvas = canvas.clone();
         let paint_drawables = Rc::clone(&drawables);
         let paint = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event: web_sys::Event| {
@@ -347,7 +391,6 @@ impl ElementLayer {
         Some(Self {
             canvas,
             drawables,
-            visible: Cell::new(true),
             _paint: paint,
         })
     }
@@ -370,7 +413,10 @@ impl ElementLayer {
         if let Err(error) = element.style().set_property("pointer-events", "auto") {
             log::warn!("html-in-canvas: could not make the element hittable: {error:?}");
         }
-        self.drawables.borrow_mut().push(element.clone());
+        self.drawables.borrow_mut().push(Drawable {
+            element: element.clone(),
+            visible: true,
+        });
         self.request_paint();
     }
 
@@ -401,23 +447,52 @@ impl ElementLayer {
         call_void(&self.canvas, REQUEST_PAINT, &[]);
     }
 
-    /// Follow GPUI's visibility for the leaf.
+    /// Follow GPUI's visibility for one of the layer's elements.
     ///
-    /// Hiding the whole layer rather than one element is exact while there is
-    /// one drawable and is the reason section 12 says not to generalize to
-    /// many controls before the composer proof holds: a second drawable with a
-    /// different visibility needs this to become per element.
-    pub(crate) fn set_visible(&self, visible: bool) {
-        if self.visible.replace(visible) == visible {
-            return;
+    /// Section 11 keeps visibility and clipping policy on GPUI's side of the
+    /// line, and it has to: the layer composites above the scene rather than
+    /// inside it, so an element GPUI had covered with an overlay would
+    /// otherwise still show through that overlay.
+    ///
+    /// Per element, and by the element's own `display`, not by hiding the
+    /// layer. Hiding the layer was exact only while there was one drawable,
+    /// and a window that realizes two capabilities has two elements with two
+    /// independent answers.
+    pub(crate) fn set_visible(&self, element: &web_sys::HtmlElement, visible: bool) {
+        {
+            let mut drawables = self.drawables.borrow_mut();
+            let Some(drawable) = drawables
+                .iter_mut()
+                .find(|drawable| &drawable.element == element)
+            else {
+                log::warn!("html-in-canvas: asked for the visibility of an element this layer does not draw");
+                return;
+            };
+            if drawable.visible == visible {
+                return;
+            }
+            drawable.visible = visible;
         }
-        let _ = self
-            .canvas
+        // Outside the borrow: this is a DOM call, and the paint listener
+        // borrows the same list.
+        let _ = element
             .style()
             .set_property("display", if visible { "block" } else { "none" });
         if visible {
             self.request_paint();
         }
+    }
+
+    /// Stop drawing an element and forget it.
+    ///
+    /// The element is left where it is: whoever built it owns taking it out of
+    /// the document, and doing it here would be a second owner for its
+    /// lifetime.
+    pub(crate) fn forget(&self, element: &web_sys::HtmlElement) {
+        self.drawables
+            .borrow_mut()
+            .retain(|drawable| &drawable.element != element);
+        self.request_paint();
     }
 
     pub(crate) fn remove(&self) {
@@ -431,7 +506,7 @@ impl ElementLayer {
 /// Reached only from the browser's own `paint` event, which is the only moment
 /// the proposal permits the draw call: outside it the canvas has no valid
 /// drawing target for element content.
-fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlElement]) {
+fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[Drawable]) {
     let Ok(Some(context)) = canvas.get_context("2d") else {
         return;
     };
@@ -456,7 +531,14 @@ fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlEl
         "scale",
         &[JsValue::from_f64(ratio), JsValue::from_f64(ratio)],
     );
-    for element in drawables {
+    // Only the elements GPUI still says to show. A hidden one is skipped
+    // rather than drawn transparent: `display: none` leaves it with a zero
+    // box, so the `get_bounding_client_rect` below would draw it at the
+    // origin.
+    let mut drawn = 0usize;
+    for drawable in drawables.iter().filter(|drawable| drawable.visible) {
+        let element = &drawable.element;
+        drawn += 1;
         // The element's own border box is where GPUI put it, through the
         // inline `left`/`top`/`width`/`height` the IME mirror writes. Asking
         // the browser for that box rather than replaying a stored rectangle
@@ -493,10 +575,12 @@ fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlEl
             ],
         );
     }
-    // Only when something was drawn. A layer with no drawables costs the reset
-    // and the scale, and reporting that as a snapshot cost would put a number
-    // near zero against a row that is meant to say what a snapshot costs.
-    if let (Some(started), false) = (started, drawables.is_empty())
+    // Only when something was drawn. A layer with nothing visible costs the
+    // reset and the scale, and reporting that as a snapshot cost would put a
+    // number near zero against a row that is meant to say what a snapshot
+    // costs.
+    if drawn > 0
+        && let Some(started) = started
         && let Some(now) = performance_now()
     {
         LAST_DRAW_MS.with(|cell| cell.set(Some(now - started)));
@@ -598,6 +682,14 @@ pub struct NativeElementSummary {
     pub forced: Option<&'static str>,
     /// The path in force.
     pub realization: &'static str,
+    /// Which of section 11's eight capabilities this window realizes
+    /// natively, by the specification's names.
+    ///
+    /// One entry per realized capability, so an oracle can assert that a named
+    /// capability is realized and that the others are not, rather than only
+    /// that *something* was. On the painted path this is empty, which is what
+    /// the fallback's assertion reads.
+    pub capabilities: Vec<&'static str>,
     /// The editable leaf's last published bounds, in CSS pixels, as
     /// `[x, y, width, height]`. Section 51 compares these against GPUI's own
     /// bounds and against where the browser reports the element.

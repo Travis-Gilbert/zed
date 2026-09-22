@@ -4847,15 +4847,21 @@ impl Window {
             .create_external_gpu_surface(width, height, format)
     }
 
-    /// What this platform hands an editable leaf in place of painted pixels.
+    /// What this platform hands a leaf declaring `capability` in place of
+    /// painted pixels.
+    ///
+    /// Asked per capability, so a leaf can declare which of section 11's eight
+    /// it is and get that one's answer rather than a window-wide one. The
+    /// answer is `capability` where the platform realizes it and
+    /// [`PlatformNativeElement::None`] where it does not.
     ///
     /// An editable element asks before it paints a caret or a selection, so
     /// that it does not draw a second one over the platform's own. Everything
     /// else about the element -- its identity, its layout, its focus, its
     /// state, its lifetime -- is the same on both answers, which is what lets
     /// one element implementation serve both.
-    pub fn native_element(&self) -> PlatformNativeElement {
-        self.platform_window.native_element()
+    pub fn native_element(&self, capability: PlatformNativeElement) -> PlatformNativeElement {
+        self.platform_window.native_element(capability)
     }
 
     /// Removes an image from the sprite atlas.

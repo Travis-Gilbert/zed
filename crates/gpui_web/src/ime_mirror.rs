@@ -314,7 +314,7 @@ impl ImeMirror {
         // until the layer draws again, and nothing else would ask -- a canvas
         // is not invalidated by a descendant's layout.
         if let Some(layer) = self.layer.as_deref() {
-            layer.set_visible(true);
+            layer.set_visible(self.element.as_ref(), true);
             layer.request_paint();
         }
     }
@@ -337,7 +337,7 @@ impl ImeMirror {
         // composites above the scene, so an element the renderer had covered
         // would otherwise still show through whatever GPUI drew over it.
         if let Some(layer) = self.layer.as_deref() {
-            layer.set_visible(false);
+            layer.set_visible(self.element.as_ref(), false);
         }
     }
 
@@ -379,6 +379,11 @@ impl ImeMirror {
     }
 
     pub(crate) fn remove(&self) {
+        // Told to the layer before the element goes: a layer still holding a
+        // detached element would draw it at the origin on the next paint.
+        if let Some(layer) = self.layer.as_deref() {
+            layer.forget(self.element.as_ref());
+        }
         let element: &web_sys::Element = self.element.as_ref();
         element.remove();
     }
