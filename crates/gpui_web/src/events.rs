@@ -1,4 +1,4 @@
-use std::{collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use gpui::{
     Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, GestureTuning,
@@ -156,18 +156,24 @@ impl WebWindowInner {
             self.register_context_menu(),
             self.register_dragover(),
             self.register_drop(),
-            self.register_key_down(),
-            self.register_key_up(),
-            self.register_before_input(),
-            self.register_input(),
-            self.register_paste(),
-            self.register_composition_start(),
-            self.register_composition_update(),
-            self.register_composition_end(),
-            self.register_focus(),
-            self.register_blur(),
-            self.register_pointer_enter(),
         ];
+        // The input path takes one set of listeners per conduit: input, key,
+        // composition and focus events fire on the focused element and do not
+        // travel to a sibling, so a set that stayed on the textarea would
+        // leave a live search field typing into nobody. The painted path has
+        // one element in this list and so registers exactly the listeners it
+        // registered before.
+        handles.extend(self.register_key_down());
+        handles.extend(self.register_key_up());
+        handles.extend(self.register_before_input());
+        handles.extend(self.register_input());
+        handles.extend(self.register_paste());
+        handles.extend(self.register_composition_start());
+        handles.extend(self.register_composition_update());
+        handles.extend(self.register_composition_end());
+        handles.extend(self.register_focus());
+        handles.extend(self.register_blur());
+        handles.push(self.register_pointer_enter());
         handles.extend(self.register_selection_change());
         handles.extend(self.register_visibility_change());
         handles.extend(self.register_appearance_change());
@@ -184,12 +190,33 @@ impl WebWindowInner {
         EventListenerHandle::add(self.canvas.as_ref(), event_name, handler)
     }
 
+    /// Register one input-path listener, on every element that path may be
+    /// driven from.
+    ///
+    /// The event fires on whichever element holds focus, so the handler has to
+    /// be listening there before it does. One closure per element, because a
+    /// DOM listener owns its closure: sharing one would mean routing every
+    /// event through a borrow to get at it, for elements that are never both
+    /// focused at once.
     fn listen_input(
         self: &Rc<Self>,
         event_name: &'static str,
         handler: impl FnMut(JsValue) + 'static,
-    ) -> EventListenerHandle {
-        EventListenerHandle::add(self.ime_mirror.event_target(), event_name, handler)
+    ) -> Vec<EventListenerHandle> {
+        let targets = self.ime_mirror.event_targets();
+        if let [target] = targets.as_slice() {
+            return vec![EventListenerHandle::add(target, event_name, handler)];
+        }
+        let handler = Rc::new(RefCell::new(handler));
+        targets
+            .into_iter()
+            .map(|target| {
+                let handler = Rc::clone(&handler);
+                EventListenerHandle::add(&target, event_name, move |event: JsValue| {
+                    (handler.borrow_mut())(event)
+                })
+            })
+            .collect()
     }
 
     fn listen_non_passive(
@@ -734,7 +761,7 @@ impl WebWindowInner {
         })
     }
 
-    fn register_key_down(self: &Rc<Self>) -> EventListenerHandle {
+    fn register_key_down(self: &Rc<Self>) -> Vec<EventListenerHandle> {
         let this = Rc::clone(self);
         self.listen_input("keydown", move |event: JsValue| {
             let event: web_sys::KeyboardEvent = event.unchecked_into();
@@ -799,7 +826,7 @@ impl WebWindowInner {
         })
     }
 
-    fn register_key_up(self: &Rc<Self>) -> EventListenerHandle {
+    fn register_key_up(self: &Rc<Self>) -> Vec<EventListenerHandle> {
         let this = Rc::clone(self);
         self.listen_input("keyup", move |event: JsValue| {
             let event: web_sys::KeyboardEvent = event.unchecked_into();
@@ -857,7 +884,7 @@ impl WebWindowInner {
     /// synchronous callback — the editor resolves its selection through
     /// anchors, so the freshly-fetched offsets are exact, and nothing can
     /// run between the query and the edit below.
-    fn register_input(self: &Rc<Self>) -> EventListenerHandle {
+    fn register_input(self: &Rc<Self>) -> Vec<EventListenerHandle> {
         let this = Rc::clone(self);
         self.listen_input("input", move |event: JsValue| {
             let event: web_sys::InputEvent = event.unchecked_into();
@@ -1004,7 +1031,7 @@ impl WebWindowInner {
     /// by `register_input`. Desktop keystrokes never reach this handler,
     /// because `register_key_down` calls `preventDefault()` for every
     /// keystroke it inserts, which cancels the corresponding `beforeinput`.
-    fn register_before_input(self: &Rc<Self>) -> EventListenerHandle {
+    fn register_before_input(self: &Rc<Self>) -> Vec<EventListenerHandle> {
         let this = Rc::clone(self);
         self.listen_input("beforeinput", move |event: JsValue| {
             let event: web_sys::InputEvent = event.unchecked_into();
@@ -1044,7 +1071,7 @@ impl WebWindowInner {
     /// pastes containing images are delivered once those reads resolve — to
     /// whichever input handler is focused at that point, matching how an
     /// application-level paste action would behave.
-    fn register_paste(self: &Rc<Self>) -> EventListenerHandle {
+    fn register_paste(self: &Rc<Self>) -> Vec<EventListenerHandle> {
         let this = Rc::clone(self);
         self.listen_input("paste", move |event: JsValue| {
             let event: web_sys::ClipboardEvent = event.unchecked_into();
@@ -1119,14 +1146,14 @@ impl WebWindowInner {
         })
     }
 
-    fn register_composition_start(self: &Rc<Self>) -> EventListenerHandle {
+    fn register_composition_start(self: &Rc<Self>) -> Vec<EventListenerHandle> {
         let this = Rc::clone(self);
         self.listen_input("compositionstart", move |_event: JsValue| {
             this.is_composing.set(true);
         })
     }
 
-    fn register_composition_update(self: &Rc<Self>) -> EventListenerHandle {
+    fn register_composition_update(self: &Rc<Self>) -> Vec<EventListenerHandle> {
         let this = Rc::clone(self);
         self.listen_input("compositionupdate", move |event: JsValue| {
             let event: web_sys::CompositionEvent = event.unchecked_into();
@@ -1138,7 +1165,7 @@ impl WebWindowInner {
         })
     }
 
-    fn register_composition_end(self: &Rc<Self>) -> EventListenerHandle {
+    fn register_composition_end(self: &Rc<Self>) -> Vec<EventListenerHandle> {
         let this = Rc::clone(self);
         self.listen_input("compositionend", move |event: JsValue| {
             let event: web_sys::CompositionEvent = event.unchecked_into();
@@ -1165,7 +1192,7 @@ impl WebWindowInner {
         })
     }
 
-    fn register_focus(self: &Rc<Self>) -> EventListenerHandle {
+    fn register_focus(self: &Rc<Self>) -> Vec<EventListenerHandle> {
         let this = Rc::clone(self);
         self.listen_input("focus", move |_event: JsValue| {
             if this.suppress_focus_status_events.get() {
@@ -1182,7 +1209,7 @@ impl WebWindowInner {
         })
     }
 
-    fn register_blur(self: &Rc<Self>) -> EventListenerHandle {
+    fn register_blur(self: &Rc<Self>) -> Vec<EventListenerHandle> {
         let this = Rc::clone(self);
         self.listen_input("blur", move |_event: JsValue| {
             if this.suppress_focus_status_events.get() {

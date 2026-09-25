@@ -236,28 +236,49 @@ impl NativeElements {
 
     /// Whether this window realizes `capability` as a real browser element.
     ///
-    /// Section 11 lists eight capabilities and this platform has built one.
-    /// The other seven answer `false` from their own arm below rather than
-    /// from a shared default, so that a capability becoming real is a change
-    /// to one arm, and so that the gap is readable in the source rather than
-    /// inferred from an array that happens to be empty.
+    /// Section 11 lists eight capabilities and this platform has built three:
+    /// the editable leaf, and the single-line text family. The other five
+    /// answer `false` from their own arm below rather than from a shared
+    /// default, so that a capability becoming real is a change to one arm,
+    /// and so that the gap is readable in the source rather than inferred
+    /// from an array that happens to be empty.
     ///
     /// A capability answers for itself. It does not inherit the editable
     /// leaf's answer, which would report a control as realized the moment the
     /// proposal shipped and would put that control's leaf on a native path
     /// with nothing behind it.
+    ///
+    /// What `true` claims for the single-line family is narrow enough to be
+    /// checked, so it is written down rather than left to the arm. The
+    /// platform builds the capability's own element -- `input[type=text]` for
+    /// [`PlatformNativeElement::EditableText`], `input[type=search]` for
+    /// [`PlatformNativeElement::SearchField`] -- drives it as the focused
+    /// editable leaf's IME conduit on the same write discipline as the
+    /// textarea, places it from the bounds GPUI publishes and draws it where
+    /// it lands, and lets the accessibility mirror claim the focused text
+    /// node onto it, so that one element is the node's whole realization
+    /// rather than a copy beside one. Which leaf it serves is decided by the
+    /// role that leaf publishes into the accessibility tree: the element has
+    /// to be the kind of control the node says it is, or a reader meets the
+    /// right number of controls of the wrong kind. [`crate::ime_mirror`]
+    /// carries the conduit policy, including why a single-line leaf cannot
+    /// share the textarea mirror at all.
     pub(crate) const fn realizes(self, capability: PlatformNativeElement) -> bool {
         match capability {
             // Built: the composer's editable leaf, which section 12 asked for
             // first and which section 13's proof is what earned the rest of
             // this list.
             PlatformNativeElement::EditableLeaf => self.realization.is_browser_native(),
+            // Built: the single-line text family. The same division of
+            // responsibility as the leaf above, on an element the platform
+            // must not wrap, so the same question has the same answer.
+            PlatformNativeElement::EditableText | PlatformNativeElement::SearchField => {
+                self.realization.is_browser_native()
+            }
             // Enumerated by section 11 and not built. Answering `false` here
             // keeps each of these on the painted path, which section 19
             // requires to be a real path rather than an untested branch.
-            PlatformNativeElement::EditableText
-            | PlatformNativeElement::SearchField
-            | PlatformNativeElement::RichText
+            PlatformNativeElement::RichText
             | PlatformNativeElement::NativeButton
             | PlatformNativeElement::NativeCheckbox
             | PlatformNativeElement::NativeSelect
@@ -283,7 +304,11 @@ impl NativeElements {
         ElementLayer::create(document, body, self.support).map(Rc::new)
     }
 
-    pub(crate) fn summary(self, editable_bounds: Option<[f32; 4]>) -> NativeElementSummary {
+    pub(crate) fn summary(
+        self,
+        editable_bounds: Option<[f32; 4]>,
+        conduit_element_id: Option<&'static str>,
+    ) -> NativeElementSummary {
         NativeElementSummary {
             supported: self.support.complete(),
             requests_paint: self.support.requests_paint,
@@ -297,6 +322,7 @@ impl NativeElements {
                 .filter(|capability| self.realizes(*capability))
                 .map(|capability| capability.name())
                 .collect(),
+            conduit_element_id,
             editable_bounds,
             last_draw_ms: LAST_DRAW_MS.with(Cell::get),
             last_input_latency_ms: LAST_INPUT_LATENCY_MS.with(Cell::get),
@@ -478,9 +504,13 @@ impl ElementLayer {
         let _ = element
             .style()
             .set_property("display", if visible { "block" } else { "none" });
-        if visible {
-            self.request_paint();
-        }
+        // Repaint on the way out as well as the way in. The layer composites
+        // above the scene and `drawElementImage` output persists until
+        // something repaints, so a hide that skipped this would leave the
+        // element's last snapshot -- caret and selection included -- drawn on
+        // the layer above whatever overlay just covered it. `forget` and
+        // `resize` repaint unconditionally for the same reason.
+        self.request_paint();
     }
 
     /// Stop drawing an element and forget it.
@@ -694,6 +724,24 @@ pub struct NativeElementSummary {
     /// `[x, y, width, height]`. Section 51 compares these against GPUI's own
     /// bounds and against where the browser reports the element.
     pub editable_bounds: Option<[f32; 4]>,
+    /// The document id of the element the IME conduit is driving for the
+    /// focused editable leaf -- `"gpui-ime-input"` for the multiline leaf,
+    /// `"gpui-ime-input-text"` and `"gpui-ime-input-search"` for the
+    /// single-line family -- or `None` where no conduit is live.
+    ///
+    /// An id rather than the capability's delegated element name, because
+    /// "which element is live" is a question an oracle asks from JavaScript
+    /// and the answer has to be something `getElementById` can be handed.
+    ///
+    /// A realized capability is not the same statement as the element in
+    /// force: a window that realizes three editable capabilities still drives
+    /// one element at a time, and section 15's "the reader meets the control
+    /// once" is a claim about that element. An oracle that could only read the
+    /// realized set could not tell a search field served by a search input
+    /// from one served by a textarea, which is the difference this field
+    /// exists to make visible. `None` on the painted path, where no element is
+    /// drawing anything.
+    pub conduit_element_id: Option<&'static str>,
     /// Section 58: the most recent HTML snapshot upload cost, in milliseconds.
     /// `None` until the layer has drawn at least one element, which on the
     /// painted path is never.

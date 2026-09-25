@@ -196,12 +196,7 @@ impl WebWindow {
         // element is parented into it. On every browser shipping today this
         // is `None` and costs one prototype lookup.
         let element_layer = native_elements.create_layer(&document, &body);
-        let ime_mirror = ImeMirror::new(
-            &document,
-            &body,
-            element_layer.clone(),
-            native_elements.realization(),
-        )?;
+        let ime_mirror = ImeMirror::new(&document, &body, element_layer.clone(), native_elements)?;
 
         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
 
@@ -261,11 +256,13 @@ impl WebWindow {
         // never keeps the window alive on its own.
         let weak = Rc::downgrade(&inner);
         crate::native_element::publish_summary_source(Rc::new(move || {
-            weak.upgrade().map_or_else(NativeElementSummary::default, |inner| {
-                inner
-                    .native_elements
-                    .summary(inner.ime_mirror.published_bounds())
-            })
+            weak.upgrade()
+                .map_or_else(NativeElementSummary::default, |inner| {
+                    inner.native_elements.summary(
+                        inner.ime_mirror.published_bounds(),
+                        inner.ime_mirror.live_conduit_id(),
+                    )
+                })
         }));
 
         let raf_closure = inner.create_raf_closure();
@@ -953,9 +950,13 @@ impl PlatformWindow for WebWindow {
         Some(self.inner.state.borrow().renderer.gpu_specs())
     }
 
-    /// Position the IME-owned textarea at the logical caret bounds.
+    /// Position the IME-owned element at the logical caret bounds.
+    ///
+    /// The window comes along because placing the element can first have to
+    /// move the input path onto another conduit, and that move is a focus
+    /// change the window has to be able to report as its own.
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
-        self.inner.ime_mirror.update_position(bounds);
+        self.inner.ime_mirror.update_position(&self.inner, bounds);
     }
 
     /// Stand up the accessibility mirror and turn accessibility on.
@@ -978,8 +979,9 @@ impl PlatformWindow for WebWindow {
 
         let adapter = match WebA11yAdapter::new(
             document,
-            self.inner.ime_mirror.accessibility_element(),
-            self.inner.ime_mirror.realization().is_browser_native(),
+            self.inner.ime_mirror.accessibility_element_handle(),
+            self.inner.ime_mirror.declared_capability_handle(),
+            self.inner.native_elements,
             action,
         ) {
             Ok(adapter) => adapter,

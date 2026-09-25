@@ -30,13 +30,16 @@
 //! last written to it so a comparison is one struct compare, not a tree
 //! walk.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use gpui::PlatformNativeElement;
 use gpui::accesskit::{self, Action, ActionRequest, Live, NodeId, Rect, Role, Toggled, TreeUpdate};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+
+use crate::native_element::NativeElements;
 
 /// The attribute that carries a node's AccessKit id on its mirror element.
 ///
@@ -199,16 +202,63 @@ struct Mirrored {
     children: Vec<NodeId>,
 }
 
+/// The native-element capability a role declares, where the browser has an
+/// element that can realize it.
+///
+/// The role *is* the leaf's declaration. A leaf that means a single-line
+/// editable field publishes `TextInput`, one that means a search field
+/// publishes `SearchInput`, and one that means the composer's multiline leaf
+/// publishes `MultilineTextInput`. The declaration is the application's, given
+/// through `Div::role`: no widget inside `gpui` assigns a text role, and
+/// `settings_ui` already declares `TextInput` and `SearchInput` on its own
+/// fields that way, so the route exists and is in use rather than being
+/// invented here. This adapter already reads the role to decide whether the
+/// element stands for the node; reading the capability off the same role at the
+/// same moment is what keeps the claim and the conduit from being two answers
+/// to one question.
+///
+/// A role with no entry is a node this mirror must project as DOM of its own,
+/// either because the browser has no control for the capability or because this
+/// platform has not built one yet. Section 11 lists all eight capabilities and
+/// section 12 is explicit that the editable leaf came first and nothing
+/// generalizes until that proof holds, so each entry here was added only once
+/// an element existed to back it.
+const fn capability_for_role(role: Role) -> Option<PlatformNativeElement> {
+    match role {
+        Role::MultilineTextInput => Some(PlatformNativeElement::EditableLeaf),
+        Role::SearchInput => Some(PlatformNativeElement::SearchField),
+        Role::TextInput => Some(PlatformNativeElement::EditableText),
+        _ => None,
+    }
+}
+
 /// Whether a real browser input element can stand for this role.
 ///
-/// Only the text roles, and only because the element that owns focus on this
-/// platform is a `<textarea>`: an element can realize the control it actually
-/// is. Section 11 lists other capabilities a browser could own, and each of
-/// them needs its own element before it can appear here. Section 12 is
-/// explicit that the editable leaf comes first and nothing generalizes until
-/// that proof holds.
+/// Only the roles this platform has built an element for, because an element
+/// can realize only the control it actually is: a `<textarea>` is the multiline
+/// editable leaf, `input[type=search]` is the search field, `input[type=text]`
+/// the single-line one. Rich text, number and date fields are controls of other
+/// kinds, and each would need an element of its own before it could appear
+/// here.
 const fn realizable_natively(role: Role) -> bool {
-    matches!(role, Role::TextInput | Role::MultilineTextInput)
+    capability_for_role(role).is_some()
+}
+
+/// The attributes a claim writes onto an element, and takes back off it.
+const CLAIM_ATTRIBUTES: [&str; 6] = [
+    NODE_ATTRIBUTE,
+    "aria-label",
+    "aria-description",
+    "aria-disabled",
+    "aria-required",
+    "aria-readonly",
+];
+
+/// Take a claim's attributes off an element.
+fn clear_claim(element: &web_sys::Element) {
+    for attribute in CLAIM_ATTRIBUTES {
+        let _ = element.remove_attribute(attribute);
+    }
 }
 
 /// The ARIA roles that take `aria-valuetext`.
@@ -276,19 +326,44 @@ pub(crate) struct WebA11yAdapter {
     document: web_sys::Document,
     container: web_sys::Element,
     live_region: web_sys::Element,
-    input_element: web_sys::HtmlElement,
+    /// The element the focused leaf is realized by, held as a cell rather
+    /// than as a copy of it.
+    ///
+    /// Which element that is depends on the leaf's capability, and the claim
+    /// has to move with it: a snapshot of the element the window started on
+    /// would leave the claim, `aria-activedescendant` and the screen reader on
+    /// the IME's old element while the IME typed into the new one.
+    input_element: Rc<RefCell<web_sys::HtmlElement>>,
+    /// Where this frame's declaration is published for the IME mirror.
+    ///
+    /// The mirror needs to know which capability the focused leaf calls for,
+    /// and this adapter is already holding the one fact that says so: the role
+    /// of the node it claims. Declaring it here rather than querying it keeps
+    /// one authority for what a node is.
+    declared: Rc<Cell<PlatformNativeElement>>,
     nodes: HashMap<NodeId, MirrorNode>,
     focus: Option<NodeId>,
     announced: String,
-    /// Whether this browser realizes an editable leaf as the real input
-    /// element rather than as pixels. Section 15: when it does, that element
-    /// *is* the accessibility realization of the focused text node, and this
-    /// mirror must not project a second control for the same node.
-    native_editable: bool,
+    /// What this window can realize.
+    ///
+    /// The claim is made against the per-capability gate rather than a
+    /// window-wide "the browser draws elements" flag, because that gate is also
+    /// what decides whether the IME mirror builds and drives a conduit for the
+    /// capability. One question, one authority: a claim that could answer
+    /// `true` for a capability this window has no element for would realize a
+    /// node as a control that does not exist, and section 15's "exactly once"
+    /// would then be satisfied by the wrong once.
+    native_elements: NativeElements,
     /// The node the input element currently stands for, if any. Kept so the
     /// attributes written onto a shared element can be taken back off it when
     /// focus leaves.
     natively_realized: Option<NodeId>,
+    /// The element those attributes were written onto, which is not always the
+    /// element the mirror is live on now: a conduit switch moves the input path
+    /// between elements, and taking the attributes off the element that carries
+    /// them is what keeps a hidden one from still answering to a node id the
+    /// live one is supposed to realize.
+    claimed_element: Option<web_sys::HtmlElement>,
     /// The delegated `click`/`focusin` listeners. Dropping the adapter removes
     /// them, which is why they are owned here rather than forgotten.
     _listeners: Vec<DelegatedListener>,
@@ -314,8 +389,9 @@ impl WebA11yAdapter {
     /// assistive-technology activation back into GPUI.
     pub(crate) fn new(
         document: web_sys::Document,
-        input_element: web_sys::HtmlElement,
-        native_editable: bool,
+        input_element: Rc<RefCell<web_sys::HtmlElement>>,
+        declared: Rc<Cell<PlatformNativeElement>>,
+        native_elements: NativeElements,
         action: Rc<dyn Fn(ActionRequest)>,
     ) -> anyhow::Result<Self> {
         let body = document
@@ -405,11 +481,13 @@ impl WebA11yAdapter {
             container,
             live_region,
             input_element,
+            declared,
+            native_elements,
             nodes: HashMap::default(),
             focus: None,
             announced: String::new(),
-            native_editable,
             natively_realized: None,
+            claimed_element: None,
             _listeners: listeners,
         })
     }
@@ -428,14 +506,36 @@ impl WebA11yAdapter {
         // in the tree for one semantic node, and a reader would encounter the
         // control twice. So the node is claimed here, before the mirror loop,
         // and the loop skips it.
-        let claimed = self.native_editable.then(|| {
-            update
-                .nodes
-                .iter()
-                .find(|(node_id, node)| *node_id == update.focus && realizable_natively(node.role()))
-                .map(|(node_id, node)| (*node_id, Mirrored::read(node)))
-        });
-        let claimed = claimed.flatten();
+        let claimed = update
+            .nodes
+            .iter()
+            .find(|(node_id, node)| *node_id == update.focus && realizable_natively(node.role()))
+            .and_then(|(node_id, node)| {
+                let capability = capability_for_role(node.role())?;
+                // The gate and the role have to agree, and each answers for
+                // one half: the role says what the node is, the gate says
+                // whether this window has the element to be it.
+                self.native_elements
+                    .realizes(capability)
+                    .then(|| (*node_id, Mirrored::read(node), capability))
+            });
+        // Declared before the element is claimed: the mirror reads the
+        // declaration to decide which conduit the focused leaf calls for, and
+        // the claim below only says which name and state that conduit carries
+        // once it is the one.
+        //
+        // `None` when nothing focused is realizable -- which is what sends the
+        // mirror back to the multiline leaf it drove before there was more
+        // than one element. A frame where no leaf declares a single-line
+        // capability is a frame where the safe answer is the element GPUI has
+        // always driven.
+        self.declared.set(
+            claimed
+                .as_ref()
+                .map_or(PlatformNativeElement::None, |(_, _, capability)| {
+                    *capability
+                }),
+        );
         self.apply_native_realization(claimed.as_ref());
 
         for (node_id, node) in &update.nodes {
@@ -523,13 +623,20 @@ impl WebA11yAdapter {
                 // There is no descendant to be active: the focused element is
                 // the control. Pointing at one would be the duplicate again,
                 // in attribute form.
-                let _ = self.input_element.remove_attribute("aria-activedescendant");
+                let _ = self
+                    .input_element
+                    .borrow()
+                    .remove_attribute("aria-activedescendant");
             } else if self.nodes.contains_key(&update.focus) {
                 let _ = self
                     .input_element
+                    .borrow()
                     .set_attribute("aria-activedescendant", &element_id(update.focus));
             } else {
-                let _ = self.input_element.remove_attribute("aria-activedescendant");
+                let _ = self
+                    .input_element
+                    .borrow()
+                    .remove_attribute("aria-activedescendant");
             }
         }
 
@@ -549,11 +656,24 @@ impl WebA11yAdapter {
     /// 16 makes GPUI the layout authority and the IME mirror the one writer of
     /// this element's box, so a second writer here would be two authorities
     /// for one rectangle.
-    fn apply_native_realization(&mut self, claimed: Option<&(NodeId, Mirrored)>) {
-        let element: &web_sys::Element = self.input_element.as_ref();
+    fn apply_native_realization(
+        &mut self,
+        claimed: Option<&(NodeId, Mirrored, PlatformNativeElement)>,
+    ) {
+        let input_element = self.input_element.borrow().clone();
+        let element: &web_sys::Element = input_element.as_ref();
+        if let Some(previous) = self.claimed_element.take()
+            && previous != input_element
+        {
+            clear_claim(previous.as_ref());
+        }
         match claimed {
-            Some((node_id, read)) => {
+            // The capability is not needed here: it was declared above, and
+            // what the element carries is the node's name and state, which are
+            // the same attributes whatever kind of control it is.
+            Some((node_id, read, _capability)) => {
                 self.natively_realized = Some(*node_id);
+                self.claimed_element = Some(input_element.clone());
                 let _ = element.set_attribute(NODE_ATTRIBUTE, &node_id.0.to_string());
                 set_or_clear(element, "aria-label", read.label.as_deref());
                 set_or_clear(element, "aria-description", read.description.as_deref());
@@ -562,19 +682,11 @@ impl WebA11yAdapter {
                 set_flag(element, "aria-readonly", read.read_only);
             }
             None => {
+                self.claimed_element = None;
                 if self.natively_realized.take().is_none() {
                     return;
                 }
-                for attribute in [
-                    NODE_ATTRIBUTE,
-                    "aria-label",
-                    "aria-description",
-                    "aria-disabled",
-                    "aria-required",
-                    "aria-readonly",
-                ] {
-                    let _ = element.remove_attribute(attribute);
-                }
+                clear_claim(element);
             }
         }
     }
@@ -761,7 +873,10 @@ impl WebA11yAdapter {
     pub(crate) fn summary(&self) -> A11yMirrorSummary {
         A11yMirrorSummary {
             node_count: self.nodes.len(),
-            focused_element_id: self.input_element.get_attribute("aria-activedescendant"),
+            focused_element_id: self
+                .input_element
+                .borrow()
+                .get_attribute("aria-activedescendant"),
             natively_realized_node: self.natively_realized.map(|node_id| node_id.0),
             textbox_element_ids: self
                 .nodes
