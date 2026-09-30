@@ -16,4 +16,5 @@
 0016-gpui-web-native-editable-leaf.patch
 0028-gpui-web-element-layer-surface.patch
 0029-gpui-web-shipping-html-in-canvas-surface.patch
-0030-gpui-native-reduced-motion.patch
+0030-gpui-web-pin-catchup.patch
+0031-gpui-native-reduced-motion.patch

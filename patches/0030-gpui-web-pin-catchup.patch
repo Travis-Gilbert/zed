@@ -1,0 +1,2353 @@
+Subject: [PATCH] chore(gpui_web): retain the previously pinned browser prerequisites
+
+Mechanical catch-up of bytes already present at consumer base 6d4d907.
+No product source changes; restores recorded-series parity with that pin.
+
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 0548504..fd05ca3 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -824,7 +824,6 @@ pub enum TextInputStateChange {
+     ContentChanged,
+ }
+ 
+-#[expect(missing_docs)]
+ /// What a platform can hand a GPUI leaf in place of painted pixels.
+ ///
+ /// A painted leaf is GPUI's entirely: it owns the pixels, and every behaviour
+@@ -846,17 +845,113 @@ pub enum TextInputStateChange {
+ /// bounds, and a second geometry channel would be a second authority for one
+ /// rectangle. The only thing a leaf cannot work out for itself is whether the
+ /// platform is drawing the control, so that is the only thing it is told.
+-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++///
++/// The variants are SPEC-THEOREMWEB-PWA-HTML-CANVAS-1.1 section 11's list of
++/// capabilities. [`Self::ALL`] holds them in that section's order, and
++/// [`Self::name`] returns that section's spelling, which is not always this
++/// one: the capability the specification calls `MultilineEditableText` is
++/// spelled [`Self::EditableLeaf`] here, because that name was in the tree
++/// before the specification enumerated the rest.
++///
++/// Enumerating all eight is what lets a leaf declare which one it is and lets
++/// a platform answer that declaration per capability. A platform that has not
++/// implemented one answers [`Self::None`] for it, which puts that leaf on the
++/// painted path -- a real path, not a branch the platform skipped.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+ pub enum PlatformNativeElement {
+-    /// GPUI paints the leaf and reproduces its behaviour.
++    /// GPUI paints the leaf and reproduces its behaviour. The answer for a
++    /// capability a platform does not realize, and for a leaf that asks for
++    /// nothing.
+     #[default]
+     None,
+-    /// The platform realizes an editable leaf as a real control of its own,
+-    /// positioned at the bounds GPUI laid out.
++    /// Multiline editable text. The platform owns caret, selection, IME,
++    /// autocorrect, spellcheck and the virtual keyboard; GPUI keeps the text,
++    /// the layout and the focus. This is section 11's `MultilineEditableText`.
+     EditableLeaf,
++    /// Single-line editable text. The same division as
++    /// [`Self::EditableLeaf`], for a leaf the platform must not wrap.
++    EditableText,
++    /// A search field: single-line text plus the platform's own search
++    /// affordances and semantics.
++    SearchField,
++    /// Text whose editing semantics the platform owns beyond plain character
++    /// editing.
++    RichText,
++    /// A push button. The platform owns activation semantics; GPUI owns the
++    /// label, the layout, and what the activation does.
++    NativeButton,
++    /// A checkbox. The platform owns the checked state's semantics and the
++    /// control's accessibility role.
++    NativeCheckbox,
++    /// A select. The platform owns the popup and the option list.
++    NativeSelect,
++    /// A hyperlink. The platform owns link semantics and navigation.
++    NativeLink,
+ }
+ 
+ impl PlatformNativeElement {
++    /// Every capability, in the order section 11 lists them.
++    ///
++    /// [`Self::EditableLeaf`] stands in the section's `MultilineEditableText`
++    /// position; [`Self::name`] is what reconciles the two spellings.
++    pub const ALL: [Self; 8] = [
++        Self::EditableText,
++        Self::EditableLeaf,
++        Self::SearchField,
++        Self::NativeButton,
++        Self::NativeCheckbox,
++        Self::NativeSelect,
++        Self::NativeLink,
++        Self::RichText,
++    ];
++
++    /// This capability under the name section 11 gives it.
++    pub const fn name(self) -> &'static str {
++        match self {
++            Self::None => "None",
++            Self::EditableLeaf => "MultilineEditableText",
++            Self::EditableText => "EditableText",
++            Self::SearchField => "SearchField",
++            Self::RichText => "RichText",
++            Self::NativeButton => "NativeButton",
++            Self::NativeCheckbox => "NativeCheckbox",
++            Self::NativeSelect => "NativeSelect",
++            Self::NativeLink => "NativeLink",
++        }
++    }
++
++    /// The real element a platform realizes this capability with, or `None`
++    /// where no platform element is the realization.
++    ///
++    /// A name rather than a constructed element: the platform's own module is
++    /// the only place that may build one, and this exists so a report can say
++    /// what a capability would have delegated to without reaching for it.
++    pub const fn delegation(self) -> Option<&'static str> {
++        match self {
++            Self::None => None,
++            Self::EditableLeaf => Some("textarea"),
++            Self::EditableText => Some("input[type=text]"),
++            Self::SearchField => Some("input[type=search]"),
++            Self::RichText => Some("contenteditable host"),
++            Self::NativeButton => Some("button"),
++            Self::NativeCheckbox => Some("input[type=checkbox]"),
++            Self::NativeSelect => Some("select"),
++            Self::NativeLink => Some("a[href]"),
++        }
++    }
++
++    /// Whether this capability is one of the four editable ones.
++    ///
++    /// The editable four share an IME conduit and one set of text-input hints;
++    /// the four controls share none of that. A per-capability gate keys on
++    /// this rather than re-deriving the split at each call site.
++    pub const fn is_editable(self) -> bool {
++        matches!(
++            self,
++            Self::EditableLeaf | Self::EditableText | Self::SearchField | Self::RichText
++        )
++    }
++
+     /// Whether an editable leaf should leave caret, selection and text
+     /// assistance to the platform.
+     pub const fn realizes_editable_leaf(self) -> bool {
+@@ -864,6 +959,44 @@ impl PlatformNativeElement {
+     }
+ }
+ 
++/// Section 11's list, checked where it is declared.
++///
++/// A capability added to the enum and forgotten in [`PlatformNativeElement::ALL`]
++/// is one the section asked for and no report would name, so the list is held
++/// to the section at compile time rather than by a test someone has to
++/// remember to run. The section enumerating the eight is what makes them
++/// requirements; an enumeration with a hole in it is the thing this asserts
++/// against, and it should not build.
++const _: () = {
++    let all = PlatformNativeElement::ALL;
++    assert!(all.len() == 8, "section 11 lists eight capabilities");
++    // In the order the section lists them, with `EditableLeaf` standing where
++    // the section says `MultilineEditableText`.
++    assert!(matches!(all[0], PlatformNativeElement::EditableText));
++    assert!(matches!(all[1], PlatformNativeElement::EditableLeaf));
++    assert!(matches!(all[2], PlatformNativeElement::SearchField));
++    assert!(matches!(all[3], PlatformNativeElement::NativeButton));
++    assert!(matches!(all[4], PlatformNativeElement::NativeCheckbox));
++    assert!(matches!(all[5], PlatformNativeElement::NativeSelect));
++    assert!(matches!(all[6], PlatformNativeElement::NativeLink));
++    assert!(matches!(all[7], PlatformNativeElement::RichText));
++    // Every listed capability names the element it delegates to and names
++    // itself; only `None`, which is not in the list, does neither.
++    let mut i = 0;
++    while i < all.len() {
++        assert!(all[i].delegation().is_some());
++        assert!(!all[i].name().is_empty());
++        i += 1;
++    }
++    // The four editable capabilities and the four controls split the way the
++    // section divides responsibilities: the editable four share caret,
++    // selection and IME, and the controls share none of that.
++    assert!(all[0].is_editable() && all[1].is_editable());
++    assert!(all[2].is_editable() && all[7].is_editable());
++    assert!(!all[3].is_editable() && !all[4].is_editable());
++    assert!(!all[5].is_editable() && !all[6].is_editable());
++};
++
+ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     fn bounds(&self) -> Bounds<Pixels>;
+     fn is_maximized(&self) -> bool;
+@@ -927,12 +1060,18 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     ) -> Result<ExternalGpuSurfaceHandle, ExternalGpuSurfaceError> {
+         Err(ExternalGpuSurfaceError::Unsupported)
+     }
+-    /// What this window can hand an editable leaf in place of painted pixels.
++    /// What this window can hand a leaf declaring `capability` in place of
++    /// painted pixels.
++    ///
++    /// Asked per capability rather than once per window, because section 11
++    /// lists eight and a platform may realize some and not others. The answer
++    /// is `capability` where the platform realizes it and
++    /// [`PlatformNativeElement::None`] where it does not.
+     ///
+-    /// Defaults to [`PlatformNativeElement::None`], which is what every
+-    /// platform other than the web answers and what the web answers on every
+-    /// browser shipping today.
+-    fn native_element(&self) -> PlatformNativeElement {
++    /// Defaults to `None` for every capability, which is what every platform
++    /// other than the web answers and what the web answers on a browser that
++    /// ships nothing this needs.
++    fn native_element(&self, _capability: PlatformNativeElement) -> PlatformNativeElement {
+         PlatformNativeElement::None
+     }
+     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+diff --git a/crates/gpui/src/platform/keystroke.rs b/crates/gpui/src/platform/keystroke.rs
+index c45c7c1..3824bc9 100644
+--- a/crates/gpui/src/platform/keystroke.rs
++++ b/crates/gpui/src/platform/keystroke.rs
+@@ -3,10 +3,56 @@ use serde::{Deserialize, Serialize};
+ use std::{
+     error::Error,
+     fmt::{Display, Write},
++    sync::atomic::{AtomicU8, Ordering},
+ };
+ 
+ use crate::PlatformKeyboardMapper;
+ 
++/// Unset, platform, or control. Read and written as a `u8` so the default
++/// stays a compile-time constant that no caller has to initialize.
++static SECONDARY_MODIFIER: AtomicU8 = AtomicU8::new(SECONDARY_UNSET);
++const SECONDARY_UNSET: u8 = 0;
++const SECONDARY_PLATFORM: u8 = 1;
++const SECONDARY_CONTROL: u8 = 2;
++
++/// Declare what the `secondary` modifier means on the machine in front of the
++/// person.
++///
++/// `secondary` is Command on macOS and Control everywhere else, and every
++/// target but one can answer that at compile time. The web cannot: one wasm
++/// binary is served to a Mac and to a Windows PC, `target_os` is `unknown` for
++/// both, and a `cfg!` there silently picks Control for everyone. A Mac user
++/// then finds that Command does nothing.
++///
++/// So the browser platform tells GPUI once, at startup, and `secondary`
++/// becomes a runtime answer on the one target that needs it. Until something
++/// calls this the compile-time answer stands, so no existing platform changes
++/// behavior.
++pub fn set_secondary_modifier_is_platform(is_platform: bool) {
++    SECONDARY_MODIFIER.store(
++        if is_platform {
++            SECONDARY_PLATFORM
++        } else {
++            SECONDARY_CONTROL
++        },
++        Ordering::Relaxed,
++    );
++}
++
++/// Whether `secondary` means the platform key (Command) rather than Control.
++///
++/// Also the right question for anything choosing between a macOS keymap and
++/// the other one, which is why it is public: a caller that reached for
++/// `cfg!(target_os = "macos")` instead would be wrong on the web in exactly
++/// the way this exists to fix.
++pub fn secondary_modifier_is_platform() -> bool {
++    match SECONDARY_MODIFIER.load(Ordering::Relaxed) {
++        SECONDARY_PLATFORM => true,
++        SECONDARY_CONTROL => false,
++        _ => cfg!(target_os = "macos"),
++    }
++}
++
+ /// This is a helper trait so that we can simplify the implementation of some functions
+ pub trait AsKeystroke {
+     /// Returns the GPUI representation of the keystroke.
+@@ -141,7 +187,7 @@ impl Keystroke {
+                 continue;
+             }
+             if component.eq_ignore_ascii_case("secondary") {
+-                if cfg!(target_os = "macos") {
++                if secondary_modifier_is_platform() {
+                     modifiers.platform = true;
+                 } else {
+                     modifiers.control = true;
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 2a28406..b52c457 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -4847,15 +4847,21 @@ impl Window {
+             .create_external_gpu_surface(width, height, format)
+     }
+ 
+-    /// What this platform hands an editable leaf in place of painted pixels.
++    /// What this platform hands a leaf declaring `capability` in place of
++    /// painted pixels.
++    ///
++    /// Asked per capability, so a leaf can declare which of section 11's eight
++    /// it is and get that one's answer rather than a window-wide one. The
++    /// answer is `capability` where the platform realizes it and
++    /// [`PlatformNativeElement::None`] where it does not.
+     ///
+     /// An editable element asks before it paints a caret or a selection, so
+     /// that it does not draw a second one over the platform's own. Everything
+     /// else about the element -- its identity, its layout, its focus, its
+     /// state, its lifetime -- is the same on both answers, which is what lets
+     /// one element implementation serve both.
+-    pub fn native_element(&self) -> PlatformNativeElement {
+-        self.platform_window.native_element()
++    pub fn native_element(&self, capability: PlatformNativeElement) -> PlatformNativeElement {
++        self.platform_window.native_element(capability)
+     }
+ 
+     /// Removes an image from the sprite atlas.
+diff --git a/crates/gpui_web/Cargo.toml b/crates/gpui_web/Cargo.toml
+index 8a9485d..d7f0f82 100644
+--- a/crates/gpui_web/Cargo.toml
++++ b/crates/gpui_web/Cargo.toml
+@@ -58,6 +58,7 @@ web-sys = { version = "0.3", features = [
+     "FileList",
+     "HtmlCanvasElement",
+     "HtmlElement",
++    "HtmlInputElement",
+     "HtmlTextAreaElement",
+     "IdleDeadline",
+     "IdleRequestOptions",
+@@ -69,6 +70,7 @@ web-sys = { version = "0.3", features = [
+     "MouseEvent",
+     "Navigator",
+     "Node",
++    "Performance",
+     "PointerEvent",
+     "ReadableStream",
+     "ReadableStreamDefaultReader",
+diff --git a/crates/gpui_web/src/a11y.rs b/crates/gpui_web/src/a11y.rs
+index f069a44..3c68994 100644
+--- a/crates/gpui_web/src/a11y.rs
++++ b/crates/gpui_web/src/a11y.rs
+@@ -30,14 +30,17 @@
+ //! last written to it so a comparison is one struct compare, not a tree
+ //! walk.
+ 
+-use std::cell::RefCell;
++use std::cell::{Cell, RefCell};
+ use std::collections::HashMap;
+ use std::rc::Rc;
+ 
++use gpui::PlatformNativeElement;
+ use gpui::accesskit::{self, Action, ActionRequest, Live, NodeId, Rect, Role, Toggled, TreeUpdate};
+ use wasm_bindgen::JsCast;
+ use wasm_bindgen::prelude::*;
+ 
++use crate::native_element::NativeElements;
++
+ /// The attribute that carries a node's AccessKit id on its mirror element.
+ ///
+ /// One delegated listener on the container reads this rather than each element
+@@ -199,16 +202,63 @@ struct Mirrored {
+     children: Vec<NodeId>,
+ }
+ 
++/// The native-element capability a role declares, where the browser has an
++/// element that can realize it.
++///
++/// The role *is* the leaf's declaration. A leaf that means a single-line
++/// editable field publishes `TextInput`, one that means a search field
++/// publishes `SearchInput`, and one that means the composer's multiline leaf
++/// publishes `MultilineTextInput`. The declaration is the application's, given
++/// through `Div::role`: no widget inside `gpui` assigns a text role, and
++/// `settings_ui` already declares `TextInput` and `SearchInput` on its own
++/// fields that way, so the route exists and is in use rather than being
++/// invented here. This adapter already reads the role to decide whether the
++/// element stands for the node; reading the capability off the same role at the
++/// same moment is what keeps the claim and the conduit from being two answers
++/// to one question.
++///
++/// A role with no entry is a node this mirror must project as DOM of its own,
++/// either because the browser has no control for the capability or because this
++/// platform has not built one yet. Section 11 lists all eight capabilities and
++/// section 12 is explicit that the editable leaf came first and nothing
++/// generalizes until that proof holds, so each entry here was added only once
++/// an element existed to back it.
++const fn capability_for_role(role: Role) -> Option<PlatformNativeElement> {
++    match role {
++        Role::MultilineTextInput => Some(PlatformNativeElement::EditableLeaf),
++        Role::SearchInput => Some(PlatformNativeElement::SearchField),
++        Role::TextInput => Some(PlatformNativeElement::EditableText),
++        _ => None,
++    }
++}
++
+ /// Whether a real browser input element can stand for this role.
+ ///
+-/// Only the text roles, and only because the element that owns focus on this
+-/// platform is a `<textarea>`: an element can realize the control it actually
+-/// is. Section 11 lists other capabilities a browser could own, and each of
+-/// them needs its own element before it can appear here. Section 12 is
+-/// explicit that the editable leaf comes first and nothing generalizes until
+-/// that proof holds.
++/// Only the roles this platform has built an element for, because an element
++/// can realize only the control it actually is: a `<textarea>` is the multiline
++/// editable leaf, `input[type=search]` is the search field, `input[type=text]`
++/// the single-line one. Rich text, number and date fields are controls of other
++/// kinds, and each would need an element of its own before it could appear
++/// here.
+ const fn realizable_natively(role: Role) -> bool {
+-    matches!(role, Role::TextInput | Role::MultilineTextInput)
++    capability_for_role(role).is_some()
++}
++
++/// The attributes a claim writes onto an element, and takes back off it.
++const CLAIM_ATTRIBUTES: [&str; 6] = [
++    NODE_ATTRIBUTE,
++    "aria-label",
++    "aria-description",
++    "aria-disabled",
++    "aria-required",
++    "aria-readonly",
++];
++
++/// Take a claim's attributes off an element.
++fn clear_claim(element: &web_sys::Element) {
++    for attribute in CLAIM_ATTRIBUTES {
++        let _ = element.remove_attribute(attribute);
++    }
+ }
+ 
+ /// The ARIA roles that take `aria-valuetext`.
+@@ -276,19 +326,44 @@ pub(crate) struct WebA11yAdapter {
+     document: web_sys::Document,
+     container: web_sys::Element,
+     live_region: web_sys::Element,
+-    input_element: web_sys::HtmlElement,
++    /// The element the focused leaf is realized by, held as a cell rather
++    /// than as a copy of it.
++    ///
++    /// Which element that is depends on the leaf's capability, and the claim
++    /// has to move with it: a snapshot of the element the window started on
++    /// would leave the claim, `aria-activedescendant` and the screen reader on
++    /// the IME's old element while the IME typed into the new one.
++    input_element: Rc<RefCell<web_sys::HtmlElement>>,
++    /// Where this frame's declaration is published for the IME mirror.
++    ///
++    /// The mirror needs to know which capability the focused leaf calls for,
++    /// and this adapter is already holding the one fact that says so: the role
++    /// of the node it claims. Declaring it here rather than querying it keeps
++    /// one authority for what a node is.
++    declared: Rc<Cell<PlatformNativeElement>>,
+     nodes: HashMap<NodeId, MirrorNode>,
+     focus: Option<NodeId>,
+     announced: String,
+-    /// Whether this browser realizes an editable leaf as the real input
+-    /// element rather than as pixels. Section 15: when it does, that element
+-    /// *is* the accessibility realization of the focused text node, and this
+-    /// mirror must not project a second control for the same node.
+-    native_editable: bool,
++    /// What this window can realize.
++    ///
++    /// The claim is made against the per-capability gate rather than a
++    /// window-wide "the browser draws elements" flag, because that gate is also
++    /// what decides whether the IME mirror builds and drives a conduit for the
++    /// capability. One question, one authority: a claim that could answer
++    /// `true` for a capability this window has no element for would realize a
++    /// node as a control that does not exist, and section 15's "exactly once"
++    /// would then be satisfied by the wrong once.
++    native_elements: NativeElements,
+     /// The node the input element currently stands for, if any. Kept so the
+     /// attributes written onto a shared element can be taken back off it when
+     /// focus leaves.
+     natively_realized: Option<NodeId>,
++    /// The element those attributes were written onto, which is not always the
++    /// element the mirror is live on now: a conduit switch moves the input path
++    /// between elements, and taking the attributes off the element that carries
++    /// them is what keeps a hidden one from still answering to a node id the
++    /// live one is supposed to realize.
++    claimed_element: Option<web_sys::HtmlElement>,
+     /// The delegated `click`/`focusin` listeners. Dropping the adapter removes
+     /// them, which is why they are owned here rather than forgotten.
+     _listeners: Vec<DelegatedListener>,
+@@ -314,8 +389,9 @@ impl WebA11yAdapter {
+     /// assistive-technology activation back into GPUI.
+     pub(crate) fn new(
+         document: web_sys::Document,
+-        input_element: web_sys::HtmlElement,
+-        native_editable: bool,
++        input_element: Rc<RefCell<web_sys::HtmlElement>>,
++        declared: Rc<Cell<PlatformNativeElement>>,
++        native_elements: NativeElements,
+         action: Rc<dyn Fn(ActionRequest)>,
+     ) -> anyhow::Result<Self> {
+         let body = document
+@@ -405,11 +481,13 @@ impl WebA11yAdapter {
+             container,
+             live_region,
+             input_element,
++            declared,
++            native_elements,
+             nodes: HashMap::default(),
+             focus: None,
+             announced: String::new(),
+-            native_editable,
+             natively_realized: None,
++            claimed_element: None,
+             _listeners: listeners,
+         })
+     }
+@@ -428,14 +506,36 @@ impl WebA11yAdapter {
+         // in the tree for one semantic node, and a reader would encounter the
+         // control twice. So the node is claimed here, before the mirror loop,
+         // and the loop skips it.
+-        let claimed = self.native_editable.then(|| {
+-            update
+-                .nodes
+-                .iter()
+-                .find(|(node_id, node)| *node_id == update.focus && realizable_natively(node.role()))
+-                .map(|(node_id, node)| (*node_id, Mirrored::read(node)))
+-        });
+-        let claimed = claimed.flatten();
++        let claimed = update
++            .nodes
++            .iter()
++            .find(|(node_id, node)| *node_id == update.focus && realizable_natively(node.role()))
++            .and_then(|(node_id, node)| {
++                let capability = capability_for_role(node.role())?;
++                // The gate and the role have to agree, and each answers for
++                // one half: the role says what the node is, the gate says
++                // whether this window has the element to be it.
++                self.native_elements
++                    .realizes(capability)
++                    .then(|| (*node_id, Mirrored::read(node), capability))
++            });
++        // Declared before the element is claimed: the mirror reads the
++        // declaration to decide which conduit the focused leaf calls for, and
++        // the claim below only says which name and state that conduit carries
++        // once it is the one.
++        //
++        // `None` when nothing focused is realizable -- which is what sends the
++        // mirror back to the multiline leaf it drove before there was more
++        // than one element. A frame where no leaf declares a single-line
++        // capability is a frame where the safe answer is the element GPUI has
++        // always driven.
++        self.declared.set(
++            claimed
++                .as_ref()
++                .map_or(PlatformNativeElement::None, |(_, _, capability)| {
++                    *capability
++                }),
++        );
+         self.apply_native_realization(claimed.as_ref());
+ 
+         for (node_id, node) in &update.nodes {
+@@ -523,13 +623,20 @@ impl WebA11yAdapter {
+                 // There is no descendant to be active: the focused element is
+                 // the control. Pointing at one would be the duplicate again,
+                 // in attribute form.
+-                let _ = self.input_element.remove_attribute("aria-activedescendant");
++                let _ = self
++                    .input_element
++                    .borrow()
++                    .remove_attribute("aria-activedescendant");
+             } else if self.nodes.contains_key(&update.focus) {
+                 let _ = self
+                     .input_element
++                    .borrow()
+                     .set_attribute("aria-activedescendant", &element_id(update.focus));
+             } else {
+-                let _ = self.input_element.remove_attribute("aria-activedescendant");
++                let _ = self
++                    .input_element
++                    .borrow()
++                    .remove_attribute("aria-activedescendant");
+             }
+         }
+ 
+@@ -549,11 +656,24 @@ impl WebA11yAdapter {
+     /// 16 makes GPUI the layout authority and the IME mirror the one writer of
+     /// this element's box, so a second writer here would be two authorities
+     /// for one rectangle.
+-    fn apply_native_realization(&mut self, claimed: Option<&(NodeId, Mirrored)>) {
+-        let element: &web_sys::Element = self.input_element.as_ref();
++    fn apply_native_realization(
++        &mut self,
++        claimed: Option<&(NodeId, Mirrored, PlatformNativeElement)>,
++    ) {
++        let input_element = self.input_element.borrow().clone();
++        let element: &web_sys::Element = input_element.as_ref();
++        if let Some(previous) = self.claimed_element.take()
++            && previous != input_element
++        {
++            clear_claim(previous.as_ref());
++        }
+         match claimed {
+-            Some((node_id, read)) => {
++            // The capability is not needed here: it was declared above, and
++            // what the element carries is the node's name and state, which are
++            // the same attributes whatever kind of control it is.
++            Some((node_id, read, _capability)) => {
+                 self.natively_realized = Some(*node_id);
++                self.claimed_element = Some(input_element.clone());
+                 let _ = element.set_attribute(NODE_ATTRIBUTE, &node_id.0.to_string());
+                 set_or_clear(element, "aria-label", read.label.as_deref());
+                 set_or_clear(element, "aria-description", read.description.as_deref());
+@@ -562,19 +682,11 @@ impl WebA11yAdapter {
+                 set_flag(element, "aria-readonly", read.read_only);
+             }
+             None => {
++                self.claimed_element = None;
+                 if self.natively_realized.take().is_none() {
+                     return;
+                 }
+-                for attribute in [
+-                    NODE_ATTRIBUTE,
+-                    "aria-label",
+-                    "aria-description",
+-                    "aria-disabled",
+-                    "aria-required",
+-                    "aria-readonly",
+-                ] {
+-                    let _ = element.remove_attribute(attribute);
+-                }
++                clear_claim(element);
+             }
+         }
+     }
+@@ -761,7 +873,10 @@ impl WebA11yAdapter {
+     pub(crate) fn summary(&self) -> A11yMirrorSummary {
+         A11yMirrorSummary {
+             node_count: self.nodes.len(),
+-            focused_element_id: self.input_element.get_attribute("aria-activedescendant"),
++            focused_element_id: self
++                .input_element
++                .borrow()
++                .get_attribute("aria-activedescendant"),
+             natively_realized_node: self.natively_realized.map(|node_id| node_id.0),
+             textbox_element_ids: self
+                 .nodes
+diff --git a/crates/gpui_web/src/events.rs b/crates/gpui_web/src/events.rs
+index 981cf4e..128ae84 100644
+--- a/crates/gpui_web/src/events.rs
++++ b/crates/gpui_web/src/events.rs
+@@ -1,4 +1,4 @@
+-use std::{collections::HashMap, rc::Rc};
++use std::{cell::RefCell, collections::HashMap, rc::Rc};
+ 
+ use gpui::{
+     Capslock, ClipboardEntry, ClipboardItem, ClipboardString, DispatchEventResult, GestureTuning,
+@@ -156,18 +156,24 @@ impl WebWindowInner {
+             self.register_context_menu(),
+             self.register_dragover(),
+             self.register_drop(),
+-            self.register_key_down(),
+-            self.register_key_up(),
+-            self.register_before_input(),
+-            self.register_input(),
+-            self.register_paste(),
+-            self.register_composition_start(),
+-            self.register_composition_update(),
+-            self.register_composition_end(),
+-            self.register_focus(),
+-            self.register_blur(),
+-            self.register_pointer_enter(),
+         ];
++        // The input path takes one set of listeners per conduit: input, key,
++        // composition and focus events fire on the focused element and do not
++        // travel to a sibling, so a set that stayed on the textarea would
++        // leave a live search field typing into nobody. The painted path has
++        // one element in this list and so registers exactly the listeners it
++        // registered before.
++        handles.extend(self.register_key_down());
++        handles.extend(self.register_key_up());
++        handles.extend(self.register_before_input());
++        handles.extend(self.register_input());
++        handles.extend(self.register_paste());
++        handles.extend(self.register_composition_start());
++        handles.extend(self.register_composition_update());
++        handles.extend(self.register_composition_end());
++        handles.extend(self.register_focus());
++        handles.extend(self.register_blur());
++        handles.push(self.register_pointer_enter());
+         handles.extend(self.register_selection_change());
+         handles.extend(self.register_visibility_change());
+         handles.extend(self.register_appearance_change());
+@@ -184,12 +190,33 @@ impl WebWindowInner {
+         EventListenerHandle::add(self.canvas.as_ref(), event_name, handler)
+     }
+ 
++    /// Register one input-path listener, on every element that path may be
++    /// driven from.
++    ///
++    /// The event fires on whichever element holds focus, so the handler has to
++    /// be listening there before it does. One closure per element, because a
++    /// DOM listener owns its closure: sharing one would mean routing every
++    /// event through a borrow to get at it, for elements that are never both
++    /// focused at once.
+     fn listen_input(
+         self: &Rc<Self>,
+         event_name: &'static str,
+         handler: impl FnMut(JsValue) + 'static,
+-    ) -> EventListenerHandle {
+-        EventListenerHandle::add(self.ime_mirror.event_target(), event_name, handler)
++    ) -> Vec<EventListenerHandle> {
++        let targets = self.ime_mirror.event_targets();
++        if let [target] = targets.as_slice() {
++            return vec![EventListenerHandle::add(target, event_name, handler)];
++        }
++        let handler = Rc::new(RefCell::new(handler));
++        targets
++            .into_iter()
++            .map(|target| {
++                let handler = Rc::clone(&handler);
++                EventListenerHandle::add(&target, event_name, move |event: JsValue| {
++                    (handler.borrow_mut())(event)
++                })
++            })
++            .collect()
+     }
+ 
+     fn listen_non_passive(
+@@ -734,7 +761,7 @@ impl WebWindowInner {
+         })
+     }
+ 
+-    fn register_key_down(self: &Rc<Self>) -> EventListenerHandle {
++    fn register_key_down(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+         let this = Rc::clone(self);
+         self.listen_input("keydown", move |event: JsValue| {
+             let event: web_sys::KeyboardEvent = event.unchecked_into();
+@@ -799,7 +826,7 @@ impl WebWindowInner {
+         })
+     }
+ 
+-    fn register_key_up(self: &Rc<Self>) -> EventListenerHandle {
++    fn register_key_up(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+         let this = Rc::clone(self);
+         self.listen_input("keyup", move |event: JsValue| {
+             let event: web_sys::KeyboardEvent = event.unchecked_into();
+@@ -857,7 +884,7 @@ impl WebWindowInner {
+     /// synchronous callback — the editor resolves its selection through
+     /// anchors, so the freshly-fetched offsets are exact, and nothing can
+     /// run between the query and the edit below.
+-    fn register_input(self: &Rc<Self>) -> EventListenerHandle {
++    fn register_input(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+         let this = Rc::clone(self);
+         self.listen_input("input", move |event: JsValue| {
+             let event: web_sys::InputEvent = event.unchecked_into();
+@@ -899,6 +926,23 @@ impl WebWindowInner {
+             }
+ 
+             this.ime_mirror.adopt_element_state();
++
++            // SPEC-THEOREMWEB-PWA-HTML-CANVAS-1.1 section 58 tracks
++            // "HTML-native editor input latency" as its own row. This is that
++            // number: the browser stamps `timeStamp` on the same timeline
++            // `performance.now()` reads, so the difference is the whole of
++            // what the product spent between the browser having the input and
++            // the editor holding it -- the mirror read, the edit computation,
++            // the replacement, and the write back.
++            //
++            // Sampled here rather than at the listener's first line because an
++            // early return is not an applied input, and a number that counted
++            // them would report the cost of deciding to do nothing.
++            if let Some(performance) = web_sys::window().and_then(|window| window.performance()) {
++                crate::native_element::record_input_latency(
++                    performance.now() - event.time_stamp(),
++                );
++            }
+         })
+     }
+ 
+@@ -987,7 +1031,7 @@ impl WebWindowInner {
+     /// by `register_input`. Desktop keystrokes never reach this handler,
+     /// because `register_key_down` calls `preventDefault()` for every
+     /// keystroke it inserts, which cancels the corresponding `beforeinput`.
+-    fn register_before_input(self: &Rc<Self>) -> EventListenerHandle {
++    fn register_before_input(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+         let this = Rc::clone(self);
+         self.listen_input("beforeinput", move |event: JsValue| {
+             let event: web_sys::InputEvent = event.unchecked_into();
+@@ -1027,7 +1071,7 @@ impl WebWindowInner {
+     /// pastes containing images are delivered once those reads resolve — to
+     /// whichever input handler is focused at that point, matching how an
+     /// application-level paste action would behave.
+-    fn register_paste(self: &Rc<Self>) -> EventListenerHandle {
++    fn register_paste(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+         let this = Rc::clone(self);
+         self.listen_input("paste", move |event: JsValue| {
+             let event: web_sys::ClipboardEvent = event.unchecked_into();
+@@ -1102,14 +1146,14 @@ impl WebWindowInner {
+         })
+     }
+ 
+-    fn register_composition_start(self: &Rc<Self>) -> EventListenerHandle {
++    fn register_composition_start(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+         let this = Rc::clone(self);
+         self.listen_input("compositionstart", move |_event: JsValue| {
+             this.is_composing.set(true);
+         })
+     }
+ 
+-    fn register_composition_update(self: &Rc<Self>) -> EventListenerHandle {
++    fn register_composition_update(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+         let this = Rc::clone(self);
+         self.listen_input("compositionupdate", move |event: JsValue| {
+             let event: web_sys::CompositionEvent = event.unchecked_into();
+@@ -1121,7 +1165,7 @@ impl WebWindowInner {
+         })
+     }
+ 
+-    fn register_composition_end(self: &Rc<Self>) -> EventListenerHandle {
++    fn register_composition_end(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+         let this = Rc::clone(self);
+         self.listen_input("compositionend", move |event: JsValue| {
+             let event: web_sys::CompositionEvent = event.unchecked_into();
+@@ -1148,7 +1192,7 @@ impl WebWindowInner {
+         })
+     }
+ 
+-    fn register_focus(self: &Rc<Self>) -> EventListenerHandle {
++    fn register_focus(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+         let this = Rc::clone(self);
+         self.listen_input("focus", move |_event: JsValue| {
+             if this.suppress_focus_status_events.get() {
+@@ -1165,7 +1209,7 @@ impl WebWindowInner {
+         })
+     }
+ 
+-    fn register_blur(self: &Rc<Self>) -> EventListenerHandle {
++    fn register_blur(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+         let this = Rc::clone(self);
+         self.listen_input("blur", move |_event: JsValue| {
+             if this.suppress_focus_status_events.get() {
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index 45e7aef..e1baae3 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -1,26 +1,69 @@
+-//! The hidden `<textarea>` that connects browser IMEs to GPUI.
++//! The editable conduits that connect browser IMEs to GPUI.
+ //!
+ //! IMEs (software keyboards, composition engines) decide what backspace,
+ //! autocorrect, and suggestions mean by inspecting the focused editable
+-//! element's value and selection. This module owns that element and keeps a
+-//! window of the document's text mirrored into it, so IME edits arrive as
+-//! interpretable events instead of operations against an empty field.
++//! element's value and selection. This module owns that element -- the
++//! *conduit* -- and keeps a window of the document's text mirrored into it, so
++//! IME edits arrive as interpretable events instead of operations against an
++//! empty field.
+ //!
+ //! The element's value and selection are only ever written by [`sync`],
+ //! reached through [`ImeMirror::schedule_sync`]: every write is observed by
+ //! the IME and makes the browser restart the IME's input connection, so
+ //! writes must be coalesced to at most one per browser event-loop turn,
+ //! landing only after the current gesture's events have all dispatched.
+-//! Keeping the element and its write path private to this module makes that
+-//! discipline a compile-time guarantee rather than a convention.
++//! Keeping the elements and their write paths private to this module makes
++//! that discipline a compile-time guarantee rather than a convention.
++//!
++//! # One conduit per realized editable capability
++//!
++//! Section 11 divides an editable leaf: GPUI keeps identity, layout, focus,
++//! state, visibility and lifecycle, and the browser owns IME, caret,
++//! selection, autocorrect, spellcheck, the virtual keyboard, browser text
++//! semantics and native accessibility semantics. Every one of those
++//! browser-owned properties is a property of *the focused element*. A caret is
++//! not drawn in an element that does not hold focus, IME is routed only to the
++//! focused element, and assistive technology follows focus too. So the element
++//! that carries them and the element the layer draws have to be the same
++//! element, and it has to be the element the capability names.
++//!
++//! That is why this module holds several elements and exactly one live one.
++//! The `<textarea>` is section 11's multiline editable leaf, and it is a
++//! textarea on purpose: a single-line input silently strips line breaks from
++//! an assigned value, which would make the mirror text disagree with what was
++//! written into it and desynchronize the diff that imports an IME edit. A
++//! single-line capability therefore cannot share that element -- a textarea
++//! wrapping free is the wrong control for a leaf the platform must not wrap,
++//! and its browser text semantics, which are the role a reader hears, what
++//! Enter does and whether a search field offers search affordances, are the
++//! wrong ones -- and it cannot be a second element beside the mirror either:
++//! the unfocused one would carry no caret, and section 15's "a screen reader
++//! must encounter the control exactly once" would meet two controls, the
++//! focused one of the wrong kind.
++//!
++//! The conduit is typed by the capability of the focused editable leaf, and
++//! all of them are driven through one discipline: the multiline leaf on the
++//! textarea, `EditableText` and `SearchField` on `input[type=text]` and
++//! `input[type=search]`. The capability is read from the role the leaf
++//! publishes for itself into the accessibility tree, which is the same fact
++//! one step later: that role is what the accessibility mirror would project
++//! for the node, and section 15 requires the real element to *be* that
++//! projection rather than a second one beside it. [`ImeMirror::capability_in_force`]
++//! holds the policy, and the gate in [`crate::native_element`] governs it: a
++//! conduit is only ever used for a capability this window answers for.
++//!
++//! The single-line conduits exist only where the window is browser-native. On
++//! the painted path this module builds one conduit, the invisible textarea
++//! this platform has always used, and never a second element: section 19's
++//! fallback is a path rather than a branch of this one.
+ 
+ use std::cell::{Cell, RefCell};
+ use std::rc::Rc;
+ 
+-use gpui::{Autocapitalize, TextInputAction, TextInputConfiguration};
++use gpui::{Autocapitalize, PlatformNativeElement, TextInputAction, TextInputConfiguration};
+ use wasm_bindgen::JsCast;
+ 
+-use crate::native_element::{ElementLayer, Realization};
++use crate::native_element::{ElementLayer, NativeElements};
+ use crate::window::{IME_INPUT_ELEMENT_ID, WebWindowInner};
+ 
+ /// UTF-16 code units of document text mirrored on each side of the
+@@ -48,26 +91,199 @@ const CONTEXT_CHARS: usize = 512;
+ /// element write and therefore an IME restart.
+ const MIN_EDGE_CHARS: usize = 64;
+ 
+-/// The hidden `<textarea>` IMEs edit, plus the bookkeeping that relates it
+-/// to the document.
++/// What the browser would draw of a native conduit *except* the caret and the
++/// selection.
++///
++/// Section 11 gives the browser caret, selection, IME, autocorrect, spellcheck
++/// and the virtual keyboard, and gives GPUI the text. `color: transparent` is
++/// the load-bearing entry: it suppresses the platform's duplicate glyphs while
++/// leaving the selection highlight, which paints behind text, and the caret,
++/// whose color is a separate property. The element stays a real, focused,
++/// hit-testable control throughout, so nothing about IME changes.
++const NATIVE_STYLE: [(&str, &str); 8] = [
++    ("background", "transparent"),
++    ("border", "none"),
++    ("outline", "none"),
++    ("padding", "0"),
++    ("margin", "0"),
++    ("resize", "none"),
++    ("overflow", "hidden"),
++    ("color", "transparent"),
++];
++
++/// The document id of the element realizing `capability`.
++///
++/// One id per capability rather than one for the family, because an oracle has
++/// to be able to say which element is live, and because two elements sharing
++/// an id would make `getElementById` answer whichever came first in the tree.
++/// The multiline leaf keeps [`IME_INPUT_ELEMENT_ID`], which is the id this
++/// platform has always published for it.
++const fn conduit_element_id(capability: PlatformNativeElement) -> &'static str {
++    match capability {
++        PlatformNativeElement::EditableText => "gpui-ime-input-text",
++        PlatformNativeElement::SearchField => "gpui-ime-input-search",
++        _ => IME_INPUT_ELEMENT_ID,
++    }
++}
++
++/// The `type` a single-line conduit's element carries, or `None` for the
++/// multiline leaf, which is not an input at all.
++const fn conduit_input_type(capability: PlatformNativeElement) -> Option<&'static str> {
++    match capability {
++        PlatformNativeElement::EditableText => Some("text"),
++        PlatformNativeElement::SearchField => Some("search"),
++        _ => None,
++    }
++}
++
++/// The element behind a conduit, with the operations the mirror needs of it.
++///
++/// The two kinds differ in exactly one thing that matters here: whether the
++/// browser may change a value on the way in. Everything else -- value,
++/// selection, read-only, focus -- is the same protocol on both.
++enum ConduitElement {
++    /// The multiline editable leaf: free to hold any window of the document,
++    /// line breaks included.
++    TextArea(web_sys::HtmlTextAreaElement),
++    /// A single-line capability: an input, whose value sanitization strips
++    /// line breaks from an assigned value.
++    Input(web_sys::HtmlInputElement),
++}
++
++impl ConduitElement {
++    fn as_element(&self) -> &web_sys::HtmlElement {
++        let element: &web_sys::HtmlElement = match self {
++            Self::TextArea(element) => element.as_ref(),
++            Self::Input(element) => element.as_ref(),
++        };
++        element
++    }
++
++    fn value(&self) -> String {
++        match self {
++            Self::TextArea(element) => element.value(),
++            Self::Input(element) => element.value(),
++        }
++    }
++
++    fn set_value(&self, value: &str) {
++        match self {
++            Self::TextArea(element) => element.set_value(value),
++            Self::Input(element) => element.set_value(value),
++        }
++    }
++
++    fn selection_start(&self) -> Option<u32> {
++        match self {
++            Self::TextArea(element) => element.selection_start().ok().flatten(),
++            Self::Input(element) => element.selection_start().ok().flatten(),
++        }
++    }
++
++    fn selection_end(&self) -> Option<u32> {
++        match self {
++            Self::TextArea(element) => element.selection_end().ok().flatten(),
++            Self::Input(element) => element.selection_end().ok().flatten(),
++        }
++    }
++
++    fn set_selection_range(&self, start: u32, end: u32) {
++        match self {
++            Self::TextArea(element) => element.set_selection_range(start, end).ok(),
++            Self::Input(element) => element.set_selection_range(start, end).ok(),
++        };
++    }
++
++    fn read_only(&self) -> bool {
++        match self {
++            Self::TextArea(element) => element.read_only(),
++            Self::Input(element) => element.read_only(),
++        }
++    }
++
++    fn set_read_only(&self, read_only: bool) {
++        match self {
++            Self::TextArea(element) => element.set_read_only(read_only),
++            Self::Input(element) => element.set_read_only(read_only),
++        }
++    }
++
++    /// Whether this element can hold `text` exactly as written.
++    ///
++    /// The single-line answer is the reason this module holds more than one
++    /// element and the reason a write is checked before it happens: an input
++    /// strips line breaks from an assigned value *silently*, so an unchecked
++    /// write would leave the element holding text the mirror believes it
++    /// wrote, and every later diff -- which is how an IME edit becomes a
++    /// document edit -- would be computed against text that is not there.
++    fn holds(&self, text: &str) -> bool {
++        match self {
++            Self::TextArea(_) => true,
++            Self::Input(_) => !text.contains(['\n', '\r']),
++        }
++    }
++}
++
++/// One element the platform may drive for the focused editable leaf.
++struct Conduit {
++    /// The capability this element realizes, and so the only capability it
++    /// may serve.
++    capability: PlatformNativeElement,
++    element: ConduitElement,
++}
++
++impl Conduit {
++    fn as_element(&self) -> &web_sys::HtmlElement {
++        self.element.as_element()
++    }
++}
++
++/// The elements IMEs edit, plus the bookkeeping that relates the live one to
++/// the document.
+ ///
+-/// The element and every value/selection write on it are private to this
+-/// module; other code interacts through read accessors, focus and
+-/// read-only control, and [`ImeMirror::schedule_sync`].
++/// The elements and every value/selection write on them are private to this
++/// module; other code interacts through read accessors, focus and read-only
++/// control, and [`ImeMirror::schedule_sync`].
+ pub(crate) struct ImeMirror {
+-    element: web_sys::HtmlTextAreaElement,
+-    /// The layer that draws this element, on the browser-native path only.
++    /// Every element this window may drive for the focused editable leaf, the
++    /// textarea first. Exactly one of them is live: the one whose capability
++    /// the focused leaf declares and this window answers for.
++    ///
++    /// On the painted path this holds the textarea alone.
++    conduits: Vec<Conduit>,
++    /// The capability whose conduit is live -- in the document, focused,
++    /// drawn and claimed. Starts at the multiline leaf, which is what this
++    /// platform drives until a leaf declares otherwise.
++    live: Cell<PlatformNativeElement>,
++    /// The live conduit's element, shared with the accessibility adapter so
++    /// that a conduit switch moves the claim with the focus instead of
++    /// leaving it on an element that is no longer the control.
++    live_element: Rc<RefCell<web_sys::HtmlElement>>,
++    /// The capability the focused node publishes for itself, written by the
++    /// accessibility adapter on every frame that carries the tree.
++    ///
++    /// A cell rather than a query, because the tree arrives on its own
++    /// schedule and the conduit settles when bounds or a sync arrive. A stale
++    /// value can only be the previous frame's answer, and the next settle
++    /// corrects it.
++    declared: Rc<Cell<PlatformNativeElement>>,
++    /// The last configuration the application forwarded, so a conduit that
++    /// becomes live after it arrives carries the focused leaf's text
++    /// assistance rather than the defaults.
++    configuration: RefCell<TextInputConfiguration>,
++    /// Set once, the first time a fetched window has to be narrowed to the
++    /// caret's line because the live conduit cannot hold a line break, so a
++    /// leaf that hands multiline text to a single-line capability is reported
++    /// once instead of on every sync.
++    refused_line_break: Cell<bool>,
++    /// The layer that draws these elements, on the browser-native path only.
+     /// Holding it here is what lets a move publish a repaint: the browser has
+     /// no reason to redraw a canvas because a descendant's style changed.
+     layer: Option<Rc<ElementLayer>>,
+-    /// Which implementation this leaf got, decided once at window creation.
+-    ///
+-    /// The two paths differ in exactly two places -- where the element is
+-    /// parented and what size it is given -- and in nothing else. Every
+-    /// value, selection, IME and configuration path below is shared, which is
+-    /// what makes section 19's "the draft format is identical" true by
+-    /// construction rather than by a second implementation that agrees.
+-    realization: Realization,
++    /// What this window can realize. The gate holds a conduit back from a
++    /// capability the platform does not answer for, so a switch can never
++    /// move the input path onto an element the platform has not built.
++    native_elements: NativeElements,
+     /// The editable leaf's last published bounds in CSS pixels, for section
+     /// 51's geometry oracle. Held here rather than recomputed from the
+     /// element's style, because what the oracle must check is that the
+@@ -115,11 +331,14 @@ impl ImeMirror {
+         document: &web_sys::Document,
+         body: &web_sys::HtmlElement,
+         layer: Option<Rc<ElementLayer>>,
+-        realization: Realization,
++        native_elements: NativeElements,
+     ) -> anyhow::Result<Self> {
+         // A textarea rather than an input: single-line inputs silently strip
+         // newlines from assigned values, which would make the mirror text
+-        // disagree with what was written into it.
++        // disagree with what was written into it. The single-line capabilities
++        // get elements of their own for that reason, and only where this
++        // window is browser-native; see this module's header for which node
++        // the browser draws and which one carries the IME.
+         let element: web_sys::HtmlTextAreaElement = document
+             .create_element("textarea")
+             .map_err(|e| anyhow::anyhow!("Failed to create textarea element: {e:?}"))?
+@@ -148,22 +367,10 @@ impl ImeMirror {
+             // path those are drawn over the scene GPUI just painted.
+             //
+             // So everything the browser would draw *except* the caret and the
+-            // selection is turned off. `color: transparent` is the load-
+-            // bearing one: it suppresses the duplicate glyphs while leaving
+-            // the selection highlight, which paints behind text, and the
+-            // caret, whose color is a separate property. The element stays a
+-            // real, focused, hit-testable textarea throughout, so nothing
+-            // about IME changes.
+-            for (name, value) in [
+-                ("background", "transparent"),
+-                ("border", "none"),
+-                ("outline", "none"),
+-                ("padding", "0"),
+-                ("margin", "0"),
+-                ("resize", "none"),
+-                ("overflow", "hidden"),
+-                ("color", "transparent"),
+-            ] {
++            // selection is turned off; [`NATIVE_STYLE`] is that list and says
++            // which entry is load-bearing. The element stays a real, focused,
++            // hit-testable textarea throughout, so nothing about IME changes.
++            for (name, value) in NATIVE_STYLE {
+                 style.set_property(name, value).ok();
+             }
+             // Into the element layer, not into the canvas wgpu owns. A
+@@ -193,10 +400,43 @@ impl ImeMirror {
+             element.set_read_only(true);
+         }
+ 
++        let mut conduits = vec![Conduit {
++            capability: PlatformNativeElement::EditableLeaf,
++            element: ConduitElement::TextArea(element),
++        }];
++        // The single-line conduits are built where this window is
++        // browser-native, and built here rather than on first use, because the
++        // events module attaches one set of listeners per conduit when the
++        // window is created: an element that appeared later would be an
++        // element whose input, composition and key events reach nobody. Each
++        // is adopted and then hidden, which is what keeps it out of the
++        // document's accessibility tree and out of the layer's draws until it
++        // is the live one.
++        //
++        // The gate decides whether the element exists at all, so
++        // `NativeElements::realizes` answering `false` and this element not
++        // being here are the same statement rather than two that agree.
++        if let Some(layer) = layer.as_deref() {
++            for capability in [
++                PlatformNativeElement::EditableText,
++                PlatformNativeElement::SearchField,
++            ] {
++                if !native_elements.realizes(capability) {
++                    continue;
++                }
++                conduits.push(Self::single_line(document, layer, capability)?);
++            }
++        }
++        let live_element = Rc::new(RefCell::new(conduits[0].as_element().clone()));
+         let this = Self {
+-            element,
++            conduits,
++            live: Cell::new(PlatformNativeElement::EditableLeaf),
++            live_element,
++            declared: Rc::new(Cell::new(PlatformNativeElement::None)),
++            configuration: RefCell::new(TextInputConfiguration::default()),
++            refused_line_break: Cell::new(false),
+             layer,
+-            realization,
++            native_elements,
+             published_bounds: Cell::new(None),
+             text: RefCell::new(String::new()),
+             selection: Cell::new((0, 0)),
+@@ -211,13 +451,74 @@ impl ImeMirror {
+         Ok(this)
+     }
+ 
+-    /// Maps a [`TextInputConfiguration`] onto the element's text-assistance
+-    /// attributes. Callers must only invoke this on actual configuration
+-    /// changes (GPUI diffs before forwarding): mutating the focused element
+-    /// can restart the IME's input connection.
++    /// Build one single-line conduit and adopt it into the layer, hidden.
++    ///
++    /// The element is the capability's own: section 11's single-line editable
++    /// text is `input[type=text]` and its search field is
++    /// `input[type=search]`. An element of the wrong kind is the wrong browser
++    /// text semantics even when its caret works, and that is the half a reader
++    /// and a software keyboard both notice.
++    fn single_line(
++        document: &web_sys::Document,
++        layer: &ElementLayer,
++        capability: PlatformNativeElement,
++    ) -> anyhow::Result<Conduit> {
++        let element: web_sys::HtmlInputElement = document
++            .create_element("input")
++            .map_err(|e| anyhow::anyhow!("Failed to create an input element: {e:?}"))?
++            .dyn_into()
++            .map_err(|e| anyhow::anyhow!("Created element is not an input: {e:?}"))?;
++        element.set_id(conduit_element_id(capability));
++        // The attribute rather than the IDL property, and set before the
++        // element is in the document, so the browser builds the input the
++        // capability names rather than re-typing one it already made.
++        if let Some(input_type) = conduit_input_type(capability) {
++            element.set_attribute("type", input_type).ok();
++        }
++        let style = element.style();
++        // The same placement the textarea gets, and for the same reason: both
++        // paths place the element in viewport coordinates, so one
++        // `update_position` can serve every conduit. The size here is
++        // provisional -- the element is hidden until a leaf publishes bounds,
++        // and those bounds are what it is given.
++        style.set_property("position", "fixed").ok();
++        style.set_property("top", "0").ok();
++        style.set_property("left", "0").ok();
++        style.set_property("width", "1px").ok();
++        style.set_property("height", "1px").ok();
++        style.set_property("font-size", "16px").ok();
++        for (name, value) in NATIVE_STYLE {
++            style.set_property(name, value).ok();
++        }
++        layer.adopt(element.as_ref());
++        layer.set_visible(element.as_ref(), false);
++        let conduit = Conduit {
++            capability,
++            element: ConduitElement::Input(element),
++        };
++        Ok(conduit)
++    }
++
++    /// Maps a [`TextInputConfiguration`] onto the live conduit's
++    /// text-assistance attributes, and remembers it for whichever conduit
++    /// becomes live next. Callers must only invoke this on actual
++    /// configuration changes (GPUI diffs before forwarding): mutating the
++    /// focused element can restart the IME's input connection.
+     pub(crate) fn apply_configuration(&self, configuration: &TextInputConfiguration) {
+-        let element: &web_sys::Element = self.element.as_ref();
+-        self.element.set_spellcheck(configuration.suggestions);
++        *self.configuration.borrow_mut() = configuration.clone();
++        self.apply_configuration_to(&self.live_conduit(), configuration);
++    }
++
++    /// The same, for one named conduit.
++    ///
++    /// A conduit that becomes live mid-session is given the last
++    /// configuration, because GPUI forwards one only when it changes and the
++    /// leaf that is now focused may well want what the leaf before it wanted.
++    fn apply_configuration_to(&self, conduit: &Conduit, configuration: &TextInputConfiguration) {
++        let element: &web_sys::Element = conduit.as_element().as_ref();
++        conduit
++            .as_element()
++            .set_spellcheck(configuration.suggestions);
+         let on_off = |enabled: bool| if enabled { "on" } else { "off" };
+         element
+             .set_attribute("autocomplete", on_off(configuration.suggestions))
+@@ -252,58 +553,121 @@ impl ImeMirror {
+         };
+     }
+ 
+-    /// Give the accessibility adapter attribute access without exposing the
+-    /// textarea's value or selection APIs outside this module.
+-    pub(crate) fn accessibility_element(&self) -> web_sys::HtmlElement {
+-        self.element.clone().unchecked_into()
++    /// The element a reader should meet for the focused node, and the cell
++    /// that moves with it when the conduit switches.
++    ///
++    /// The accessibility adapter holds this rather than an element, because
++    /// the element that is the node's realization is whichever conduit is
++    /// live, and section 15's "the control exactly once" is a claim about that
++    /// one: a claim left behind on the textarea while a search input is the
++    /// control would leave the reader with a focused multiline box and an
++    /// unfocused search field for one node.
++    pub(crate) fn accessibility_element_handle(&self) -> Rc<RefCell<web_sys::HtmlElement>> {
++        Rc::clone(&self.live_element)
++    }
++
++    /// The cell the accessibility adapter publishes the focused node's
++    /// capability into.
++    ///
++    /// It is the adapter that reads it, because the role AGPUI gives a node is
++    /// what the adapter already claims the node on; giving the mirror the same
++    /// fact keeps the element and the claim from being two answers to one
++    /// question.
++    pub(crate) fn declared_capability_handle(&self) -> Rc<Cell<PlatformNativeElement>> {
++        Rc::clone(&self.declared)
+     }
+ 
+     /// Browser caret bounds use CSS pixels, matching GPUI's logical coordinates.
+     ///
+     /// Section 16 makes GPUI the layout authority on both paths, so both take
+     /// the bounds GPUI prepainted and neither lets the browser decide where
+-    /// the control sits. They differ only in width, and for a reason: a
+-    /// painted mirror is one pixel wide because a wider invisible textarea
+-    /// would swallow pointer events over the control GPUI drew, while a
++    /// the control sits. They differ in width, and for a reason: a painted
++    /// mirror is one pixel wide because a wider invisible textarea would
++    /// swallow pointer events over the control GPUI drew, while a
+     /// browser-native element must occupy the control's real box or the
+     /// browser lays out its text, hit-tests its caret and reports its
+     /// accessibility geometry against the wrong rectangle.
+-    pub(crate) fn update_position(&self, bounds: gpui::Bounds<gpui::Pixels>) {
++    ///
++    /// They also differ in *how* they move, and that is the whole difficulty
++    /// of the native path. `layoutsubtree` gives the canvas layout authority
++    /// over its descendants, and it exercises it: measured against Chrome
++    /// 153.0.8010.12, a child of such a canvas ignores `left` and `top` under
++    /// `fixed`, `absolute` and `relative` alike, and ignores `margin` too. It
++    /// honours `width` and `height`, and every child lands on the canvas's
++    /// origin stacked on the last.
++    ///
++    /// A transform is applied after layout, so it is the one channel the
++    /// canvas does not consume. `transform: translate(x, y)` moves the
++    /// element, `getBoundingClientRect` reports the moved box, and
++    /// `elementFromPoint` and a real click both land on it there. So the
++    /// native path translates and the painted path offsets, and section 16
++    /// holds on both.
++    /// Settle the conduit the bounds belong to, then give it the bounds.
++    ///
++    /// The capability in force can change with the focus, and a bound
++    /// published for one capability is a bound for the element that serves it.
++    /// Settling first means the element about to be placed is the one that
++    /// will hold focus, be drawn, and be claimed for the focused node.
++    pub(crate) fn update_position(
++        &self,
++        window: &WebWindowInner,
++        bounds: gpui::Bounds<gpui::Pixels>,
++    ) {
++        // A conduit is never swapped mid-composition. The composition belongs
++        // to the element that is holding it, and section 18 forbids anything
++        // here that would destroy it; the next bounds or sync after the
++        // composition ends settles whatever was pending.
++        if !window.is_composing.get() {
++            self.settle_conduit(window);
++        }
++        let conduit = self.live_conduit();
+         let x = f32::from(bounds.origin.x);
+         let y = f32::from(bounds.origin.y);
+         let width = f32::from(bounds.size.width).max(1.0);
+         let height = f32::from(bounds.size.height).max(1.0);
+-        let style = self.element.style();
++        self.place(conduit, x, y, width, height);
++        self.published_bounds.set(Some([x, y, width, height]));
++        // GPUI prepainted a caret box, so there is a live editable leaf and
++        // it is here. That is both the visibility signal and the repaint
++        // signal: the element moved, so its pixels are in the wrong place
++        // until the layer draws again, and nothing else would ask -- a canvas
++        // is not invalidated by a descendant's layout.
++        if let Some(layer) = self.layer.as_deref() {
++            layer.set_visible(conduit.as_element(), true);
++            layer.request_paint();
++        }
++    }
++
++    /// Write one conduit's box, in the channel the canvas does not consume.
++    fn place(&self, conduit: &Conduit, x: f32, y: f32, width: f32, height: f32) {
++        let style = conduit.as_element().style();
+         let mut properties = vec![
+             ("left", format!("{x}px")),
+             ("top", format!("{y}px")),
+             ("height", format!("{height}px")),
+         ];
+-        if self.realization.is_browser_native() {
++        if self.native_elements.realization().is_browser_native() {
++            // `left` and `top` were still written above, because they cost
++            // nothing and a browser that later lays this subtree out the
++            // ordinary way would then place the element correctly without a
++            // second code path. The transform is what moves it today.
+             properties.push(("width", format!("{width}px")));
++            properties.push(("transform", format!("translate({x}px, {y}px)")));
+         }
+         for (name, value) in properties {
+             if let Err(error) = style.set_property(name, &value) {
+                 log::warn!("Failed to position IME mirror {name}: {error:?}");
+             }
+         }
+-        self.published_bounds.set(Some([x, y, width, height]));
+-        // GPUI prepainted a caret box, so there is a live editable leaf and
+-        // it is here. That is both the visibility signal and the repaint
+-        // signal: the element moved, so its pixels are in the wrong place
+-        // until the layer draws again, and nothing else would ask -- a canvas
+-        // is not invalidated by a descendant's layout.
+-        if let Some(layer) = self.layer.as_deref() {
+-            layer.set_visible(true);
+-            layer.request_paint();
+-        }
+     }
+ 
+     pub(crate) fn reset_position(&self) {
+-        let style = self.element.style();
++        let conduit = self.live_conduit();
++        let style = conduit.as_element().style();
+         let mut properties = vec![("left", "0"), ("top", "0"), ("height", "1px")];
+-        if self.realization.is_browser_native() {
++        if self.native_elements.realization().is_browser_native() {
+             properties.push(("width", "1px"));
++            properties.push(("transform", "none"));
+         }
+         for (name, value) in properties {
+             if let Err(error) = style.set_property(name, value) {
+@@ -316,7 +680,141 @@ impl ImeMirror {
+         // composites above the scene, so an element the renderer had covered
+         // would otherwise still show through whatever GPUI drew over it.
+         if let Some(layer) = self.layer.as_deref() {
+-            layer.set_visible(false);
++            layer.set_visible(conduit.as_element(), false);
++        }
++    }
++
++    /// The capability whose conduit should be live.
++    ///
++    /// The focused leaf's own answer, where this window has the element for
++    /// it, and the multiline leaf otherwise -- which is what this platform
++    /// drove before there was more than one element, so a window whose leaves
++    /// declare nothing keeps the behavior the composer proof was taken on. The
++    /// gate has the last word: a capability this window does not answer for
++    /// never gets an element to be served from, whatever a node declares.
++    fn capability_in_force(&self) -> PlatformNativeElement {
++        let declared = self.declared.get();
++        let declared_is_served = declared != PlatformNativeElement::None
++            && self.native_elements.realizes(declared)
++            && self
++                .conduits
++                .iter()
++                .any(|conduit| conduit.capability == declared);
++        if declared_is_served {
++            declared
++        } else {
++            PlatformNativeElement::EditableLeaf
++        }
++    }
++
++    /// The conduit in the document, focused, drawn and claimed.
++    fn live_conduit(&self) -> &Conduit {
++        let live = self.live.get();
++        self.conduits
++            .iter()
++            .find(|conduit| conduit.capability == live)
++            // The textarea is built unconditionally and is the first conduit,
++            // so this is unreachable; it exists so that the accessors below
++            // cannot fail open on a missing element.
++            .unwrap_or(&self.conduits[0])
++    }
++
++    /// The capability whose element is driving the focused editable leaf.
++    pub(crate) fn live_capability(&self) -> PlatformNativeElement {
++        self.live_conduit().capability
++    }
++
++    /// The document id of the element driving the focused editable leaf, for
++    /// the capability report.
++    ///
++    /// An id rather than the element, because "which element is live" is a
++    /// question an oracle asks from JavaScript, where the answer has to be
++    /// something `getElementById` can be handed. `None` on the painted path,
++    /// which has no element of its own to name.
++    pub(crate) fn live_conduit_id(&self) -> Option<&'static str> {
++        self.native_elements
++            .realization()
++            .is_browser_native()
++            .then(|| conduit_element_id(self.live_capability()))
++    }
++
++    /// Make the live conduit the one the focused leaf calls for, if it is not
++    /// already.
++    ///
++    /// A switch moves DOM focus, the layer's draws and the accessibility claim
++    /// together, because all three belong to whichever element is live. Focus
++    /// moves before the old element is hidden, so the platform's focus is
++    /// never on an element that is going away and never on the document body:
++    /// the browser sends the next key to whatever holds focus, and the keydown
++    /// path this platform lives by is a listener on the conduit. The move is
++    /// bracketed as a suppressed focus change, because a conduit swap is not
++    /// the window becoming inactive.
++    fn settle_conduit(&self, window: &WebWindowInner) {
++        let wanted = self.capability_in_force();
++        let live = self.live.get();
++        if wanted == live {
++            return;
++        }
++        let Some(next) = self
++            .conduits
++            .iter()
++            .find(|conduit| conduit.capability == wanted)
++        else {
++            return;
++        };
++        let previous = self
++            .conduits
++            .iter()
++            .find(|conduit| conduit.capability == live);
++        window.suppress_focus_status_events.set(true);
++        // Focus first, and stop here if it does not take. Everything below
++        // assumes the browser is delivering input to the element that becomes
++        // live -- that is the whole reason the conduits share a node with
++        // their IME -- and a switch that moved the claim while leaving focus
++        // behind would draw and claim an element that no keystroke reaches.
++        // The old conduit stays live and the next settle tries again.
++        if next.as_element().focus().is_err() {
++            window.suppress_focus_status_events.set(false);
++            return;
++        }
++        if let Some(previous) = previous {
++            // Blur cannot fail in a way that matters here: the element is
++            // losing focus either way, and the switch is already committed to
++            // the new one.
++            let _ = previous.as_element().blur();
++            if let Some(layer) = self.layer.as_deref() {
++                layer.set_visible(previous.as_element(), false);
++            }
++        }
++        window.suppress_focus_status_events.set(false);
++        if let Some(layer) = self.layer.as_deref() {
++            layer.set_visible(next.as_element(), true);
++        }
++        // The new element holds none of the document yet. Until the next sync
++        // writes a window into it, every diff and every test of whether the
++        // element is still an accurate mirror would be answered against text
++        // that belongs to the element that just left, so the bookkeeping is
++        // reset and the next write is a rebuild.
++        self.text.borrow_mut().clear();
++        self.selection.set((0, 0));
++        self.window_hint.set(0);
++        // The attributes the focused leaf's configuration names have to arrive
++        // with the element, since GPUI forwards a configuration only when it
++        // changes and the leaf before this one may have been the one that
++        // forwarded it.
++        let configuration = self.configuration.borrow().clone();
++        self.apply_configuration_to(next, &configuration);
++        self.live_element.replace(next.as_element().clone());
++        self.live.set(wanted);
++        // Section 16: the geometry GPUI published is the geometry this element
++        // has, so the element that becomes live takes the bounds that were
++        // published for the leaf it serves rather than waiting for the next
++        // frame to say so.
++        if let Some([x, y, width, height]) = self.published_bounds.get() {
++            self.place(next, x, y, width, height);
++        }
++        if let Some(layer) = self.layer.as_deref() {
++            layer.request_paint();
+         }
+     }
+ 
+@@ -325,20 +823,28 @@ impl ImeMirror {
+         self.published_bounds.get()
+     }
+ 
+-    pub(crate) const fn realization(&self) -> Realization {
+-        self.realization
+-    }
+-
+-    pub(crate) fn event_target(&self) -> &web_sys::EventTarget {
+-        self.element.as_ref()
++    /// Every element whose events belong to the platform's input path.
++    ///
++    /// The events module registers one set of listeners per conduit, because
++    /// input, key and composition events fire on the focused element and do
++    /// not travel to a sibling: a listener set that stayed on the textarea
++    /// would leave a live search input typing into nothing.
++    pub(crate) fn event_targets(&self) -> Vec<web_sys::EventTarget> {
++        self.conduits
++            .iter()
++            .map(|conduit| {
++                let target: &web_sys::EventTarget = conduit.as_element().as_ref();
++                target.clone()
++            })
++            .collect()
+     }
+ 
+     pub(crate) fn focus(&self) {
+-        self.element.focus().ok();
++        self.live_conduit().as_element().focus().ok();
+     }
+ 
+     pub(crate) fn is_focused(&self) -> bool {
+-        let element: &web_sys::Element = self.element.as_ref();
++        let element: &web_sys::Element = self.live_conduit().as_element().as_ref();
+         web_sys::window()
+             .and_then(|window| window.document())
+             .and_then(|document| document.active_element())
+@@ -346,32 +852,39 @@ impl ImeMirror {
+     }
+ 
+     pub(crate) fn blur(&self) {
+-        self.element.blur().ok();
++        self.live_conduit().as_element().blur().ok();
+     }
+ 
+     pub(crate) fn read_only(&self) -> bool {
+-        self.element.read_only()
++        self.live_conduit().element.read_only()
+     }
+ 
+     pub(crate) fn set_read_only(&self, read_only: bool) {
+-        self.element.set_read_only(read_only);
++        self.live_conduit().element.set_read_only(read_only);
+     }
+ 
+     pub(crate) fn remove(&self) {
+-        let element: &web_sys::Element = self.element.as_ref();
+-        element.remove();
++        // Told to the layer before the elements go: a layer still holding a
++        // detached element would draw it at the origin on the next paint.
++        for conduit in &self.conduits {
++            if let Some(layer) = self.layer.as_deref() {
++                layer.forget(conduit.as_element());
++            }
++            let element: &web_sys::Element = conduit.as_element().as_ref();
++            element.remove();
++        }
+     }
+ 
+     pub(crate) fn value(&self) -> String {
+-        self.element.value()
++        self.live_conduit().element.value()
+     }
+ 
+     pub(crate) fn selection_start(&self) -> Option<u32> {
+-        self.element.selection_start().ok().flatten()
++        self.live_conduit().element.selection_start()
+     }
+ 
+     pub(crate) fn element_selection_end(&self) -> Option<u32> {
+-        self.element.selection_end().ok().flatten()
++        self.live_conduit().element.selection_end()
+     }
+ 
+     pub(crate) fn stored_text(&self) -> String {
+@@ -388,14 +901,10 @@ impl ImeMirror {
+     /// the element is already what the IME expects, and echoing a write
+     /// back would restart the IME mid-gesture.
+     pub(crate) fn adopt_element_state(&self) {
+-        *self.text.borrow_mut() = self.element.value();
++        let conduit = self.live_conduit();
++        *self.text.borrow_mut() = conduit.element.value();
+         let selection_start = self.selection_start().unwrap_or(0);
+-        let selection_end = self
+-            .element
+-            .selection_end()
+-            .ok()
+-            .flatten()
+-            .unwrap_or(selection_start);
++        let selection_end = conduit.element.selection_end().unwrap_or(selection_start);
+         self.selection.set((selection_start, selection_end));
+     }
+ 
+@@ -406,6 +915,49 @@ impl ImeMirror {
+         self.selection_import_rejected.set(true);
+     }
+ 
++    /// The window of the document to mirror, fitted to what the live
++    /// conduit can actually hold.
++    ///
++    /// A single-line control holds one line and strips anything else from an
++    /// assigned value *silently*. Writing a window that spans a line break
++    /// would therefore leave the element holding text this module believes it
++    /// wrote, and every later diff -- which is how an IME edit becomes a
++    /// document edit -- would be computed against text that is not in the
++    /// element. The damage is not a stale mirror: the missing text reads as a
++    /// deletion, so the next keystroke would delete a line of the document
++    /// the user never touched. So the window becomes the line the caret is
++    /// on, which is the most a native field of that kind ever mirrors.
++    ///
++    /// For the single-line capabilities this platform realizes, the leaf's
++    /// document is normally one line, so this is usually a no-op that returns
++    /// the window it was given. Where it is not, the app has handed multiline
++    /// text to a single-line control and the narrowing is reported once.
++    ///
++    /// The multiline conduit holds anything, so it never narrows and the
++    /// proven path is unchanged. Nor does narrowing cost a write by itself:
++    /// the write below is guarded by equality against the element's value, so
++    /// a window that narrows to the same line as last time writes nothing.
++    fn fit_to_conduit(
++        &self,
++        conduit: &Conduit,
++        window_start: usize,
++        text: String,
++        app_selection_start: usize,
++    ) -> (usize, String) {
++        if conduit.element.holds(&text) {
++            return (window_start, text);
++        }
++        let caret = app_selection_start.saturating_sub(window_start);
++        let (line_start, line) = line_containing(&text, caret);
++        if !self.refused_line_break.replace(true) {
++            log::warn!(
++                "A single-line native element cannot hold a line break; the mirror is \
++                 following the caret's line instead of the surrounding window"
++            );
++        }
++        (window_start + line_start, line.to_owned())
++    }
++
+     /// Schedules a coalesced sync of the mirror for the next task.
+     ///
+     /// Event handlers must not write to the mirror element mid-gesture:
+@@ -466,6 +1018,12 @@ impl ImeMirror {
+                 return;
+             }
+             let mirror = &window.ime_mirror;
++            // Everything below reads and writes *the live conduit*: the
++            // element the focused leaf's capability called for, which is the
++            // one holding focus and the one the browser is delivering this
++            // gesture to. Naming it once keeps a sync from straddling two
++            // elements if the capability changes while one is in flight.
++            let conduit = mirror.live_conduit();
+             // A live element selection that differs from the stored baseline
+             // while the value still matches is an IME-driven selection move
+             // whose `selectionchange` import hasn't dispatched yet (the event
+@@ -475,7 +1033,7 @@ impl ImeMirror {
+             // growing its selection. The import reconciles the two sides and
+             // schedules a fresh sync when it cannot adopt the move.
+             if !mirror.selection_import_rejected.replace(false)
+-                && *mirror.text.borrow() == mirror.element.value()
++                && *mirror.text.borrow() == conduit.element.value()
+             {
+                 let live_start = mirror.selection_start().unwrap_or(0);
+                 let live_end = mirror.element_selection_end().unwrap_or(live_start);
+@@ -487,8 +1045,9 @@ impl ImeMirror {
+                 .with_input_handler(|handler| handler.selected_text_range(false))
+                 .flatten();
+             let Some(selection) = selection else {
++                // An empty value is the one value every conduit holds.
+                 if !mirror.text.borrow().is_empty() {
+-                    mirror.element.set_value("");
++                    conduit.element.set_value("");
+                     mirror.text.borrow_mut().clear();
+                 }
+                 mirror.selection.set((0, 0));
+@@ -543,29 +1102,30 @@ impl ImeMirror {
+                 .flatten()
+                 .unwrap_or_default();
+             let window_start = adjusted.unwrap_or(window_range).start;
++            let (window_start, text) =
++                mirror.fit_to_conduit(&conduit, window_start, text, selection.range.start);
+ 
+-            if *mirror.text.borrow() != text || mirror.element.value() != text {
+-                mirror.element.set_value(&text);
++            if *mirror.text.borrow() != text || conduit.element.value() != text {
++                conduit.element.set_value(&text);
+                 *mirror.text.borrow_mut() = text;
+             }
+ 
+             mirror.window_hint.set(window_start);
+             let selection_start = selection.range.start.saturating_sub(window_start) as u32;
+             let selection_end = selection.range.end.saturating_sub(window_start) as u32;
+-            if mirror.element.selection_start().ok().flatten() != Some(selection_start)
+-                || mirror.element.selection_end().ok().flatten() != Some(selection_end)
++            if conduit.element.selection_start() != Some(selection_start)
++                || conduit.element.selection_end() != Some(selection_end)
+             {
+-                mirror
++                conduit
+                     .element
+-                    .set_selection_range(selection_start, selection_end)
+-                    .ok();
++                    .set_selection_range(selection_start, selection_end);
+             }
+             // Read the selection back rather than trusting the computed
+             // values: the browser clamps out-of-bounds positions, and a
+             // stored selection the element doesn't actually have would
+             // corrupt the next diff.
+-            let actual_start = mirror.element.selection_start().ok().flatten();
+-            let actual_end = mirror.element.selection_end().ok().flatten();
++            let actual_start = conduit.element.selection_start();
++            let actual_end = conduit.element.selection_end();
+             mirror.selection.set((
+                 actual_start.unwrap_or(selection_start),
+                 actual_end.unwrap_or(selection_end),
+@@ -574,6 +1134,35 @@ impl ImeMirror {
+     }
+ }
+ 
++/// The line-break-free segment of `text` that contains the caret, as
++/// `(start, line)` in UTF-16 code units from `text`'s start.
++///
++/// Offsets here are UTF-16 units on both sides, matching every other offset on
++/// this path, and the slicing is done on character boundaries so a surrogate
++/// pair is never split. A caret past the end of `text` is treated as sitting
++/// at the end, and `"\r\n"` counts as two breaks: the segment between them is
++/// empty, which is a window every element holds, so the degenerate case
++/// degrades to a degraded IME rather than to a wrong document.
++fn line_containing(text: &str, caret: usize) -> (usize, &str) {
++    let caret = caret.min(text.encode_utf16().count());
++    let mut units = 0usize;
++    let mut line_start_units = 0usize;
++    let mut line_start_byte = 0usize;
++    for (byte, character) in text.char_indices() {
++        if character == '\n' || character == '\r' {
++            // The line that ends here is complete, and lies before the caret
++            // unless the caret is on this break or before it.
++            if caret <= units {
++                return (line_start_units, &text[line_start_byte..byte]);
++            }
++            line_start_units = units + character.len_utf16();
++            line_start_byte = byte + character.len_utf8();
++        }
++        units += character.len_utf16();
++    }
++    (line_start_units, &text[line_start_byte..])
++}
++
+ /// Attempts to represent a changed app selection as a pure element
+ /// selection move within the existing mirror window.
+ ///
+@@ -590,7 +1179,7 @@ fn move_selection_within_window(
+     let mirror = &window.ime_mirror;
+     let stored_text = mirror.text.borrow().clone();
+     let stored_length = stored_text.encode_utf16().count();
+-    if stored_length == 0 || mirror.element.value() != stored_text {
++    if stored_length == 0 || mirror.value() != stored_text {
+         return false;
+     }
+     let window_start = mirror.window_hint.get();
+@@ -646,12 +1235,12 @@ fn move_selection_within_window(
+         return false;
+     }
+ 
+-    mirror
++    let conduit = mirror.live_conduit();
++    conduit
+         .element
+-        .set_selection_range(selection_start as u32, selection_end as u32)
+-        .ok();
+-    let actual_start = mirror.element.selection_start().ok().flatten();
+-    let actual_end = mirror.element.selection_end().ok().flatten();
++        .set_selection_range(selection_start as u32, selection_end as u32);
++    let actual_start = conduit.element.selection_start();
++    let actual_end = conduit.element.selection_end();
+     if actual_start != Some(selection_start as u32) || actual_end != Some(selection_end as u32) {
+         return false;
+     }
+@@ -682,8 +1271,8 @@ fn is_consistent(
+         return false;
+     }
+     // The element's real selection must match what we believe it is.
+-    if mirror.element.selection_start().ok().flatten() != Some(element_selection_start as u32)
+-        || mirror.element.selection_end().ok().flatten() != Some(element_selection_end as u32)
++    if mirror.selection_start() != Some(element_selection_start as u32)
++        || mirror.element_selection_end() != Some(element_selection_end as u32)
+     {
+         return false;
+     }
+@@ -742,7 +1331,7 @@ fn is_consistent(
+     if document_text != stored_text {
+         return false;
+     }
+-    if mirror.element.value() != stored_text {
++    if mirror.value() != stored_text {
+         return false;
+     }
+     // The element selection corresponds to the app selection end too?
+diff --git a/crates/gpui_web/src/native_element.rs b/crates/gpui_web/src/native_element.rs
+index 4631a1e..56070b2 100644
+--- a/crates/gpui_web/src/native_element.rs
++++ b/crates/gpui_web/src/native_element.rs
+@@ -48,6 +48,7 @@
+ use std::cell::{Cell, RefCell};
+ use std::rc::Rc;
+ 
++use gpui::PlatformNativeElement;
+ use wasm_bindgen::prelude::Closure;
+ use wasm_bindgen::{JsCast, JsValue};
+ 
+@@ -233,6 +234,59 @@ impl NativeElements {
+         self.realization
+     }
+ 
++    /// Whether this window realizes `capability` as a real browser element.
++    ///
++    /// Section 11 lists eight capabilities and this platform has built three:
++    /// the editable leaf, and the single-line text family. The other five
++    /// answer `false` from their own arm below rather than from a shared
++    /// default, so that a capability becoming real is a change to one arm,
++    /// and so that the gap is readable in the source rather than inferred
++    /// from an array that happens to be empty.
++    ///
++    /// A capability answers for itself. It does not inherit the editable
++    /// leaf's answer, which would report a control as realized the moment the
++    /// proposal shipped and would put that control's leaf on a native path
++    /// with nothing behind it.
++    ///
++    /// What `true` claims for the single-line family is narrow enough to be
++    /// checked, so it is written down rather than left to the arm. The
++    /// platform builds the capability's own element -- `input[type=text]` for
++    /// [`PlatformNativeElement::EditableText`], `input[type=search]` for
++    /// [`PlatformNativeElement::SearchField`] -- drives it as the focused
++    /// editable leaf's IME conduit on the same write discipline as the
++    /// textarea, places it from the bounds GPUI publishes and draws it where
++    /// it lands, and lets the accessibility mirror claim the focused text
++    /// node onto it, so that one element is the node's whole realization
++    /// rather than a copy beside one. Which leaf it serves is decided by the
++    /// role that leaf publishes into the accessibility tree: the element has
++    /// to be the kind of control the node says it is, or a reader meets the
++    /// right number of controls of the wrong kind. [`crate::ime_mirror`]
++    /// carries the conduit policy, including why a single-line leaf cannot
++    /// share the textarea mirror at all.
++    pub(crate) const fn realizes(self, capability: PlatformNativeElement) -> bool {
++        match capability {
++            // Built: the composer's editable leaf, which section 12 asked for
++            // first and which section 13's proof is what earned the rest of
++            // this list.
++            PlatformNativeElement::EditableLeaf => self.realization.is_browser_native(),
++            // Built: the single-line text family. The same division of
++            // responsibility as the leaf above, on an element the platform
++            // must not wrap, so the same question has the same answer.
++            PlatformNativeElement::EditableText | PlatformNativeElement::SearchField => {
++                self.realization.is_browser_native()
++            }
++            // Enumerated by section 11 and not built. Answering `false` here
++            // keeps each of these on the painted path, which section 19
++            // requires to be a real path rather than an untested branch.
++            PlatformNativeElement::RichText
++            | PlatformNativeElement::NativeButton
++            | PlatformNativeElement::NativeCheckbox
++            | PlatformNativeElement::NativeSelect
++            | PlatformNativeElement::NativeLink => false,
++            PlatformNativeElement::None => false,
++        }
++    }
++
+     /// Build the layer this decision calls for, if it calls for one.
+     ///
+     /// Routed through the decision rather than constructed beside it so that
+@@ -250,7 +304,11 @@ impl NativeElements {
+         ElementLayer::create(document, body, self.support).map(Rc::new)
+     }
+ 
+-    pub(crate) fn summary(self, editable_bounds: Option<[f32; 4]>) -> NativeElementSummary {
++    pub(crate) fn summary(
++        self,
++        editable_bounds: Option<[f32; 4]>,
++        conduit_element_id: Option<&'static str>,
++    ) -> NativeElementSummary {
+         NativeElementSummary {
+             supported: self.support.complete(),
+             requests_paint: self.support.requests_paint,
+@@ -259,11 +317,31 @@ impl NativeElements {
+             lays_out_subtree: self.support.lays_out_subtree,
+             forced: self.forced.map(Forced::as_str),
+             realization: self.realization.as_str(),
++            capabilities: PlatformNativeElement::ALL
++                .into_iter()
++                .filter(|capability| self.realizes(*capability))
++                .map(|capability| capability.name())
++                .collect(),
++            conduit_element_id,
+             editable_bounds,
++            last_draw_ms: LAST_DRAW_MS.with(Cell::get),
++            last_input_latency_ms: LAST_INPUT_LATENCY_MS.with(Cell::get),
+         }
+     }
+ }
+ 
++/// One element the layer draws, and whether GPUI currently says to show it.
++///
++/// Visibility is per element rather than per layer. With one drawable the two
++/// are the same thing, which is why the layer could hold the flag alone; but
++/// section 11 lists eight capabilities, a window may realize more than one of
++/// them, and a second drawable with a different visibility needs the flag
++/// here.
++struct Drawable {
++    element: web_sys::HtmlElement,
++    visible: bool,
++}
++
+ /// The transparent canvas the browser's own elements are drawn onto.
+ ///
+ /// It is stacked over the canvas wgpu owns and composited by the browser, so
+@@ -281,13 +359,7 @@ pub(crate) struct ElementLayer {
+     /// because reading a canvas's children means `HTMLCollection`, a web-sys
+     /// feature this crate does not enable, to recover a list this side of the
+     /// boundary already has.
+-    drawables: Rc<RefCell<Vec<web_sys::HtmlElement>>>,
+-    /// Whether GPUI currently says the leaf is visible. Section 11 keeps
+-    /// visibility and clipping policy on GPUI's side of the line, and it has
+-    /// to: a GPUI overlay drawn above the leaf would otherwise still show the
+-    /// browser's element through it, because the layer composites above the
+-    /// scene rather than inside it.
+-    visible: Cell<bool>,
++    drawables: Rc<RefCell<Vec<Drawable>>>,
+     _paint: Closure<dyn FnMut(web_sys::Event)>,
+ }
+ 
+@@ -332,7 +404,7 @@ impl ElementLayer {
+         }
+         body.append_child(&canvas).ok()?;
+ 
+-        let drawables: Rc<RefCell<Vec<web_sys::HtmlElement>>> = Rc::default();
++        let drawables: Rc<RefCell<Vec<Drawable>>> = Rc::default();
+         let paint_canvas = canvas.clone();
+         let paint_drawables = Rc::clone(&drawables);
+         let paint = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event: web_sys::Event| {
+@@ -345,7 +417,6 @@ impl ElementLayer {
+         Some(Self {
+             canvas,
+             drawables,
+-            visible: Cell::new(true),
+             _paint: paint,
+         })
+     }
+@@ -368,7 +439,10 @@ impl ElementLayer {
+         if let Err(error) = element.style().set_property("pointer-events", "auto") {
+             log::warn!("html-in-canvas: could not make the element hittable: {error:?}");
+         }
+-        self.drawables.borrow_mut().push(element.clone());
++        self.drawables.borrow_mut().push(Drawable {
++            element: element.clone(),
++            visible: true,
++        });
+         self.request_paint();
+     }
+ 
+@@ -399,23 +473,56 @@ impl ElementLayer {
+         call_void(&self.canvas, REQUEST_PAINT, &[]);
+     }
+ 
+-    /// Follow GPUI's visibility for the leaf.
++    /// Follow GPUI's visibility for one of the layer's elements.
+     ///
+-    /// Hiding the whole layer rather than one element is exact while there is
+-    /// one drawable and is the reason section 12 says not to generalize to
+-    /// many controls before the composer proof holds: a second drawable with a
+-    /// different visibility needs this to become per element.
+-    pub(crate) fn set_visible(&self, visible: bool) {
+-        if self.visible.replace(visible) == visible {
+-            return;
++    /// Section 11 keeps visibility and clipping policy on GPUI's side of the
++    /// line, and it has to: the layer composites above the scene rather than
++    /// inside it, so an element GPUI had covered with an overlay would
++    /// otherwise still show through that overlay.
++    ///
++    /// Per element, and by the element's own `display`, not by hiding the
++    /// layer. Hiding the layer was exact only while there was one drawable,
++    /// and a window that realizes two capabilities has two elements with two
++    /// independent answers.
++    pub(crate) fn set_visible(&self, element: &web_sys::HtmlElement, visible: bool) {
++        {
++            let mut drawables = self.drawables.borrow_mut();
++            let Some(drawable) = drawables
++                .iter_mut()
++                .find(|drawable| &drawable.element == element)
++            else {
++                log::warn!("html-in-canvas: asked for the visibility of an element this layer does not draw");
++                return;
++            };
++            if drawable.visible == visible {
++                return;
++            }
++            drawable.visible = visible;
+         }
+-        let _ = self
+-            .canvas
++        // Outside the borrow: this is a DOM call, and the paint listener
++        // borrows the same list.
++        let _ = element
+             .style()
+             .set_property("display", if visible { "block" } else { "none" });
+-        if visible {
+-            self.request_paint();
+-        }
++        // Repaint on the way out as well as the way in. The layer composites
++        // above the scene and `drawElementImage` output persists until
++        // something repaints, so a hide that skipped this would leave the
++        // element's last snapshot -- caret and selection included -- drawn on
++        // the layer above whatever overlay just covered it. `forget` and
++        // `resize` repaint unconditionally for the same reason.
++        self.request_paint();
++    }
++
++    /// Stop drawing an element and forget it.
++    ///
++    /// The element is left where it is: whoever built it owns taking it out of
++    /// the document, and doing it here would be a second owner for its
++    /// lifetime.
++    pub(crate) fn forget(&self, element: &web_sys::HtmlElement) {
++        self.drawables
++            .borrow_mut()
++            .retain(|drawable| &drawable.element != element);
++        self.request_paint();
+     }
+ 
+     pub(crate) fn remove(&self) {
+@@ -429,10 +536,16 @@ impl ElementLayer {
+ /// Reached only from the browser's own `paint` event, which is the only moment
+ /// the proposal permits the draw call: outside it the canvas has no valid
+ /// drawing target for element content.
+-fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlElement]) {
++fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[Drawable]) {
+     let Ok(Some(context)) = canvas.get_context("2d") else {
+         return;
+     };
++    // SPEC-THEOREMWEB-PWA-HTML-CANVAS-1.1 section 58 tracks "HTML snapshot
++    // upload cost" as its own row. This is that cost: the whole of what the
++    // browser does to put the element's rendering into the canvas, measured
++    // where it happens rather than inferred from a frame time that also
++    // contains everything wgpu drew.
++    let started = performance_now();
+     // `reset` rather than `clearRect`: the proposal's element draws carry
+     // state the next frame must not inherit, and a reset is one call instead
+     // of a clear plus a transform restore.
+@@ -448,7 +561,14 @@ fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlEl
+         "scale",
+         &[JsValue::from_f64(ratio), JsValue::from_f64(ratio)],
+     );
+-    for element in drawables {
++    // Only the elements GPUI still says to show. A hidden one is skipped
++    // rather than drawn transparent: `display: none` leaves it with a zero
++    // box, so the `get_bounding_client_rect` below would draw it at the
++    // origin.
++    let mut drawn = 0usize;
++    for drawable in drawables.iter().filter(|drawable| drawable.visible) {
++        let element = &drawable.element;
++        drawn += 1;
+         // The element's own border box is where GPUI put it, through the
+         // inline `left`/`top`/`width`/`height` the IME mirror writes. Asking
+         // the browser for that box rather than replaying a stored rectangle
+@@ -485,6 +605,23 @@ fn paint_layer(canvas: &web_sys::HtmlCanvasElement, drawables: &[web_sys::HtmlEl
+             ],
+         );
+     }
++    // Only when something was drawn. A layer with nothing visible costs the
++    // reset and the scale, and reporting that as a snapshot cost would put a
++    // number near zero against a row that is meant to say what a snapshot
++    // costs.
++    if drawn > 0
++        && let Some(started) = started
++        && let Some(now) = performance_now()
++    {
++        LAST_DRAW_MS.with(|cell| cell.set(Some(now - started)));
++    }
++}
++
++/// `performance.now()`, or nothing where there is no performance timeline.
++fn performance_now() -> Option<f64> {
++    web_sys::window()
++        .and_then(|window| window.performance())
++        .map(|performance| performance.now())
+ }
+ 
+ /// Call a method the proposal defines and web-sys does not bind.
+@@ -575,10 +712,44 @@ pub struct NativeElementSummary {
+     pub forced: Option<&'static str>,
+     /// The path in force.
+     pub realization: &'static str,
++    /// Which of section 11's eight capabilities this window realizes
++    /// natively, by the specification's names.
++    ///
++    /// One entry per realized capability, so an oracle can assert that a named
++    /// capability is realized and that the others are not, rather than only
++    /// that *something* was. On the painted path this is empty, which is what
++    /// the fallback's assertion reads.
++    pub capabilities: Vec<&'static str>,
+     /// The editable leaf's last published bounds, in CSS pixels, as
+     /// `[x, y, width, height]`. Section 51 compares these against GPUI's own
+     /// bounds and against where the browser reports the element.
+     pub editable_bounds: Option<[f32; 4]>,
++    /// The document id of the element the IME conduit is driving for the
++    /// focused editable leaf -- `"gpui-ime-input"` for the multiline leaf,
++    /// `"gpui-ime-input-text"` and `"gpui-ime-input-search"` for the
++    /// single-line family -- or `None` where no conduit is live.
++    ///
++    /// An id rather than the capability's delegated element name, because
++    /// "which element is live" is a question an oracle asks from JavaScript
++    /// and the answer has to be something `getElementById` can be handed.
++    ///
++    /// A realized capability is not the same statement as the element in
++    /// force: a window that realizes three editable capabilities still drives
++    /// one element at a time, and section 15's "the reader meets the control
++    /// once" is a claim about that element. An oracle that could only read the
++    /// realized set could not tell a search field served by a search input
++    /// from one served by a textarea, which is the difference this field
++    /// exists to make visible. `None` on the painted path, where no element is
++    /// drawing anything.
++    pub conduit_element_id: Option<&'static str>,
++    /// Section 58: the most recent HTML snapshot upload cost, in milliseconds.
++    /// `None` until the layer has drawn at least one element, which on the
++    /// painted path is never.
++    pub last_draw_ms: Option<f64>,
++    /// Section 58: the most recent editor input latency, in milliseconds --
++    /// from the browser stamping the input event to GPUI having applied it.
++    /// `None` until something has been typed.
++    pub last_input_latency_ms: Option<f64>,
+ }
+ 
+ thread_local! {
+@@ -586,6 +757,23 @@ thread_local! {
+     /// thread, which is what lets an oracle read this without owning it.
+     static SUMMARY_SOURCE: RefCell<Option<Rc<dyn Fn() -> NativeElementSummary>>> =
+         const { RefCell::new(None) };
++
++    /// Section 58's two HTML-in-Canvas rows, as the most recent sample of
++    /// each. The most recent rather than an average, because an average hides
++    /// the frame that was slow and section 58's point is that these costs are
++    /// tracked separately rather than folded into one another.
++    static LAST_DRAW_MS: Cell<Option<f64>> = const { Cell::new(None) };
++    static LAST_INPUT_LATENCY_MS: Cell<Option<f64>> = const { Cell::new(None) };
++}
++
++/// Record how long the browser took to apply one input to the editor.
++///
++/// Section 58's "HTML-native editor input latency". Called from the input
++/// path, which runs on both realizations; the reader publishes it under that
++/// name only where the leaf really is browser-native, and the realization
++/// travels in the same report so the two cannot be read apart.
++pub(crate) fn record_input_latency(milliseconds: f64) {
++    LAST_INPUT_LATENCY_MS.with(|cell| cell.set(Some(milliseconds)));
+ }
+ 
+ pub(crate) fn publish_summary_source(source: Rc<dyn Fn() -> NativeElementSummary>) {
+diff --git a/crates/gpui_web/src/platform.rs b/crates/gpui_web/src/platform.rs
+index af8cc85..a07b3bb 100644
+--- a/crates/gpui_web/src/platform.rs
++++ b/crates/gpui_web/src/platform.rs
+@@ -152,6 +152,16 @@ impl WebPlatform {
+     ) -> Self {
+         let browser_window =
+             web_sys::window().expect("must be running in a browser window context");
++        // Tell GPUI what `secondary` means here, before anything binds a key.
++        // One wasm binary is served to a Mac and to a Windows PC and
++        // `cfg!(target_os = "macos")` is false for both, so without this a Mac
++        // user finds that Command does nothing and Control does everything.
++        // The browser is the only thing that knows.
++        //
++        // Here rather than at window creation because a keymap is registered
++        // before a window exists: `Application::run`'s callback binds keys and
++        // then opens one.
++        gpui::set_secondary_modifier_is_platform(crate::events::is_mac_platform(&browser_window));
+         let dispatcher = Arc::new(WebDispatcher::new(
+             browser_window.clone(),
+             allow_multi_threading,
+diff --git a/crates/gpui_web/src/window.rs b/crates/gpui_web/src/window.rs
+index d4a166e..cda9ec0 100644
+--- a/crates/gpui_web/src/window.rs
++++ b/crates/gpui_web/src/window.rs
+@@ -196,12 +196,7 @@ impl WebWindow {
+         // element is parented into it. On every browser shipping today this
+         // is `None` and costs one prototype lookup.
+         let element_layer = native_elements.create_layer(&document, &body);
+-        let ime_mirror = ImeMirror::new(
+-            &document,
+-            &body,
+-            element_layer.clone(),
+-            native_elements.realization(),
+-        )?;
++        let ime_mirror = ImeMirror::new(&document, &body, element_layer.clone(), native_elements)?;
+ 
+         let display: Rc<dyn PlatformDisplay> = Rc::new(WebDisplay::new(browser_window.clone()));
+ 
+@@ -261,11 +256,13 @@ impl WebWindow {
+         // never keeps the window alive on its own.
+         let weak = Rc::downgrade(&inner);
+         crate::native_element::publish_summary_source(Rc::new(move || {
+-            weak.upgrade().map_or_else(NativeElementSummary::default, |inner| {
+-                inner
+-                    .native_elements
+-                    .summary(inner.ime_mirror.published_bounds())
+-            })
++            weak.upgrade()
++                .map_or_else(NativeElementSummary::default, |inner| {
++                    inner.native_elements.summary(
++                        inner.ime_mirror.published_bounds(),
++                        inner.ime_mirror.live_conduit_id(),
++                    )
++                })
+         }));
+ 
+         let raf_closure = inner.create_raf_closure();
+@@ -746,10 +743,19 @@ impl PlatformWindow for WebWindow {
+ 
+     /// The web is the one platform that can answer anything but `None`, and
+     /// it only does so on a browser that ships HTML-in-Canvas. The decision
+-    /// was taken once at window creation; this reports it.
+-    fn native_element(&self) -> gpui::PlatformNativeElement {
+-        if self.inner.ime_mirror.realization().is_browser_native() {
+-            gpui::PlatformNativeElement::EditableLeaf
++    /// was taken once at window creation; this reports it per capability.
++    ///
++    /// Per capability rather than per window, because section 11 lists eight
++    /// and this platform has built one. A capability with no implementation
++    /// behind it answers `None` on its own account rather than inheriting the
++    /// editable leaf's answer, which would report a control as realized the
++    /// moment the proposal shipped.
++    fn native_element(
++        &self,
++        capability: gpui::PlatformNativeElement,
++    ) -> gpui::PlatformNativeElement {
++        if self.inner.native_elements.realizes(capability) {
++            capability
+         } else {
+             gpui::PlatformNativeElement::None
+         }
+@@ -944,9 +950,13 @@ impl PlatformWindow for WebWindow {
+         Some(self.inner.state.borrow().renderer.gpu_specs())
+     }
+ 
+-    /// Position the IME-owned textarea at the logical caret bounds.
++    /// Position the IME-owned element at the logical caret bounds.
++    ///
++    /// The window comes along because placing the element can first have to
++    /// move the input path onto another conduit, and that move is a focus
++    /// change the window has to be able to report as its own.
+     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
+-        self.inner.ime_mirror.update_position(bounds);
++        self.inner.ime_mirror.update_position(&self.inner, bounds);
+     }
+ 
+     /// Stand up the accessibility mirror and turn accessibility on.
+@@ -969,8 +979,9 @@ impl PlatformWindow for WebWindow {
+ 
+         let adapter = match WebA11yAdapter::new(
+             document,
+-            self.inner.ime_mirror.accessibility_element(),
+-            self.inner.ime_mirror.realization().is_browser_native(),
++            self.inner.ime_mirror.accessibility_element_handle(),
++            self.inner.ime_mirror.declared_capability_handle(),
++            self.inner.native_elements,
+             action,
+         ) {
+             Ok(adapter) => adapter,
+

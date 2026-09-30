@@ -1,5 +1,11 @@
 # Theorem Zed patch series
 
+The pin catch-up patch records browser prerequisites already present at
+`6d4d90754f7dde3e62afb6fe74a632c0b4660396` but absent from the older series.
+It changes no production source at the consumer pin. Replay now retains those
+exact pre-existing platform, single-line input and browser editing bytes before
+applying the native-motion extension.
+
 The native reduced-motion patch feeds macOS's NSWorkspace preference into
 GPUI's existing App policy. It owns its notification token and foreground task,
 coalesces wake signals through a bounded channel, and fences delivery after
