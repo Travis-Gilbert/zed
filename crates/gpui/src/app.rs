@@ -878,6 +878,20 @@ impl App {
         init_app_menus(platform.as_ref(), &app.borrow());
         SystemWindowTabController::init(&mut app.borrow_mut());
 
+        // Subscribe before reading so a preference change during setup is not
+        // lost. The platform delivers later changes outside native callbacks.
+        platform.on_reduce_motion_change(Box::new({
+            let app = Rc::downgrade(&app);
+            move |reduced| {
+                if let Some(app) = app.upgrade() {
+                    app.borrow_mut().update(|cx| cx.set_reduce_motion(reduced));
+                }
+            }
+        }));
+        if let Some(reduced) = platform.reduce_motion() {
+            app.borrow_mut().update(|cx| cx.set_reduce_motion(reduced));
+        }
+
         platform.on_keyboard_layout_change(Box::new({
             let app = Rc::downgrade(&app);
             move || {
@@ -3111,6 +3125,77 @@ mod test {
 
     use crate::{AppContext, Context, Empty, IntoElement, Render, TestAppContext, Window};
 
+    fn motion_test_platform() -> Rc<crate::TestPlatform> {
+        let dispatcher = std::sync::Arc::new(crate::TestDispatcher::new(0));
+        crate::TestPlatform::new(
+            crate::BackgroundExecutor::new(dispatcher.clone()),
+            crate::ForegroundExecutor::new(dispatcher),
+        )
+    }
+
+    fn motion_test_app(platform: Rc<crate::TestPlatform>) -> Rc<crate::AppCell> {
+        super::App::new_app(
+            platform,
+            std::sync::Arc::new(()),
+            http_client::FakeHttpClient::with_404_response(),
+        )
+    }
+
+    #[test]
+    fn reduced_motion_reads_native_preference_at_startup() {
+        for preference in [None, Some(false), Some(true)] {
+            let platform = motion_test_platform();
+            platform.fake_reduce_motion.set(preference);
+            let app = motion_test_app(platform);
+            assert_eq!(app.borrow().reduce_motion(), preference.unwrap_or(false));
+            if preference.is_some() {
+                assert!(app.borrow().pending_effects.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn reduced_motion_subscribes_before_reading_preference() {
+        let platform = motion_test_platform();
+        platform.fake_reduce_motion.set(Some(false));
+        platform.fake_reduce_motion_on_subscribe.set(Some(true));
+        let app = motion_test_app(platform);
+        assert!(app.borrow().reduce_motion());
+    }
+
+    #[test]
+    fn reduced_motion_notification_flushes_refresh_and_ignores_duplicates() {
+        let platform = motion_test_platform();
+        let app = motion_test_app(platform.clone());
+        let mut callback = platform
+            .fake_reduce_motion_callback
+            .borrow_mut()
+            .take()
+            .unwrap();
+        for value in [true, true, false, false] {
+            callback(value);
+            assert_eq!(app.borrow().reduce_motion(), value);
+            assert!(app.borrow().pending_effects.is_empty());
+        }
+        app.borrow_mut().set_reduce_motion(false);
+        assert!(app.borrow().pending_effects.is_empty());
+    }
+
+    #[test]
+    fn reduced_motion_platform_callback_does_not_retain_app() {
+        let platform = motion_test_platform();
+        let app = motion_test_app(platform.clone());
+        let weak_app = Rc::downgrade(&app);
+        drop(app);
+        assert!(weak_app.upgrade().is_none());
+        let mut callback = platform
+            .fake_reduce_motion_callback
+            .borrow_mut()
+            .take()
+            .unwrap();
+        callback(true);
+    }
+
     struct RenderCounter(Rc<Cell<usize>>);
 
     impl Render for RenderCounter {
@@ -3118,6 +3203,24 @@ mod test {
             self.0.set(self.0.get() + 1);
             Empty
         }
+    }
+
+    #[gpui::test]
+    fn reduced_motion_duplicate_does_not_redraw_windows(cx: &mut TestAppContext) {
+        let render_count = Rc::new(Cell::new(0));
+        let _window = cx.add_window({
+            let render_count = render_count.clone();
+            move |_, _| RenderCounter(render_count)
+        });
+        cx.run_until_parked();
+        let before = render_count.get();
+        cx.update(|cx| cx.set_reduce_motion(true));
+        cx.run_until_parked();
+        assert!(render_count.get() > before);
+        let after = render_count.get();
+        cx.update(|cx| cx.set_reduce_motion(true));
+        cx.run_until_parked();
+        assert_eq!(render_count.get(), after);
     }
 
     #[gpui::test]

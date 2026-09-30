@@ -192,6 +192,7 @@ pub(crate) struct MacPlatformState {
     /// Mirrors `[NSCursor setHiddenUntilMouseMoves:]` state, which AppKit doesn't expose.
     cursor_visible: Arc<AtomicBool>,
     system_notifications: crate::system_notifications::SystemNotificationState,
+    reduced_motion_observer: Option<crate::reduce_motion::ReducedMotionObserver>,
 }
 
 impl MacPlatform {
@@ -240,6 +241,7 @@ impl MacPlatform {
             keyboard_mapper,
             cursor_visible: Arc::new(AtomicBool::new(true)),
             system_notifications: crate::system_notifications::SystemNotificationState::new(),
+            reduced_motion_observer: None,
         });
         Self(state, marker)
     }
@@ -479,6 +481,16 @@ impl MacPlatform {
 }
 
 impl Platform for MacPlatform {
+    fn reduce_motion(&self) -> Option<bool> {
+        Some(crate::reduce_motion::current())
+    }
+
+    fn on_reduce_motion_change(&self, callback: Box<dyn FnMut(bool)>) {
+        let executor = self.foreground_executor();
+        let observer = crate::reduce_motion::ReducedMotionObserver::new(&executor, callback);
+        self.0.lock().reduced_motion_observer = Some(observer);
+    }
+
     fn background_executor(&self) -> BackgroundExecutor {
         self.0.lock().background_executor.clone()
     }
