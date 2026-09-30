@@ -1,5 +1,21 @@
 # Theorem Zed patch series
 
+The pin catch-up patch records browser prerequisites already present at
+`6d4d90754f7dde3e62afb6fe74a632c0b4660396` but absent from the older series.
+It changes no production source at the consumer pin. Replay now retains those
+exact pre-existing platform, single-line input and browser editing bytes before
+applying the native-motion extension.
+
+The native reduced-motion patch feeds macOS's NSWorkspace preference into
+GPUI's existing App policy. It owns its notification token and foreground task,
+coalesces wake signals through a bounded channel, and fences delivery after
+observer replacement. Unsupported platforms preserve the existing policy.
+`cargo nextest run --locked -p gpui --lib --features gpui_platform/runtime_shaders`
+checks the GPUI components. `cargo run --locked -p gpui_macos --example
+native_motion --features runtime_shaders` checks the actual macOS adapter;
+`GPUI_NATIVE_MOTION_WAIT_FOR_CHANGE=1` additionally waits for a manual OS toggle.
+Posted notification tests are not evidence of an actual System Settings change.
+
 This hard-fork series is applied in the order recorded by `series`. It is not
 an upstream contribution queue.
 

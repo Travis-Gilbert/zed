@@ -129,6 +129,17 @@ pub trait Platform: 'static {
     fn foreground_executor(&self) -> ForegroundExecutor;
     fn text_system(&self) -> Arc<dyn PlatformTextSystem>;
 
+    /// The operating system's reduced-motion preference, if supported.
+    /// `None` leaves the application's existing motion policy unchanged.
+    fn reduce_motion(&self) -> Option<bool> {
+        None
+    }
+
+    /// Replaces the platform-owned motion listener. Delivery must be deferred
+    /// onto the foreground executor, outside any synchronous native callback.
+    /// Unsupported platforms leave the application policy unchanged.
+    fn on_reduce_motion_change(&self, _callback: Box<dyn FnMut(bool)>) {}
+
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>);
     fn quit(&self);
     fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<OsString>);
