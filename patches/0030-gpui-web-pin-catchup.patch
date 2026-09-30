@@ -1,3 +1,6 @@
+From ba7359c47715252115085ee27d021add977e893a Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Wed, 30 Sep 2026 10:15:13 -0400
 Subject: [PATCH] chore(gpui_web): retain the previously pinned browser prerequisites
 
 Mechanical catch-up of bytes already present at consumer base 6d4d907.
@@ -2350,4 +2353,3 @@ index d4a166e..cda9ec0 100644
              action,
          ) {
              Ok(adapter) => adapter,
-
