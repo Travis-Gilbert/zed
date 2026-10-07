@@ -1932,7 +1932,7 @@ impl PlatformWindow for MacWindow {
         &self,
         scene: &gpui::Scene,
         target: &ExternalGpuSurfaceHandle,
-        expected_size: Size<DevicePixels>,
+        expected_size: Size<gpui::DevicePixels>,
     ) -> anyhow::Result<gpui::wgpu::SubmissionIndex> {
         self.0
             .lock()
