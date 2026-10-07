@@ -131,6 +131,18 @@ impl Renderer {
         }
     }
 
+    pub fn render_scene_to_external_surface(
+        &mut self,
+        scene: &Scene,
+        target: &ExternalGpuSurfaceHandle,
+        expected_size: Size<DevicePixels>,
+    ) -> anyhow::Result<gpui::wgpu::SubmissionIndex> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("macOS compositor is not initialized"))?
+            .render_scene_to_external_surface(scene, target, expected_size)
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> bool {
         self.inner_mut().draw(scene)
     }

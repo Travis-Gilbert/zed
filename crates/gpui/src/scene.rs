@@ -40,6 +40,8 @@ impl From<bool> for PaddedBool32 {
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
+    pub(crate) captures: Vec<RetainedSceneCapture>,
+    pending_captures: Vec<PendingRetainedCapture>,
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
@@ -53,9 +55,26 @@ pub struct Scene {
     pub surfaces: Vec<PaintSurface>,
 }
 
+// Adapted from cradiy/gpui-fusion 2f0e58241e4d (Apache-2.0):
+// nested capture boundaries are part of the replayable paint stream.
+pub(crate) struct RetainedSceneCapture {
+    pub target: crate::ExternalGpuSurfaceHandle,
+    pub config: crate::RetainedCaptureConfig,
+    pub scene: Scene,
+}
+
+struct PendingRetainedCapture {
+    target: crate::ExternalGpuSurfaceHandle,
+    config: crate::RetainedCaptureConfig,
+    scene: Scene,
+    start: usize,
+}
+
 #[expect(missing_docs)]
 impl Scene {
     pub fn clear(&mut self) {
+        self.captures.clear();
+        self.pending_captures.clear();
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
@@ -74,6 +93,12 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        if let Some(pending) = self.pending_captures.last_mut() {
+            pending.scene.push_layer(bounds);
+            self.paint_operations
+                .push(PaintOperation::StartLayer(bounds));
+            return;
+        }
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
         self.paint_operations
@@ -81,12 +106,23 @@ impl Scene {
     }
 
     pub fn pop_layer(&mut self) {
+        if let Some(pending) = self.pending_captures.last_mut() {
+            pending.scene.pop_layer();
+            self.paint_operations.push(PaintOperation::EndLayer);
+            return;
+        }
         self.layer_stack.pop();
         self.paint_operations.push(PaintOperation::EndLayer);
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
+        if let Some(pending) = self.pending_captures.last_mut() {
+            pending.scene.insert_primitive(primitive.clone());
+            self.paint_operations
+                .push(PaintOperation::Primitive(primitive));
+            return;
+        }
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -145,8 +181,60 @@ impl Scene {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::StartCapture(target, config) => {
+                    self.start_retained_capture(target.clone(), *config)
+                }
+                PaintOperation::EndCapture => self.end_retained_capture(),
             }
         }
+    }
+
+    pub(crate) fn omit_external_surfaces(&mut self, failed: &[crate::ExternalGpuSurfaceId]) {
+        // Keep paint operations intact so a later replay can retry after recovery.
+        self.surfaces.retain(|surface| !matches!(&surface.content, SurfaceContent::ExternalGpu(id) if failed.contains(id)));
+    }
+
+    pub(crate) fn start_retained_capture(
+        &mut self,
+        target: crate::ExternalGpuSurfaceHandle,
+        config: crate::RetainedCaptureConfig,
+    ) {
+        let start = self.paint_operations.len();
+        self.paint_operations
+            .push(PaintOperation::StartCapture(target.clone(), config));
+        self.pending_captures.push(PendingRetainedCapture {
+            target,
+            config,
+            scene: Scene::default(),
+            start,
+        });
+    }
+
+    pub(crate) fn end_retained_capture(&mut self) {
+        let mut pending = self
+            .pending_captures
+            .pop()
+            .expect("balanced retained capture");
+        pending.scene.finish();
+        let capture = RetainedSceneCapture {
+            target: pending.target,
+            config: pending.config,
+            scene: pending.scene,
+        };
+        if let Some(parent) = self.pending_captures.last_mut() {
+            parent.scene.captures.push(capture);
+        } else {
+            self.captures.push(capture);
+        }
+        self.paint_operations.push(PaintOperation::EndCapture);
+    }
+
+    pub(crate) fn cancel_retained_capture(&mut self) {
+        let pending = self
+            .pending_captures
+            .pop()
+            .expect("balanced retained capture");
+        self.paint_operations.truncate(pending.start);
     }
 
     pub fn finish(&mut self) {
@@ -216,6 +304,11 @@ pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    StartCapture(
+        crate::ExternalGpuSurfaceHandle,
+        crate::RetainedCaptureConfig,
+    ),
+    EndCapture,
 }
 
 #[derive(Clone)]
@@ -689,7 +782,7 @@ impl TransformationMatrix {
 
     /// Apply transformation to a point, mainly useful for debugging
     pub fn apply(&self, point: Point<Pixels>) -> Point<Pixels> {
-        let input = [point.x.0, point.y.0];
+        let input = [f32::from(point.x), f32::from(point.y)];
         let mut output = self.translation;
         for (i, output_cell) in output.iter_mut().enumerate() {
             for (k, input_cell) in input.iter().enumerate() {
@@ -957,5 +1050,219 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod retained_capture_tests {
+    use super::*;
+    use crate::{
+        DevicePixels, ExternalGpuSurfaceHandle, ExternalGpuSurfaceRegistry, RetainedCaptureConfig,
+        px, size,
+    };
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    fn targets() -> anyhow::Result<(ExternalGpuSurfaceHandle, ExternalGpuSurfaceHandle)> {
+        target_pair(false)
+    }
+
+    fn target_pair(
+        foreign: bool,
+    ) -> anyhow::Result<(ExternalGpuSurfaceHandle, ExternalGpuSurfaceHandle)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        let adapter = crate::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))?;
+        println!("retained scene adapter: {:?}", adapter.get_info());
+        let (device, queue) = crate::block_on(
+            adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("retained_capture_replay_test"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_defaults()
+                    .using_resolution(adapter.limits())
+                    .using_alignment(adapter.limits()),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            }),
+        )?;
+        let device = Arc::new(device);
+        let queue = Arc::new(queue);
+        let registry = Arc::new(ExternalGpuSurfaceRegistry::new());
+        let lost = Arc::new(AtomicBool::new(false));
+        let make = |registry| {
+            ExternalGpuSurfaceHandle::new(
+                registry,
+                device.clone(),
+                queue.clone(),
+                64,
+                48,
+                wgpu::TextureFormat::Rgba8Unorm,
+                lost.clone(),
+                Arc::new(|| {}),
+            )
+        };
+        let other = if foreign {
+            Arc::new(ExternalGpuSurfaceRegistry::new())
+        } else {
+            registry.clone()
+        };
+        Ok((make(registry)?, make(other)?))
+    }
+
+    fn marker(x: f32) -> Quad {
+        let bounds = Bounds::new(
+            point(ScaledPixels(x), ScaledPixels(0.)),
+            size(ScaledPixels(1.), ScaledPixels(1.)),
+        );
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Quad::default()
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a live native wgpu adapter"]
+    fn nested_capture_replay_preserves_targets_and_window_primitives() -> anyhow::Result<()> {
+        let (outer, inner) = targets()?;
+        let config = RetainedCaptureConfig::new(size(px(64.), px(48.)), 1., 2048)?;
+        let mut previous = Scene::default();
+        previous.insert_primitive(marker(1.));
+        previous.start_retained_capture(outer.clone(), config);
+        previous.insert_primitive(marker(2.));
+        let child_start = previous.len();
+        previous.start_retained_capture(inner.clone(), config);
+        previous.push_layer(marker(3.).bounds);
+        previous.insert_primitive(marker(3.));
+        previous.pop_layer();
+        previous.end_retained_capture();
+        let child_end = previous.len();
+        previous.insert_primitive(marker(4.));
+        previous.end_retained_capture();
+        previous.insert_primitive(marker(5.));
+        previous.finish();
+        let mut next = Scene::default();
+        next.replay(0..previous.len(), &previous);
+        next.finish();
+        assert_eq!(
+            next.quads
+                .iter()
+                .map(|q| q.bounds.origin.x.0)
+                .collect::<Vec<_>>(),
+            vec![1., 5.]
+        );
+        assert_eq!(next.captures.len(), 1);
+        let captured = &next.captures[0];
+        assert_eq!(captured.target.id(), outer.id());
+        assert_eq!(
+            captured.config.pixel_size(),
+            size(DevicePixels(64), DevicePixels(48))
+        );
+        assert_eq!(
+            captured
+                .scene
+                .quads
+                .iter()
+                .map(|q| q.bounds.origin.x.0)
+                .collect::<Vec<_>>(),
+            vec![2., 4.]
+        );
+        assert_eq!(captured.scene.captures.len(), 1);
+        assert_eq!(captured.scene.captures[0].target.id(), inner.id());
+        assert_eq!(
+            captured.scene.captures[0].scene.quads[0].bounds.origin.x.0,
+            3.
+        );
+        // A cached child can replay into an active parent without leaking pixels.
+        let mut partial = Scene::default();
+        partial.start_retained_capture(outer, config);
+        partial.replay(child_start..child_end, &previous);
+        partial.end_retained_capture();
+        assert!(partial.quads.is_empty());
+        assert_eq!(
+            partial.captures[0].scene.captures[0].target.id(),
+            inner.id()
+        );
+        next.clear();
+        assert!(next.captures.is_empty());
+        assert_eq!(next.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a live native wgpu adapter"]
+    fn cancelled_capture_preserves_parent_stream() -> anyhow::Result<()> {
+        let (outer, inner) = targets()?;
+        let config = RetainedCaptureConfig::new(size(px(64.), px(48.)), 1., 2048)?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(marker(1.));
+        scene.start_retained_capture(outer.clone(), config);
+        scene.insert_primitive(marker(2.));
+        scene.start_retained_capture(inner, config);
+        scene.insert_primitive(marker(3.));
+        scene.cancel_retained_capture();
+        scene.insert_primitive(marker(4.));
+        scene.end_retained_capture();
+        scene.insert_primitive(marker(5.));
+        let mut replay = Scene::default();
+        replay.replay(0..scene.len(), &scene);
+        assert_eq!(replay.quads.len(), 2);
+        assert_eq!(replay.captures[0].target.id(), outer.id());
+        assert_eq!(replay.captures[0].scene.quads.len(), 2);
+        assert!(replay.captures[0].scene.captures.is_empty());
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires a live native wgpu adapter"]
+    fn failed_lease_omission_preserves_trusted_window_and_retry_stream() -> anyhow::Result<()> {
+        // First slots of separate registries formerly shared the same opaque
+        // numeric ID. A foreign refusal must not hide the local healthy sample.
+        let (failed, healthy) = target_pair(true)?;
+        let mut scene = Scene::default();
+        scene.insert_primitive(marker(1.));
+        for target in [&failed, &healthy] {
+            let bounds = marker(2.).bounds;
+            scene.insert_primitive(PaintSurface {
+                order: 0,
+                bounds,
+                content_mask: ContentMask { bounds },
+                opacity: 1.,
+                transformation: TransformationMatrix::unit(),
+                content: SurfaceContent::ExternalGpu(target.id()),
+            });
+        }
+        let operations = scene.len();
+        scene.omit_external_surfaces(&[failed.id()]);
+        assert_eq!(
+            scene.quads.len(),
+            1,
+            "trusted window primitives must still render"
+        );
+        assert_eq!(
+            scene.surfaces.len(),
+            1,
+            "failed lease must never sample stale pixels"
+        );
+        assert!(
+            matches!(scene.surfaces[0].content, SurfaceContent::ExternalGpu(id) if id == healthy.id())
+        );
+        assert_eq!(scene.len(), operations);
+        let mut retry = Scene::default();
+        retry.replay(0..operations, &scene);
+        assert_eq!(
+            retry.surfaces.len(),
+            2,
+            "later owner recovery can retry the retained stream"
+        );
+        Ok(())
     }
 }

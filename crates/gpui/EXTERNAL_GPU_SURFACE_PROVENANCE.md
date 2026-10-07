@@ -26,3 +26,32 @@ SceneOS remains outside GPUI. It consumes the narrow
 `ExternalGpuSurfaceHandle` contract and submits ordinary `wgpu` command buffers;
 GPUI remains responsible for layout, clipping, opacity, transformation, hit
 testing, compositor ordering, and teardown.
+
+
+## Retained capture adaptation, 2026-10-07
+
+The paint-only retained capture scope adapts core Apache-2.0 mechanisms from
+[cradiy/gpui-fusion](https://github.com/cradiy/gpui-fusion) at
+`2f0e58241e4dba0df582d54a8f54d28c355c1781`: `crates/gpui/src/scene.rs`,
+`crates/gpui/src/window/effects.rs`, `crates/gpui/src/view.rs`, and the sizing
+contract in `crates/gpui/src/scene3d.rs`. Attribution includes gpui-fusion
+contributors and the original GPUI/Zed contributors. The existing
+`LICENSE-APACHE` applies. No donor `gpui_3d` code, MIT assets, new device,
+renderer distribution, or semantic scene owner is imported.
+
+Theorem's adaptation records nested capture boundaries in the replay stream,
+retains the supplied element/entity, scopes source-local masks, offsets, viewport
+and bounded raster density, and disables interactive/cache/overlay reuse in the
+capture. Window state is restored on unwind. Publication uses the existing
+compositor's GPU lease exporter; unsupported platforms refuse explicitly. Failed
+leases are excluded from window composition and reported to the trusted host,
+while ordinary window paint remains available. Surface identities include a
+non-reused process registry token, so a refused foreign lease cannot alias the
+local compositor's first slot. Captured text uses grayscale coverage because
+subpixel coverage cannot be transferred to a transparent transformed target.
+
+This API is paint-only. A Theorem-owned adapter must still establish provider
+and presentation generation ownership, pointer mapping, keyboard focus, IME,
+accessibility projection, overlay placement, resource recovery, trusted return,
+and any privileged browser GPU import. A captured interface must not be
+advertised as interactive before those obligations are implemented and proved.

@@ -1,3 +1,4 @@
+// Theorem modification: sample premultiplied exported scenes without double alpha.
 /* Functions useful for debugging:
 
 // A heat map color for debugging (blue -> cyan -> green -> yellow -> red).
@@ -1318,7 +1319,7 @@ struct SurfaceParams {
     rotation_scale: mat2x2<f32>,
     translation: vec2<f32>,
     opacity: f32,
-    pad: f32,
+    premultiplied_alpha: u32,
 }
 
 @group(1) @binding(0) var<uniform> surface_locals: SurfaceParams;
@@ -1358,6 +1359,14 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    let color = textureSampleLevel(t_surface, s_surface, input.texture_position, 0.0);
+    let sampled = textureSampleLevel(t_surface, s_surface, input.texture_position, 0.0);
+    var color = sampled;
+    if (surface_locals.premultiplied_alpha != 0u) {
+        // Avoid applying the destination alpha twice to scene-rendered textures.
+        color = vec4<f32>(vec3<f32>(0.0), sampled.a);
+        if (sampled.a > 0.0) {
+            color = vec4<f32>(sampled.rgb / sampled.a, sampled.a);
+        }
+    }
     return blend_color(color, surface_locals.opacity);
 }

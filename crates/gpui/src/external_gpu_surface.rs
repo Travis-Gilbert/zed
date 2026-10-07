@@ -1,3 +1,4 @@
+// Theorem modification: validate compositor ownership before scene export.
 use parking_lot::{Mutex, MutexGuard};
 use std::{
     collections::HashMap,
@@ -26,6 +27,24 @@ pub enum ExternalGpuSurfaceError {
     /// The surface was removed from its compositor registry.
     #[error("the external GPU surface is no longer registered")]
     Closed,
+    /// The requested dimensions exceed this device's texture limits.
+    #[error("external GPU surface dimensions {width}x{height} exceed limit {limit}")]
+    InvalidSize {
+        /// Requested device-pixel width.
+        width: u32,
+        /// Requested device-pixel height.
+        height: u32,
+        /// Device's maximum two-dimensional texture extent.
+        limit: u32,
+    },
+    /// A pending resize no longer matches the scene being exported.
+    #[error("external GPU surface dimensions changed from {expected:?} to {actual:?}")]
+    SizeChanged {
+        /// Device-pixel viewport used to build the scene.
+        expected: (u32, u32),
+        /// Current or pending device-pixel surface extent.
+        actual: (u32, u32),
+    },
 }
 
 /// The terminal-aware state of an external GPU surface.
@@ -42,7 +61,14 @@ pub enum ExternalGpuSurfaceStatus {
 /// Opaque identity for an external GPU surface in a compositor registry.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct ExternalGpuSurfaceId(u64);
+pub struct ExternalGpuSurfaceId {
+    registry: u64,
+    surface: u64,
+}
+
+// A scene can contain handles from multiple windows. Registry-local counters
+// alone would let a foreign handle alias a healthy compositor-owned surface.
+static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(not(target_family = "wasm"))]
 #[doc(hidden)]
@@ -91,6 +117,7 @@ struct TripleBuffer {
     views: [wgpu::TextureView; 3],
     indices: BufferIndices,
     submission_indices: [Option<wgpu::SubmissionIndex>; 3],
+    premultiplied_alpha: [bool; 3],
     frame_generation: u64,
     composited_generation: u64,
     redraw_pending: bool,
@@ -118,6 +145,14 @@ impl TripleBuffer {
 
         let width = width.max(1);
         let height = height.max(1);
+        let limit = device.limits().max_texture_dimension_2d;
+        if width > limit || height > limit {
+            return Err(ExternalGpuSurfaceError::InvalidSize {
+                width,
+                height,
+                limit,
+            });
+        }
         let create_texture = |label| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -151,6 +186,7 @@ impl TripleBuffer {
             views,
             indices: BufferIndices::default(),
             submission_indices: [None, None, None],
+            premultiplied_alpha: [false; 3],
             frame_generation: 0,
             composited_generation: 0,
             redraw_pending: false,
@@ -175,6 +211,7 @@ impl TripleBuffer {
 #[doc(hidden)]
 pub struct ExternalGpuSurfaceRegistry {
     surfaces: Mutex<HashMap<ExternalGpuSurfaceId, TripleBuffer>>,
+    registry_id: u64,
     next_id: AtomicU64,
     submission_gate: Mutex<()>,
 }
@@ -183,6 +220,9 @@ impl Default for ExternalGpuSurfaceRegistry {
     fn default() -> Self {
         Self {
             surfaces: Mutex::new(HashMap::new()),
+            registry_id: NEXT_REGISTRY_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("GPU surface registry identity exhausted"),
             next_id: AtomicU64::new(1),
             submission_gate: Mutex::new(()),
         }
@@ -211,10 +251,20 @@ impl ExternalGpuSurfaceRegistry {
         height: u32,
         format: wgpu::TextureFormat,
     ) -> Result<ExternalGpuSurfaceId, ExternalGpuSurfaceError> {
-        let id = ExternalGpuSurfaceId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let id = self.next_surface_id();
         let triple_buffer = TripleBuffer::new(device, width, height, format)?;
         self.surfaces.lock().insert(id, triple_buffer);
         Ok(id)
+    }
+
+    fn next_surface_id(&self) -> ExternalGpuSurfaceId {
+        ExternalGpuSurfaceId {
+            registry: self.registry_id,
+            surface: self
+                .next_id
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("GPU surface identity exhausted"),
+        }
     }
 
     fn remove(&self, id: ExternalGpuSurfaceId) {
@@ -241,6 +291,7 @@ impl ExternalGpuSurfaceRegistry {
         &self,
         id: ExternalGpuSurfaceId,
         submission_index: wgpu::SubmissionIndex,
+        premultiplied_alpha: bool,
     ) -> Option<bool> {
         let mut surfaces = self.surfaces.lock();
         let Some(surface) = surfaces.get_mut(&id) else {
@@ -248,6 +299,7 @@ impl ExternalGpuSurfaceRegistry {
         };
         let published = surface.indices.publish();
         surface.submission_indices[published] = Some(submission_index);
+        surface.premultiplied_alpha[published] = premultiplied_alpha;
         surface.frame_generation = surface.frame_generation.wrapping_add(1);
         let should_invalidate = !surface.redraw_pending;
         surface.redraw_pending = true;
@@ -257,6 +309,16 @@ impl ExternalGpuSurfaceRegistry {
     /// Promote the newest producer frame and return the stable display view.
     #[doc(hidden)]
     pub fn promote_and_front_view(&self, id: ExternalGpuSurfaceId) -> Option<wgpu::TextureView> {
+        self.promote_and_front_view_with_alpha(id)
+            .map(|(view, _)| view)
+    }
+
+    /// Promote color data and its alpha representation as one frame.
+    #[doc(hidden)]
+    pub fn promote_and_front_view_with_alpha(
+        &self,
+        id: ExternalGpuSurfaceId,
+    ) -> Option<(wgpu::TextureView, bool)> {
         let mut surfaces = self.surfaces.lock();
         let surface = surfaces.get_mut(&id)?;
         if surface.frame_generation != surface.composited_generation {
@@ -264,7 +326,10 @@ impl ExternalGpuSurfaceRegistry {
             surface.composited_generation = surface.frame_generation;
         }
         surface.redraw_pending = false;
-        Some(surface.views[surface.indices.display].clone())
+        Some((
+            surface.views[surface.indices.display].clone(),
+            surface.premultiplied_alpha[surface.indices.display],
+        ))
     }
 
     fn resize(
@@ -344,6 +409,21 @@ pub struct ExternalGpuSurfaceHandle {
 }
 
 impl ExternalGpuSurfaceHandle {
+    /// Whether this handle belongs to exactly this compositor registry and GPU.
+    ///
+    /// Registry-local surface IDs alone cannot identify a resource across renderers.
+    #[doc(hidden)]
+    pub fn belongs_to(
+        &self,
+        registry: &Arc<ExternalGpuSurfaceRegistry>,
+        device: &Arc<wgpu::Device>,
+        queue: &Arc<wgpu::Queue>,
+    ) -> bool {
+        Arc::ptr_eq(&self.inner.registry, registry)
+            && Arc::ptr_eq(&self.inner.device, device)
+            && Arc::ptr_eq(&self.inner.queue, queue)
+    }
+
     /// Construct a handle from a platform renderer's shared registry.
     #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
@@ -444,6 +524,22 @@ impl ExternalGpuSurfaceHandle {
 
     /// Acquire the rendering slot while excluding compositor submission and resize.
     pub fn acquire_frame(&self) -> Result<ExternalGpuSurfaceFrame<'_>, ExternalGpuSurfaceError> {
+        self.acquire_frame_for_size(None)
+    }
+
+    /// Acquire only if the current or pending size matches the scene's viewport.
+    /// A mismatch refuses before allocating a pending resize.
+    pub fn acquire_frame_at_size(
+        &self,
+        expected: (u32, u32),
+    ) -> Result<ExternalGpuSurfaceFrame<'_>, ExternalGpuSurfaceError> {
+        self.acquire_frame_for_size(Some(expected))
+    }
+
+    fn acquire_frame_for_size(
+        &self,
+        expected: Option<(u32, u32)>,
+    ) -> Result<ExternalGpuSurfaceFrame<'_>, ExternalGpuSurfaceError> {
         match self.status() {
             ExternalGpuSurfaceStatus::Ready => {}
             ExternalGpuSurfaceStatus::DeviceLost => {
@@ -453,11 +549,31 @@ impl ExternalGpuSurfaceHandle {
         }
 
         let submission_guard = self.inner.registry.lock_submission();
-        if let Some((width, height)) = self.inner.pending_size.lock().take() {
+        let mut pending_size = self.inner.pending_size.lock();
+        let size = pending_size.unwrap_or(self.size()?);
+        let size = (size.0.max(1), size.1.max(1));
+        if let Some(expected) = expected
+            && expected != size
+        {
+            return Err(ExternalGpuSurfaceError::SizeChanged {
+                expected,
+                actual: size,
+            });
+        }
+        let limit = self.inner.device.limits().max_texture_dimension_2d;
+        if size.0 > limit || size.1 > limit {
+            return Err(ExternalGpuSurfaceError::InvalidSize {
+                width: size.0,
+                height: size.1,
+                limit,
+            });
+        }
+        if pending_size.take().is_some() {
             self.inner
                 .registry
-                .resize(&self.inner.device, self.inner.id, width, height)?;
+                .resize(&self.inner.device, self.inner.id, size.0, size.1)?;
         }
+        drop(pending_size);
         let (view, size) = self
             .inner
             .registry
@@ -527,8 +643,24 @@ impl ExternalGpuSurfaceFrame<'_> {
 
     /// Submit command buffers and atomically publish this frame to GPUI.
     pub fn submit_and_present(
+        self,
+        command_buffers: impl IntoIterator<Item = wgpu::CommandBuffer>,
+    ) -> Result<wgpu::SubmissionIndex, ExternalGpuSurfaceError> {
+        self.submit_with_alpha(command_buffers, false)
+    }
+
+    /// Publish a scene-rendered frame whose stored RGB already includes alpha.
+    pub fn submit_premultiplied_and_present(
+        self,
+        command_buffers: impl IntoIterator<Item = wgpu::CommandBuffer>,
+    ) -> Result<wgpu::SubmissionIndex, ExternalGpuSurfaceError> {
+        self.submit_with_alpha(command_buffers, true)
+    }
+
+    fn submit_with_alpha(
         mut self,
         command_buffers: impl IntoIterator<Item = wgpu::CommandBuffer>,
+        premultiplied_alpha: bool,
     ) -> Result<wgpu::SubmissionIndex, ExternalGpuSurfaceError> {
         if self.handle.status() == ExternalGpuSurfaceStatus::DeviceLost {
             return Err(ExternalGpuSurfaceError::DeviceLost);
@@ -538,7 +670,11 @@ impl ExternalGpuSurfaceFrame<'_> {
             .handle
             .inner
             .registry
-            .publish(self.handle.inner.id, submission_index.clone())
+            .publish(
+                self.handle.inner.id,
+                submission_index.clone(),
+                premultiplied_alpha,
+            )
             .ok_or(ExternalGpuSurfaceError::Closed)?;
         drop(self.submission_guard.take());
         if should_invalidate {
@@ -558,6 +694,23 @@ mod tests {
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     };
+
+    #[test]
+    fn external_gpu_surface_identity_is_qualified_by_registry() {
+        let first = ExternalGpuSurfaceRegistry::new();
+        let second = ExternalGpuSurfaceRegistry::new();
+        let a = first.next_surface_id();
+        let b = second.next_surface_id();
+        assert_eq!(
+            a.surface, b.surface,
+            "both registries begin at the same local slot"
+        );
+        assert_ne!(
+            a, b,
+            "foreign surfaces must never alias local samples or failures"
+        );
+        assert_ne!(a, first.next_surface_id());
+    }
 
     #[test]
     fn external_gpu_surface_triple_buffer_rotation_stays_distinct() {
@@ -596,6 +749,11 @@ mod tests {
             compatible_surface: None,
             force_fallback_adapter: false,
         }))?;
+        let info = adapter.get_info();
+        println!(
+            "external surface adapter: {:?}, {:?}, {}",
+            info.backend, info.device_type, info.name
+        );
         let (device, queue) = crate::block_on(
             adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("external_gpu_surface_live_test_device"),
@@ -622,13 +780,30 @@ mod tests {
         let handle = ExternalGpuSurfaceHandle::new(
             Arc::clone(&registry),
             Arc::clone(&device),
-            queue,
+            Arc::clone(&queue),
             64,
             48,
             wgpu::TextureFormat::Rgba8Unorm,
             Arc::clone(&device_lost),
             invalidator,
         )?;
+
+        assert!(handle.belongs_to(&registry, &device, &queue));
+        assert!(!handle.belongs_to(
+            &Arc::new(ExternalGpuSurfaceRegistry::new()),
+            &device,
+            &queue
+        ));
+        handle.request_resize(device.limits().max_texture_dimension_2d + 1, 48);
+        assert!(matches!(
+            handle.acquire_frame_at_size((64, 48)),
+            Err(ExternalGpuSurfaceError::SizeChanged { .. })
+        ));
+        assert!(matches!(
+            handle.acquire_frame(),
+            Err(ExternalGpuSurfaceError::InvalidSize { .. })
+        ));
+        assert_eq!(handle.size()?, (64, 48));
 
         for iteration in 0..256_u32 {
             let width = 64 + iteration % 17;
@@ -639,9 +814,16 @@ mod tests {
             let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("external_gpu_surface_live_test_encoder"),
             });
-            frame.submit_and_present([encoder.finish()])?;
+            if iteration % 2 == 0 {
+                frame.submit_premultiplied_and_present([encoder.finish()])?;
+            } else {
+                frame.submit_and_present([encoder.finish()])?;
+            }
             assert!(handle.has_unconsumed_frame()?);
-            assert!(registry.promote_and_front_view(handle.id()).is_some());
+            let (_, premultiplied_alpha) = registry
+                .promote_and_front_view_with_alpha(handle.id())
+                .expect("published frame");
+            assert_eq!(premultiplied_alpha, iteration % 2 == 0);
             assert!(!handle.has_unconsumed_frame()?);
             assert_eq!(
                 handle.allocated_texture_bytes()?,

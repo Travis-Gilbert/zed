@@ -14,17 +14,16 @@ use crate::{
     KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex,
     Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
     MouseUpEvent, PaintSurface, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformNativeElement, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
-    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange, TextRenderingMode,
-    TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    PlatformInputHandler, PlatformNativeElement, PlatformWindow, Point, PolychromeSprite, Priority,
+    PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle,
+    Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -1195,6 +1194,8 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
+    retained_capture_depth: u32,
+    retained_capture_failures: Vec<crate::RetainedCaptureFailure>,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -2022,6 +2023,8 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            retained_capture_depth: 0,
+            retained_capture_failures: Vec::new(),
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -3218,6 +3221,46 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        fn export(
+            platform: &dyn PlatformWindow,
+            scene: &Scene,
+            failures: &mut Vec<crate::RetainedCaptureFailure>,
+        ) {
+            for capture in &scene.captures {
+                let before = failures.len();
+                export(platform, &capture.scene, failures);
+                let dependencies_failed = failures.len() != before || capture.scene.surfaces.iter().any(|surface| matches!(&surface.content, crate::SurfaceContent::ExternalGpu(id) if failures.iter().any(|failure| failure.target == *id)));
+                let result = if dependencies_failed {
+                    Err(anyhow!("retained capture dependency was not published"))
+                } else {
+                    platform
+                        .render_scene_to_external_surface(
+                            &capture.scene,
+                            &capture.target,
+                            capture.config.pixel_size(),
+                        )
+                        .map(|_| ())
+                };
+                if let Err(error) = result {
+                    failures.push(crate::RetainedCaptureFailure {
+                        target: capture.target.id(),
+                        reason: format!("{error:#}"),
+                    });
+                }
+            }
+        }
+        self.retained_capture_failures.clear();
+        export(
+            self.platform_window.as_ref(),
+            &self.rendered_frame.scene,
+            &mut self.retained_capture_failures,
+        );
+        let failed = self
+            .retained_capture_failures
+            .iter()
+            .map(|failure| failure.target)
+            .collect::<Vec<_>>();
+        self.rendered_frame.scene.omit_external_surfaces(&failed);
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
@@ -3696,6 +3739,80 @@ impl Window {
         );
     }
 
+    /// Refusals from the last capture presentation. Failed leases are omitted
+    /// from window composition; the rest of the shell remains usable.
+    pub fn retained_capture_failures(&self) -> &[crate::RetainedCaptureFailure] {
+        &self.retained_capture_failures
+    }
+
+    /// Whether the current subtree is a decorative retained capture.
+    /// Captured views always redraw; cached interactive/window ranges are not reused.
+    pub fn is_retained_capture(&self) -> bool {
+        self.retained_capture_depth != 0
+    }
+
+    /// Scope source-local layout, raster density, and disabled input for a retained view.
+    /// Use the identical configuration for source prepaint and paint. Ancestor masks
+    /// clip the final display surface, never the source texture. Deferred overlays
+    /// are deliberately excluded until projection-aware input/overlay support exists.
+    pub fn with_retained_capture<R>(
+        &mut self,
+        config: crate::RetainedCaptureConfig,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let scale = mem::replace(&mut self.scale_factor, config.scale_factor());
+        let masks = mem::replace(
+            &mut self.content_mask_stack,
+            vec![ContentMask {
+                bounds: Bounds::new(Point::default(), config.logical_size()),
+            }],
+        );
+        let offsets = mem::replace(&mut self.element_offset_stack, vec![Point::default()]);
+        let viewport = mem::replace(&mut self.viewport_size, config.logical_size());
+        let tab_stops = mem::take(&mut self.next_frame.tab_stops);
+        let a11y = mem::replace(
+            &mut self.a11y,
+            A11y::new(Arc::new(AtomicBool::new(false)), true, None),
+        );
+        let focus_enabled = mem::replace(&mut self.focus_enabled, false);
+        self.retained_capture_depth += 1;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.retained_capture_depth -= 1;
+        self.focus_enabled = focus_enabled;
+        self.a11y = a11y;
+        self.next_frame.tab_stops = tab_stops;
+        self.viewport_size = viewport;
+        self.element_offset_stack = offsets;
+        self.content_mask_stack = masks;
+        self.scale_factor = scale;
+        match result {
+            Ok(value) => value,
+            Err(error) => std::panic::resume_unwind(error),
+        }
+    }
+
+    /// Paint an already retained source into this window's compositor-owned lease.
+    /// This grants no pointer, keyboard, IME, accessibility, or browser texture authority.
+    pub fn paint_retained_capture(
+        &mut self,
+        config: crate::RetainedCaptureConfig,
+        target: ExternalGpuSurfaceHandle,
+        paint: impl FnOnce(&mut Self),
+    ) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame.scene.start_retained_capture(target, config);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.with_retained_capture(config, paint)
+        }));
+        match result {
+            Ok(()) => self.next_frame.scene.end_retained_capture(),
+            Err(error) => {
+                self.next_frame.scene.cancel_retained_capture();
+                std::panic::resume_unwind(error);
+            }
+        }
+    }
+
     /// Push a text style onto the stack, and call a function with that style active.
     /// Use [`Window::text_style`] to get the current, combined text style. This method
     /// should only be called as part of element drawing.
@@ -3717,6 +3834,9 @@ impl Window {
     /// Updates the cursor style at the platform level. This method should only be called
     /// during the paint phase of element drawing.
     pub fn set_cursor_style(&mut self, style: CursorStyle, hitbox: &Hitbox) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.invalidator.debug_assert_paint();
         self.next_frame.cursor_styles.push(CursorStyleRequest {
             hitbox_id: Some(hitbox.id),
@@ -3729,6 +3849,9 @@ impl Window {
     /// `set_cursor_style`. This method should only be called during the paint
     /// phase of element drawing.
     pub fn set_window_cursor_style(&mut self, style: CursorStyle) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.invalidator.debug_assert_paint();
         self.next_frame.cursor_styles.push(CursorStyleRequest {
             hitbox_id: None,
@@ -3741,9 +3864,11 @@ impl Window {
     pub fn set_tooltip(&mut self, tooltip: AnyTooltip) -> TooltipId {
         self.invalidator.debug_assert_prepaint();
         let id = TooltipId(post_inc(&mut self.next_tooltip_id.0));
-        self.next_frame
-            .tooltip_requests
-            .push(Some(TooltipRequest { id, tooltip }));
+        if !self.is_retained_capture() {
+            self.next_frame
+                .tooltip_requests
+                .push(Some(TooltipRequest { id, tooltip }));
+        }
         id
     }
 
@@ -4127,6 +4252,9 @@ impl Window {
         priority: usize,
         content_mask: Option<ContentMask<Pixels>>,
     ) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.invalidator.debug_assert_prepaint();
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
         self.next_frame.deferred_draws.push(DeferredDraw {
@@ -4537,7 +4665,11 @@ impl Window {
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
-        if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
+        // Captures have transparent premultiplied targets and may be transformed
+        // over another background. Host-window RGB coverage is not transferable.
+        if self.is_retained_capture()
+            || self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque
+        {
             return false;
         }
 
@@ -4997,7 +5129,9 @@ impl Window {
             content_mask,
             behavior,
         };
-        self.next_frame.hitboxes.push(hitbox.clone());
+        if !self.is_retained_capture() {
+            self.next_frame.hitboxes.push(hitbox.clone());
+        }
         hitbox
     }
 
@@ -5005,6 +5139,9 @@ impl Window {
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn insert_window_control_hitbox(&mut self, area: WindowControlArea, hitbox: Hitbox) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.invalidator.debug_assert_paint();
         self.next_frame.window_control_hitboxes.push((area, hitbox));
     }
@@ -5014,6 +5151,9 @@ impl Window {
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn set_key_context(&mut self, context: KeyContext) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.invalidator.debug_assert_paint();
         self.next_frame.dispatch_tree.set_key_context(context);
     }
@@ -5023,6 +5163,9 @@ impl Window {
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn set_focus_handle(&mut self, focus_handle: &FocusHandle, _: &App) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.invalidator.debug_assert_prepaint();
         if focus_handle.is_focused(self) {
             self.next_frame.focus = Some(focus_handle.id);
@@ -5087,6 +5230,9 @@ impl Window {
         input_handler: impl InputHandler,
         cx: &App,
     ) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.invalidator.debug_assert_paint();
 
         if focus_handle.is_focused(self) {
@@ -5126,6 +5272,9 @@ impl Window {
         &mut self,
         mut listener: impl FnMut(&Event, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.invalidator.debug_assert_paint();
 
         self.next_frame.mouse_listeners.push(Some(Box::new(
@@ -5149,6 +5298,9 @@ impl Window {
         &mut self,
         listener: impl Fn(&Event, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.invalidator.debug_assert_paint();
 
         self.next_frame.dispatch_tree.on_key_event(Rc::new(
@@ -5170,6 +5322,9 @@ impl Window {
         &mut self,
         listener: impl Fn(&ModifiersChangedEvent, &mut Window, &mut App) + 'static,
     ) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.invalidator.debug_assert_paint();
 
         self.next_frame.dispatch_tree.on_modifiers_changed(Rc::new(
@@ -6543,6 +6698,9 @@ impl Window {
         action_type: TypeId,
         listener: impl Fn(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.invalidator.debug_assert_paint();
 
         self.next_frame
@@ -6564,6 +6722,9 @@ impl Window {
         action_type: TypeId,
         listener: impl Fn(&dyn Any, DispatchPhase, &mut Window, &mut App) + 'static,
     ) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.invalidator.debug_assert_paint();
 
         if condition {
@@ -6665,6 +6826,9 @@ impl Window {
         action: accesskit::Action,
         listener: impl FnMut(Option<&accesskit::ActionData>, &mut Window, &mut App) + 'static,
     ) {
+        if self.is_retained_capture() {
+            return;
+        }
         self.a11y
             .action_listeners
             .entry(node_id)
