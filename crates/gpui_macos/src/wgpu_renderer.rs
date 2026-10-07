@@ -131,6 +131,18 @@ impl Renderer {
         }
     }
 
+    pub fn render_scene_to_external_surface(
+        &mut self,
+        scene: &Scene,
+        target: &ExternalGpuSurfaceHandle,
+        expected_size: Size<DevicePixels>,
+    ) -> anyhow::Result<gpui::wgpu::SubmissionIndex> {
+        self.inner
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("macOS compositor is not initialized"))?
+            .render_scene_to_external_surface(scene, target, expected_size)
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> bool {
         self.inner_mut().draw(scene)
     }
@@ -167,6 +179,22 @@ impl Renderer {
 
     pub fn device_lost(&self) -> bool {
         self.inner().device_lost()
+    }
+
+    /// Native retained-paint transport on this compositor's exact device/queue.
+    pub fn create_native_gpu_surface_producer(
+        &self,
+        source: ExternalGpuSurfaceHandle,
+    ) -> Result<
+        crate::mac_gpu_surface::MacGpuSurfaceProducer,
+        crate::mac_gpu_surface::MacGpuSurfaceError,
+    > {
+        let context = self.context.borrow();
+        let context = context.as_ref().ok_or(ExternalGpuSurfaceError::Closed)?;
+        if source.device() != &*context.device || source.queue() != &*context.queue {
+            return Err(crate::mac_gpu_surface::MacGpuSurfaceError::ForeignRenderer);
+        }
+        crate::mac_gpu_surface::MacGpuSurfaceProducer::new(source)
     }
 
     pub fn recover(&mut self) -> anyhow::Result<()> {

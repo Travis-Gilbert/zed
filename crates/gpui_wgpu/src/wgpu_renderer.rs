@@ -1,3 +1,4 @@
+// Theorem modification: render admitted scenes into compositor-owned GPU leases.
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
@@ -88,7 +89,7 @@ struct SurfaceParams {
     rotation_scale: [[f32; 2]; 2],
     translation: [f32; 2],
     opacity: f32,
-    _pad: f32,
+    premultiplied_alpha: u32,
 }
 
 struct PreparedExternalSurface {
@@ -193,6 +194,7 @@ struct WgpuResources {
     queue: Arc<wgpu::Queue>,
     surface: wgpu::Surface<'static>,
     pipelines: WgpuPipelines,
+    export_pipelines: Option<WgpuPipelines>,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
     globals_buffer: wgpu::Buffer,
@@ -203,9 +205,29 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    export_path_intermediate_texture: Option<wgpu::Texture>,
+    export_path_intermediate_view: Option<wgpu::TextureView>,
+    export_path_msaa_texture: Option<wgpu::Texture>,
+    export_path_msaa_view: Option<wgpu::TextureView>,
 }
 
 impl WgpuResources {
+    fn exchange_export_intermediates(&mut self) {
+        std::mem::swap(
+            &mut self.path_intermediate_texture,
+            &mut self.export_path_intermediate_texture,
+        );
+        std::mem::swap(
+            &mut self.path_intermediate_view,
+            &mut self.export_path_intermediate_view,
+        );
+        std::mem::swap(
+            &mut self.path_msaa_texture,
+            &mut self.export_path_msaa_texture,
+        );
+        std::mem::swap(&mut self.path_msaa_view, &mut self.export_path_msaa_view);
+    }
+
     fn invalidate_intermediate_textures(&mut self) {
         self.path_intermediate_texture = None;
         self.path_intermediate_view = None;
@@ -578,6 +600,7 @@ impl WgpuRenderer {
             queue,
             surface,
             pipelines,
+            export_pipelines: None,
             bind_group_layouts,
             atlas_sampler,
             globals_buffer,
@@ -590,6 +613,10 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            export_path_intermediate_texture: None,
+            export_path_intermediate_view: None,
+            export_path_msaa_texture: None,
+            export_path_msaa_view: None,
         };
 
         Ok(Self {
@@ -1173,14 +1200,18 @@ impl WgpuRenderer {
         }
     }
 
-    fn ensure_intermediate_textures(&mut self) {
-        if self.resources().path_intermediate_texture.is_some() {
+    fn ensure_intermediate_textures(&mut self, width: u32, height: u32) {
+        if self
+            .resources()
+            .path_intermediate_texture
+            .as_ref()
+            .is_some_and(|texture| texture.width() == width && texture.height() == height)
+        {
             return;
         }
 
         let format = self.surface_config.format;
-        let width = self.surface_config.width;
-        let height = self.surface_config.height;
+        self.resources_mut().invalidate_intermediate_textures();
         let path_sample_count = self.rendering_params.path_sample_count;
         let resources = self.resources_mut();
 
@@ -1364,13 +1395,27 @@ impl WgpuRenderer {
             }
         };
 
-        // Now that we know the surface is healthy, ensure intermediate textures exist
-        self.ensure_intermediate_textures();
-
+        self.prepare_frame_target(
+            self.surface_config.width,
+            self.surface_config.height,
+            self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied,
+        );
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        if let Err(error) = self.record_frame(scene, &frame_view) {
+            log::error!("{error:#}");
+            self.resources().queue.submit(std::iter::empty());
+            return false;
+        }
+
+        frame.present();
+        true
+    }
+
+    fn prepare_frame_target(&mut self, width: u32, height: u32, premultiplied_alpha: bool) {
+        self.ensure_intermediate_textures(width, height);
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
             grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
@@ -1380,17 +1425,8 @@ impl WgpuRenderer {
         };
 
         let globals = GlobalParams {
-            viewport_size: [
-                self.surface_config.width as f32,
-                self.surface_config.height as f32,
-            ],
-            premultiplied_alpha: if self.surface_config.alpha_mode
-                == wgpu::CompositeAlphaMode::PreMultiplied
-            {
-                1
-            } else {
-                0
-            },
+            viewport_size: [width as f32, height as f32],
+            premultiplied_alpha: u32::from(premultiplied_alpha),
             pad: 0,
         };
 
@@ -1417,20 +1453,107 @@ impl WgpuRenderer {
                 bytemuck::bytes_of(&gamma_params),
             );
         }
+    }
 
-        if let Err(error) = self.record_frame(scene, &frame_view) {
-            log::error!("{error:#}");
-            self.resources().queue.submit(std::iter::empty());
-            return false;
+    /// Render an already-built scene into a lease on this compositor's device.
+    ///
+    /// This neither lays out a retained view nor transfers focus/input ownership.
+    /// The caller binds the scene to its own source/presentation generation. The
+    /// returned submission identifies publication, not GPU completion or native
+    /// input readiness. The target must match the compositor's color format.
+    /// A temporarily unconfigured window surface does not prevent offscreen
+    /// rendering; destroyed renderer resources do.
+    pub fn render_scene_to_external_surface(
+        &mut self,
+        scene: &Scene,
+        target: &ExternalGpuSurfaceHandle,
+        expected_size: Size<DevicePixels>,
+    ) -> Result<wgpu::SubmissionIndex> {
+        anyhow::ensure!(!self.device_lost(), "scene export device was lost");
+        anyhow::ensure!(
+            self.resources.is_some(),
+            "scene export renderer was destroyed"
+        );
+        let resources = self.resources();
+        validate_scene_export(
+            target.belongs_to(
+                &self.external_surface_registry,
+                &resources.device,
+                &resources.queue,
+            ),
+            (expected_size.width.0, expected_size.height.0),
+            self.max_texture_size,
+            target.format() == self.surface_config.format,
+            scene.surfaces.iter().any(|surface| {
+                matches!(
+                    &surface.content, SurfaceContent::ExternalGpu(id) if *id == target.id()
+                )
+            }),
+        )
+        .map_err(anyhow::Error::msg)?;
+
+        // acquire_frame already owns the submission gate; calling record_frame
+        // here would acquire that non-reentrant mutex a second time.
+        let frame = target
+            .acquire_frame_at_size((expected_size.width.0 as u32, expected_size.height.0 as u32))?;
+        self.atlas.before_frame();
+        let swap_pipelines =
+            self.surface_config.alpha_mode != wgpu::CompositeAlphaMode::PreMultiplied;
+        if swap_pipelines && self.resources().export_pipelines.is_none() {
+            let resources = self.resources();
+            let pipelines = Self::create_pipelines(
+                &resources.device,
+                &resources.bind_group_layouts,
+                self.surface_config.format,
+                wgpu::CompositeAlphaMode::PreMultiplied,
+                self.rendering_params.path_sample_count,
+                self.dual_source_blending,
+                self.uses_webgl_instance_data,
+            );
+            self.resources_mut().export_pipelines = Some(pipelines);
         }
-
-        frame.present();
-        true
+        if swap_pipelines {
+            let resources = self.resources_mut();
+            std::mem::swap(
+                &mut resources.pipelines,
+                resources
+                    .export_pipelines
+                    .as_mut()
+                    .context("export pipeline cache was not initialized")?,
+            );
+        }
+        self.resources_mut().exchange_export_intermediates();
+        self.prepare_frame_target(frame.size().0, frame.size().1, true);
+        let commands = self.encode_frame(scene, frame.view());
+        self.resources_mut().exchange_export_intermediates();
+        // Restore the window pipeline even when scene encoding refuses.
+        if swap_pipelines {
+            let resources = self.resources_mut();
+            std::mem::swap(
+                &mut resources.pipelines,
+                resources
+                    .export_pipelines
+                    .as_mut()
+                    .context("export pipeline cache was not initialized")?,
+            );
+        }
+        let commands = commands?;
+        Ok(frame.submit_premultiplied_and_present([commands])?)
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
         let external_surface_registry = Arc::clone(&self.external_surface_registry);
         let _external_submission_guard = external_surface_registry.lock_submission();
+        let commands = self.encode_frame(scene, frame_view)?;
+        self.resources().queue.submit([commands]);
+        Ok(())
+    }
+
+    fn encode_frame(
+        &mut self,
+        scene: &Scene,
+        frame_view: &wgpu::TextureView,
+    ) -> Result<wgpu::CommandBuffer> {
         let prepared_external_surfaces = self.prepare_external_surfaces(scene);
         let mut instance_offset = 0;
         let instance_bindings = self
@@ -1573,10 +1696,7 @@ impl WgpuRenderer {
             }
         }
 
-        self.resources()
-            .queue
-            .submit(std::iter::once(encoder.finish()));
-        Ok(())
+        Ok(encoder.finish())
     }
 
     fn prepare_external_surfaces(&self, scene: &Scene) -> Vec<Option<PreparedExternalSurface>> {
@@ -1589,16 +1709,16 @@ impl WgpuRenderer {
                     #[cfg(target_os = "macos")]
                     SurfaceContent::Video(_) => return None,
                 };
-                let texture_view = self
+                let (texture_view, premultiplied_alpha) = self
                     .external_surface_registry
-                    .promote_and_front_view(*surface_id)?;
+                    .promote_and_front_view_with_alpha(*surface_id)?;
                 let parameters = SurfaceParams {
                     bounds: surface.bounds.into(),
                     content_mask: surface.content_mask.bounds.into(),
                     rotation_scale: surface.transformation.rotation_scale,
                     translation: surface.transformation.translation,
                     opacity: surface.opacity,
-                    _pad: 0.0,
+                    premultiplied_alpha: u32::from(premultiplied_alpha),
                 };
                 let resources = self.resources();
                 let parameters_buffer =
@@ -2228,6 +2348,33 @@ impl WgpuRenderer {
     }
 }
 
+// Kept GPU-free so admission can be tested without claiming a live renderer run.
+fn validate_scene_export(
+    same_owner: bool,
+    size: (i32, i32),
+    max_texture_size: u32,
+    same_format: bool,
+    samples_destination: bool,
+) -> std::result::Result<(), &'static str> {
+    if !same_owner {
+        return Err("scene export target belongs to another compositor");
+    }
+    if size.0 <= 0
+        || size.1 <= 0
+        || size.0 as u32 > max_texture_size
+        || size.1 as u32 > max_texture_size
+    {
+        return Err("scene export dimensions are invalid");
+    }
+    if !same_format {
+        return Err("scene export target format differs from the compositor");
+    }
+    if samples_destination {
+        return Err("scene export cannot sample its destination");
+    }
+    Ok(())
+}
+
 fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
 }
@@ -2297,6 +2444,52 @@ impl RenderingParameters {
 mod tests {
     use super::*;
     use gpui::{MonochromeSprite, PolychromeSprite, Quad, Shadow, SubpixelSprite, Underline};
+
+    #[test]
+    fn scene_export_refuses_another_owner_before_any_gpu_work() {
+        assert_eq!(
+            validate_scene_export(false, (640, 480), 4096, true, false),
+            Err("scene export target belongs to another compositor")
+        );
+    }
+
+    #[test]
+    fn scene_export_admits_only_bounded_positive_dimensions() {
+        for size in [(0, 480), (640, 0), (-1, 480), (4097, 480), (640, 4097)] {
+            assert_eq!(
+                validate_scene_export(true, size, 4096, true, false),
+                Err("scene export dimensions are invalid")
+            );
+        }
+        assert_eq!(
+            validate_scene_export(true, (4096, 1), 4096, true, false),
+            Ok(())
+        );
+        assert_eq!(
+            validate_scene_export(true, (1, 4096), 4096, true, false),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn scene_export_refuses_a_pipeline_format_mismatch() {
+        assert_eq!(
+            validate_scene_export(true, (640, 480), 4096, false, false),
+            Err("scene export target format differs from the compositor")
+        );
+    }
+
+    #[test]
+    fn scene_export_cannot_sample_its_destination() {
+        assert_eq!(
+            validate_scene_export(true, (640, 480), 4096, true, true),
+            Err("scene export cannot sample its destination")
+        );
+        assert_eq!(
+            validate_scene_export(true, (640, 480), 4096, true, false),
+            Ok(())
+        );
+    }
 
     #[test]
     fn webgl_shader_is_valid_wgsl_without_storage_buffers() {

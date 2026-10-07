@@ -1927,6 +1927,19 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().toggle_tab_bar_callback = Some(callback);
     }
 
+    #[cfg(feature = "external-gpu-surface")]
+    fn render_scene_to_external_surface(
+        &self,
+        scene: &gpui::Scene,
+        target: &ExternalGpuSurfaceHandle,
+        expected_size: Size<gpui::DevicePixels>,
+    ) -> anyhow::Result<gpui::wgpu::SubmissionIndex> {
+        self.0
+            .lock()
+            .renderer
+            .render_scene_to_external_surface(scene, target, expected_size)
+    }
+
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
 

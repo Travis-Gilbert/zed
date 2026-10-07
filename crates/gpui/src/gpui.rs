@@ -48,6 +48,7 @@ pub mod profiler;
 #[expect(missing_docs)]
 pub mod queue;
 mod scene;
+mod retained_capture;
 mod shared_uri;
 mod spring;
 mod style;
@@ -150,6 +151,7 @@ pub use profiler::*;
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
 pub use scene::*;
+pub use retained_capture::*;
 pub use shared_uri::*;
 use std::{any::Any, future::Future};
 pub use style::*;

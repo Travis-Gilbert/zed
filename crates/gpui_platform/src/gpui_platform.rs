@@ -3,6 +3,10 @@
 
 pub use gpui::Platform;
 
+/// Native-only retained-paint IOSurface transport on the compositor device.
+#[cfg(all(target_os = "macos", feature = "external-gpu-surface"))]
+pub use gpui_macos::mac_gpu_surface;
+
 use std::rc::Rc;
 
 /// Returns a background executor for the current platform.

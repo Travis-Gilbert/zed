@@ -18,7 +18,7 @@ test-support = ["gpui/test-support", "gpui_apple/test-support"]
 runtime_shaders = ["gpui_apple/runtime_shaders"]
 font-kit = ["dep:font-kit"]
 screen-capture = ["gpui/screen-capture"]
-external-gpu-surface = ["dep:gpui_wgpu"]
+external-gpu-surface = ["dep:gpui_wgpu", "dep:objc2-metal", "dep:thiserror"]
 
 [dependencies]
 gpui.workspace = true
@@ -56,6 +56,7 @@ objc.workspace = true
 objc2.workspace = true
 objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
+objc2-metal = { version = "0.3.2", optional = true }
 objc2-user-notifications.workspace = true
 parking_lot.workspace = true
 pathfinder_geometry.workspace = true
@@ -63,6 +64,7 @@ raw-window-handle.workspace = true
 semver.workspace = true
 smallvec.workspace = true
 strum.workspace = true
+thiserror = { workspace = true, optional = true }
 uuid.workspace = true
 
 # The macOS test-only window implementation depends on test-only APIs from both

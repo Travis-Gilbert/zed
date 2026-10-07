@@ -7658,6 +7658,7 @@ dependencies = [
  "objc2 0.6.3",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "objc2-metal 0.3.2",
  "objc2-user-notifications",
  "parking_lot",
  "pathfinder_geometry",
@@ -7665,6 +7666,7 @@ dependencies = [
  "semver",
  "smallvec",
  "strum 0.28.0",
+ "thiserror 2.0.17",
  "uuid",
  "zed-font-kit",
 ]

@@ -1039,6 +1039,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Export a paint-only retained scene using this compositor's existing lease owner.
+    /// Unsupported backends refuse rather than returning an old or CPU-backed frame.
+    fn render_scene_to_external_surface(
+        &self,
+        _scene: &Scene,
+        _target: &ExternalGpuSurfaceHandle,
+        _expected_size: Size<DevicePixels>,
+    ) -> Result<wgpu::SubmissionIndex> {
+        anyhow::bail!("retained scene export is unsupported by this platform")
+    }
     fn schedule_frame(&self) {}
     /// Allocate a bounded texture surface on this window's compositor device.
     fn create_external_gpu_surface(
