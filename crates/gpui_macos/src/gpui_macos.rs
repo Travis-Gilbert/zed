@@ -19,6 +19,8 @@ mod screen_capture;
 use gpui_apple::metal_renderer as renderer;
 
 #[cfg(feature = "external-gpu-surface")]
+pub mod mac_gpu_surface;
+#[cfg(feature = "external-gpu-surface")]
 mod wgpu_renderer;
 #[cfg(feature = "external-gpu-surface")]
 use wgpu_renderer as renderer;

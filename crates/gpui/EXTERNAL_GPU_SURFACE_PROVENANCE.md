@@ -55,3 +55,30 @@ and presentation generation ownership, pointer mapping, keyboard focus, IME,
 accessibility projection, overlay placement, resource recovery, trusted return,
 and any privileged browser GPU import. A captured interface must not be
 advertised as interactive before those obligations are implemented and proved.
+
+## macOS IOSurface export, 2026-10-07
+
+The submitted-frame read lease and `gpui_macos::mac_gpu_surface` extend the
+retained-capture implementation at `93ffaae7fa2fd5b419d6637bf5b4874e6bd1ddc5`.
+The producer uses the compositor's exact Metal device and submission queue,
+copies through a WGSL texture-load pass into one of three retained IOSurfaces,
+and exposes completed frames through the versioned same-process C lease in
+`gpui_macos/native_gpu_frame_v1.h`. Held frames cannot be overwritten; resize,
+source loss, stale completion and exhausted slots refuse or backpressure.
+Native IOSurface initialization is submitted and completed on that same queue
+before its unsafe wgpu HAL import. Production export has no pixel readback.
+
+The native frame lease owns retained storage only. It grants no document,
+WebGL context, texture, origin, presentation epoch or provider identity. The
+privileged consumer must establish those authorities separately and retain
+the lease until its GPU use completes. No pointer or IOSurface global ID is
+exposed through a guest/MCP endpoint.
+
+Actual source-module Metal tests exercise changing pixels, top-row orientation,
+premultiplied BGRA, held slots, resize/loss and cross-thread C ABI release.
+An independent component probe imports those actual surfaces through the
+pinned Servo CGL graphics function into a real GL texture. Diagnostic readback
+is confined to tests. These source-module probes do not establish the owning
+Cargo graph, live Servo DOM admission, input/IME, or a mounted product. Their
+reproduction sources and revision-bound receipts are retained in Theorem's
+`docs/plans/theorem-world-first-crossing-20261006/forks/gpui-fusion`.

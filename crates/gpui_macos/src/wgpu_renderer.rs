@@ -181,6 +181,22 @@ impl Renderer {
         self.inner().device_lost()
     }
 
+    /// Native retained-paint transport on this compositor's exact device/queue.
+    pub fn create_native_gpu_surface_producer(
+        &self,
+        source: ExternalGpuSurfaceHandle,
+    ) -> Result<
+        crate::mac_gpu_surface::MacGpuSurfaceProducer,
+        crate::mac_gpu_surface::MacGpuSurfaceError,
+    > {
+        let context = self.context.borrow();
+        let context = context.as_ref().ok_or(ExternalGpuSurfaceError::Closed)?;
+        if source.device() != &*context.device || source.queue() != &*context.queue {
+            return Err(crate::mac_gpu_surface::MacGpuSurfaceError::ForeignRenderer);
+        }
+        crate::mac_gpu_surface::MacGpuSurfaceProducer::new(source)
+    }
+
     pub fn recover(&mut self) -> anyhow::Result<()> {
         let surface_target = self.surface_target;
         self.inner_mut().recover(&surface_target)

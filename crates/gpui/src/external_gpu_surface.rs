@@ -45,6 +45,18 @@ pub enum ExternalGpuSurfaceError {
         /// Current or pending device-pixel surface extent.
         actual: (u32, u32),
     },
+    /// No producer frame has been submitted for the current resource generation.
+    #[error("the external GPU surface has no submitted frame")]
+    NotPublished,
+    /// A pending resize invalidates reads until a matching producer frame is submitted.
+    #[error("the external GPU surface has a pending resize")]
+    ResizePending,
+    /// The caller's exact submitted frame is no longer current.
+    #[error("the external GPU surface submitted frame changed")]
+    StaleFrame,
+    /// Resource/frame identity counters cannot be reused after exhaustion.
+    #[error("the external GPU surface generation is exhausted")]
+    GenerationExhausted,
 }
 
 /// The terminal-aware state of an external GPU surface.
@@ -64,6 +76,54 @@ pub enum ExternalGpuSurfaceStatus {
 pub struct ExternalGpuSurfaceId {
     registry: u64,
     surface: u64,
+}
+
+impl ExternalGpuSurfaceId {
+    /// Native transport identity; these counters are not authority grants or GPU pointers.
+    pub fn native_identity(&self) -> (u64, u64) {
+        (self.registry, self.surface)
+    }
+}
+
+/// Exact native-only identity of a submitted color frame.
+///
+/// This is not a document, provider or browser authorization token. A host must
+/// bind it to its existing presentation/source authority before transporting it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExternalGpuSurfaceFrameStamp {
+    surface: ExternalGpuSurfaceId,
+    resource_generation: u64,
+    frame_generation: u64,
+    size: (u32, u32),
+    format: wgpu::TextureFormat,
+    premultiplied_alpha: bool,
+}
+
+impl ExternalGpuSurfaceFrameStamp {
+    /// Registry-qualified source resource identity.
+    pub fn surface(&self) -> ExternalGpuSurfaceId {
+        self.surface
+    }
+    /// Changes whenever the surface's actual texture resources are replaced.
+    pub fn resource_generation(&self) -> u64 {
+        self.resource_generation
+    }
+    /// Submitted producer-frame sequence within this resource generation.
+    pub fn frame_generation(&self) -> u64 {
+        self.frame_generation
+    }
+    /// Immutable device-pixel dimensions of this submitted frame.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+    /// Actual color texture format.
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
+    /// Whether source RGB already includes its alpha value.
+    pub fn premultiplied_alpha(&self) -> bool {
+        self.premultiplied_alpha
+    }
 }
 
 // A scene can contain handles from multiple windows. Registry-local counters
@@ -118,6 +178,7 @@ struct TripleBuffer {
     indices: BufferIndices,
     submission_indices: [Option<wgpu::SubmissionIndex>; 3],
     premultiplied_alpha: [bool; 3],
+    resource_generation: u64,
     frame_generation: u64,
     composited_generation: u64,
     redraw_pending: bool,
@@ -187,6 +248,7 @@ impl TripleBuffer {
             indices: BufferIndices::default(),
             submission_indices: [None, None, None],
             premultiplied_alpha: [false; 3],
+            resource_generation: 1,
             frame_generation: 0,
             composited_generation: 0,
             redraw_pending: false,
@@ -292,18 +354,52 @@ impl ExternalGpuSurfaceRegistry {
         id: ExternalGpuSurfaceId,
         submission_index: wgpu::SubmissionIndex,
         premultiplied_alpha: bool,
-    ) -> Option<bool> {
+    ) -> Result<bool, ExternalGpuSurfaceError> {
         let mut surfaces = self.surfaces.lock();
-        let Some(surface) = surfaces.get_mut(&id) else {
-            return None;
-        };
+        let surface = surfaces
+            .get_mut(&id)
+            .ok_or(ExternalGpuSurfaceError::Closed)?;
+        let frame_generation = surface
+            .frame_generation
+            .checked_add(1)
+            .ok_or(ExternalGpuSurfaceError::GenerationExhausted)?;
         let published = surface.indices.publish();
         surface.submission_indices[published] = Some(submission_index);
         surface.premultiplied_alpha[published] = premultiplied_alpha;
-        surface.frame_generation = surface.frame_generation.wrapping_add(1);
+        surface.frame_generation = frame_generation;
         let should_invalidate = !surface.redraw_pending;
         surface.redraw_pending = true;
-        Some(should_invalidate)
+        Ok(should_invalidate)
+    }
+
+    fn published_frame(
+        &self,
+        id: ExternalGpuSurfaceId,
+    ) -> Result<(wgpu::TextureView, ExternalGpuSurfaceFrameStamp), ExternalGpuSurfaceError> {
+        let surfaces = self.surfaces.lock();
+        let surface = surfaces.get(&id).ok_or(ExternalGpuSurfaceError::Closed)?;
+        if surface.frame_generation == 0 {
+            return Err(ExternalGpuSurfaceError::NotPublished);
+        }
+        let slot = if surface.frame_generation != surface.composited_generation {
+            surface.indices.ready
+        } else {
+            surface.indices.display
+        };
+        if surface.submission_indices[slot].is_none() {
+            return Err(ExternalGpuSurfaceError::NotPublished);
+        }
+        Ok((
+            surface.views[slot].clone(),
+            ExternalGpuSurfaceFrameStamp {
+                surface: id,
+                resource_generation: surface.resource_generation,
+                frame_generation: surface.frame_generation,
+                size: (surface.width, surface.height),
+                format: surface.format,
+                premultiplied_alpha: surface.premultiplied_alpha[slot],
+            },
+        ))
     }
 
     /// Promote the newest producer frame and return the stable display view.
@@ -354,7 +450,13 @@ impl ExternalGpuSurfaceRegistry {
                 timeout: None,
             })
             .map_err(|_| ExternalGpuSurfaceError::DeviceLost)?;
-        *surface = TripleBuffer::new(device, width, height, surface.format)?;
+        let generation = surface
+            .resource_generation
+            .checked_add(1)
+            .ok_or(ExternalGpuSurfaceError::GenerationExhausted)?;
+        let mut replacement = TripleBuffer::new(device, width, height, surface.format)?;
+        replacement.resource_generation = generation;
+        *surface = replacement;
         Ok((width, height))
     }
 
@@ -536,6 +638,58 @@ impl ExternalGpuSurfaceHandle {
         self.acquire_frame_for_size(Some(expected))
     }
 
+    /// Read metadata for the newest submitted frame without promoting GPUI display.
+    ///
+    /// The caller must subsequently acquire this exact stamp; metadata alone does
+    /// not pin a slot or establish browser/provider presentation authority.
+    pub fn published_frame_stamp(
+        &self,
+    ) -> Result<ExternalGpuSurfaceFrameStamp, ExternalGpuSurfaceError> {
+        let _submission_guard = self.inner.registry.lock_submission();
+        self.check_published_read()?;
+        self.inner
+            .registry
+            .published_frame(self.inner.id)
+            .map(|(_, stamp)| stamp)
+    }
+
+    /// Acquire an exact submitted frame while excluding source overwrite/resize.
+    ///
+    /// Copy commands must be submitted through the returned lease on this device's
+    /// queue before releasing it. Do not retain/submit the borrowed view after the
+    /// lease; the same texture slot can later contain unrelated producer output.
+    pub fn acquire_published_frame(
+        &self,
+        expected: ExternalGpuSurfaceFrameStamp,
+    ) -> Result<ExternalGpuSurfaceReadFrame<'_>, ExternalGpuSurfaceError> {
+        let submission_guard = self.inner.registry.lock_submission();
+        self.check_published_read()?;
+        let (view, stamp) = self.inner.registry.published_frame(self.inner.id)?;
+        if stamp != expected {
+            return Err(ExternalGpuSurfaceError::StaleFrame);
+        }
+        Ok(ExternalGpuSurfaceReadFrame {
+            handle: self,
+            view,
+            stamp,
+            submission_guard: Some(submission_guard),
+        })
+    }
+
+    fn check_published_read(&self) -> Result<(), ExternalGpuSurfaceError> {
+        match self.status() {
+            ExternalGpuSurfaceStatus::Ready => {}
+            ExternalGpuSurfaceStatus::DeviceLost => {
+                return Err(ExternalGpuSurfaceError::DeviceLost);
+            }
+            ExternalGpuSurfaceStatus::Closed => return Err(ExternalGpuSurfaceError::Closed),
+        }
+        if self.is_resize_pending() {
+            return Err(ExternalGpuSurfaceError::ResizePending);
+        }
+        Ok(())
+    }
+
     fn acquire_frame_for_size(
         &self,
         expected: Option<(u32, u32)>,
@@ -666,21 +820,415 @@ impl ExternalGpuSurfaceFrame<'_> {
             return Err(ExternalGpuSurfaceError::DeviceLost);
         }
         let submission_index = self.handle.inner.queue.submit(command_buffers);
-        let should_invalidate = self
-            .handle
-            .inner
-            .registry
-            .publish(
-                self.handle.inner.id,
-                submission_index.clone(),
-                premultiplied_alpha,
-            )
-            .ok_or(ExternalGpuSurfaceError::Closed)?;
+        let should_invalidate = self.handle.inner.registry.publish(
+            self.handle.inner.id,
+            submission_index.clone(),
+            premultiplied_alpha,
+        )?;
         drop(self.submission_guard.take());
         if should_invalidate {
             (self.handle.inner.invalidator)();
         }
         Ok(submission_index)
+    }
+}
+
+/// A native-only, synchronized read of one exact submitted surface frame.
+///
+/// This lease is intentionally separate from a producer frame: dropping it or
+/// submitting its GPU copy must never publish or consume the source display.
+pub struct ExternalGpuSurfaceReadFrame<'a> {
+    handle: &'a ExternalGpuSurfaceHandle,
+    view: wgpu::TextureView,
+    stamp: ExternalGpuSurfaceFrameStamp,
+    submission_guard: Option<MutexGuard<'a, ()>>,
+}
+
+impl ExternalGpuSurfaceReadFrame<'_> {
+    /// Source sampler view, valid for encoding only while this lease is held.
+    pub fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+
+    /// Exact immutable submitted-frame metadata acquired by this lease.
+    pub fn stamp(&self) -> ExternalGpuSurfaceFrameStamp {
+        self.stamp
+    }
+
+    /// Enqueue a same-device GPU copy before allowing subsequent source writes.
+    ///
+    /// This returns submission, not completion. The transport must wait for its
+    /// own completion/fence before presenting an imported destination resource.
+    /// The source frame and GPUI display publication remain unchanged.
+    pub fn submit_copy(
+        mut self,
+        command_buffers: impl IntoIterator<Item = wgpu::CommandBuffer>,
+    ) -> Result<wgpu::SubmissionIndex, ExternalGpuSurfaceError> {
+        self.handle.check_published_read()?;
+        let pending = self.handle.inner.pending_size.lock();
+        if pending.is_some() {
+            return Err(ExternalGpuSurfaceError::ResizePending);
+        }
+        let submission = self.handle.inner.queue.submit(command_buffers);
+        drop(pending);
+        drop(self.submission_guard.take());
+        Ok(submission)
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod submitted_read_tests {
+    use super::*;
+
+    fn host() -> anyhow::Result<(ExternalGpuSurfaceHandle, Arc<AtomicBool>)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::METAL,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        let adapter = crate::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))?;
+        assert_eq!(adapter.get_info().backend, wgpu::Backend::Metal);
+        println!("submitted frame adapter: {:?}", adapter.get_info());
+        let (device, queue) = crate::block_on(
+            adapter.request_device(&wgpu::DeviceDescriptor {
+                required_limits: wgpu::Limits::downlevel_defaults()
+                    .using_resolution(adapter.limits())
+                    .using_alignment(adapter.limits()),
+                ..Default::default()
+            }),
+        )?;
+        let lost = Arc::new(AtomicBool::new(false));
+        let handle = ExternalGpuSurfaceHandle::new(
+            Arc::new(ExternalGpuSurfaceRegistry::new()),
+            Arc::new(device),
+            Arc::new(queue),
+            8,
+            4,
+            wgpu::TextureFormat::Rgba8Unorm,
+            Arc::clone(&lost),
+            Arc::new(|| {}),
+        )?;
+        Ok((handle, lost))
+    }
+
+    fn publish(handle: &ExternalGpuSurfaceHandle, color: wgpu::Color) -> anyhow::Result<()> {
+        let frame = handle.acquire_frame()?;
+        let mut encoder = handle.device().create_command_encoder(&Default::default());
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame.view(),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+        }
+        frame.submit_premultiplied_and_present([encoder.finish()])?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an actual native Metal adapter"]
+    fn submitted_read_refuses_unpublished_stale_foreign_resize_and_loss() -> anyhow::Result<()> {
+        let (handle, lost) = host()?;
+        assert!(matches!(
+            handle.published_frame_stamp(),
+            Err(ExternalGpuSurfaceError::NotPublished)
+        ));
+        let encoded = handle.acquire_frame()?;
+        assert_eq!(
+            handle.inner.registry.surfaces.lock()[&handle.id()].frame_generation,
+            0,
+            "acquisition/encoding alone cannot create a submitted frame"
+        );
+        drop(encoded);
+        publish(&handle, wgpu::Color::RED)?;
+        let original = handle.published_frame_stamp()?;
+        assert_eq!(original.size(), (8, 4));
+        assert_eq!(original.resource_generation(), 1);
+        assert_eq!(original.frame_generation(), 1);
+        assert!(original.premultiplied_alpha());
+        assert_eq!(original.format(), wgpu::TextureFormat::Rgba8Unorm);
+        let mut foreign = original;
+        foreign.surface.registry += 1;
+        assert!(matches!(
+            handle.acquire_published_frame(foreign),
+            Err(ExternalGpuSurfaceError::StaleFrame)
+        ));
+        publish(&handle, wgpu::Color::GREEN)?;
+        assert!(matches!(
+            handle.acquire_published_frame(original),
+            Err(ExternalGpuSurfaceError::StaleFrame)
+        ));
+        let current = handle.published_frame_stamp()?;
+        handle.request_resize(9, 4);
+        assert!(matches!(
+            handle.published_frame_stamp(),
+            Err(ExternalGpuSurfaceError::ResizePending)
+        ));
+        assert!(matches!(
+            handle.acquire_published_frame(current),
+            Err(ExternalGpuSurfaceError::ResizePending)
+        ));
+        let unpublished = handle.acquire_frame()?;
+        drop(unpublished);
+        assert!(matches!(
+            handle.published_frame_stamp(),
+            Err(ExternalGpuSurfaceError::NotPublished)
+        ));
+        publish(&handle, wgpu::Color::BLUE)?;
+        handle.request_resize(8, 4);
+        publish(&handle, wgpu::Color::RED)?;
+        let replaced = handle.published_frame_stamp()?;
+        assert_eq!(replaced.size(), original.size());
+        assert_eq!(replaced.frame_generation(), original.frame_generation());
+        assert_eq!(
+            replaced.resource_generation(),
+            3,
+            "resize-away-and-back cannot reuse resource identity"
+        );
+        assert!(matches!(
+            handle.acquire_published_frame(original),
+            Err(ExternalGpuSurfaceError::StaleFrame)
+        ));
+        let acquired = handle.acquire_published_frame(replaced)?;
+        lost.store(true, Ordering::Release);
+        assert!(matches!(
+            acquired.submit_copy([]),
+            Err(ExternalGpuSurfaceError::DeviceLost)
+        ));
+        assert!(matches!(
+            handle.published_frame_stamp(),
+            Err(ExternalGpuSurfaceError::DeviceLost)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an actual native Metal adapter"]
+    fn submitted_read_keeps_publication_and_serializes_source_overwrite() -> anyhow::Result<()> {
+        let (handle, _) = host()?;
+        publish(&handle, wgpu::Color::RED)?;
+        let stamp = handle.published_frame_stamp()?;
+        assert!(handle.has_unconsumed_frame()?);
+        let reader = handle.acquire_published_frame(stamp)?;
+        assert_eq!(reader.stamp(), stamp);
+        assert!(
+            handle.inner.registry.submission_gate.try_lock().is_none(),
+            "read lease must exclude producer acquisition/submission/actual resize"
+        );
+        assert!(
+            handle.has_unconsumed_frame()?,
+            "export does not consume display publication"
+        );
+        drop(reader);
+        assert!(handle.inner.registry.submission_gate.try_lock().is_some());
+        assert_eq!(handle.published_frame_stamp()?, stamp);
+        let reader = handle.acquire_published_frame(stamp)?;
+        handle.request_resize(9, 4);
+        assert!(
+            matches!(
+                reader.submit_copy([]),
+                Err(ExternalGpuSurfaceError::ResizePending)
+            ),
+            "resize requested while encoding must refuse stale export at submission"
+        );
+        assert!(handle.has_unconsumed_frame()?);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an actual native Metal adapter"]
+    fn submitted_read_shader_copy_preserves_exact_latest_gpu_pixels() -> anyhow::Result<()> {
+        let (handle, _) = host()?;
+        let device = handle.device();
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("submitted_read_diagnostic_shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+@group(0) @binding(0) var source: texture_2d<f32>;
+@vertex fn vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    let positions = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+    return vec4(positions[index], 0.0, 1.0);
+}
+@fragment fn fragment(@builtin(position) pixel: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(source, vec2<i32>(pixel.xy), 0);
+}
+"#
+                .into(),
+            ),
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("submitted_read_diagnostic_pipeline"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fragment"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let destination = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("diagnostic_only_readback_destination"),
+            size: wgpu::Extent3d {
+                width: 8,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let destination_view = destination.create_view(&Default::default());
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("diagnostic_only_cpu_readback"),
+            size: 256 * 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        for (index, (color, expected)) in [
+            (wgpu::Color::RED, [255, 0, 0, 255]),
+            (wgpu::Color::GREEN, [0, 255, 0, 255]),
+            (wgpu::Color::BLUE, [0, 0, 255, 255]),
+        ]
+        .into_iter()
+        .cycle()
+        .take(12)
+        .enumerate()
+        {
+            publish(&handle, color)?;
+            let stamp = handle.published_frame_stamp()?;
+            assert_eq!(stamp.frame_generation(), index as u64 + 1);
+            let reader = handle.acquire_published_frame(stamp)?;
+            assert!(
+                !reader
+                    .view()
+                    .texture()
+                    .usage()
+                    .contains(wgpu::TextureUsages::COPY_SRC),
+                "test cannot weaken production source usage to enable readback"
+            );
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(reader.view()),
+                }],
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &destination_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &destination,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 8,
+                    height: 4,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let submission = reader.submit_copy([encoder.finish()])?;
+            assert_eq!(
+                handle.published_frame_stamp()?,
+                stamp,
+                "copy cannot publish another producer frame"
+            );
+            assert!(
+                handle.has_unconsumed_frame()?,
+                "copy cannot consume GPUI display publication"
+            );
+            let (sender, receiver) = std::sync::mpsc::channel();
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = sender.send(result);
+                });
+            device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(std::time::Duration::from_secs(5)),
+            })?;
+            receiver.recv_timeout(std::time::Duration::from_secs(5))??;
+            {
+                let bytes = buffer.slice(..).get_mapped_range();
+                for y in 0..4 {
+                    for x in 0..8 {
+                        assert_eq!(
+                            &bytes[y * 256 + x * 4..y * 256 + x * 4 + 4],
+                            &expected,
+                            "latest submitted GPU color must survive shader copy at frame {index}, pixel {x},{y}"
+                        );
+                    }
+                }
+            }
+            buffer.unmap();
+            // Mix independent GPUI promotions with exports, exercising both source-slot choices.
+            if index % 2 == 0 {
+                handle
+                    .inner
+                    .registry
+                    .promote_and_front_view(handle.id())
+                    .unwrap();
+                assert_eq!(handle.published_frame_stamp()?, stamp);
+            }
+        }
+        Ok(())
     }
 }
 
