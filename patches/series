@@ -18,3 +18,5 @@
 0029-gpui-web-shipping-html-in-canvas-surface.patch
 0030-gpui-web-pin-catchup.patch
 0031-gpui-native-reduced-motion.patch
+0032-gpui-aria-disabled.patch
+0033-gpui-web-ime-entry-name-and-state-projection.patch

@@ -126,3 +126,22 @@ copy of the text in the user agent's font; section 11 grants the browser caret,
 selection, spellcheck and autocorrect and nothing more. `color: transparent`
 removes the duplicate glyphs and keeps the selection highlight, which paints
 behind text, and the caret, which has its own color property.
+
+The `aria_disabled` patch adds the one AccessKit state GPUI could not publish:
+`StatefulInteractiveElement::aria_disabled(bool)` writes the node's `disabled`
+flag and nothing else. It does not block input or change drawing, so a
+component that disables itself keeps owning both and the reader hears the
+state. `false` publishes nothing.
+
+The IME entry patch names the element that holds keyboard focus for canvas
+text entry. Every conduit is built with `aria-label="Text input"`; while a text
+input is focused, the accessibility adapter replaces that with the input's own
+label (and sets `aria-description` from its description), on the painted path
+as well as the browser-native one, and puts the fixed name back when focus
+leaves every text field. Names come from labels only: the node's value is never
+read. A blank label is treated as absent, because an empty `aria-label`
+suppresses name computation instead of supplying one. The same patch collects
+the availability attributes the mirror writes (`aria-disabled`,
+`aria-description`, `aria-required`, `aria-readonly`) into one pure table,
+`state_attributes`, which the unit tests exercise without a DOM; the
+projection itself was already on the mirror element, never a synthetic child.
