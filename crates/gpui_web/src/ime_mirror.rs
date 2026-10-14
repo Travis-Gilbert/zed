@@ -91,6 +91,28 @@ const CONTEXT_CHARS: usize = 512;
 /// element write and therefore an IME restart.
 const MIN_EDGE_CHARS: usize = 64;
 
+/// The name a conduit carries when no focused text input has given it one.
+///
+/// A conduit is the element a reader lands on whenever canvas text entry has
+/// focus, so an unnamed one is announced as an anonymous field. Every conduit
+/// carries this from the moment it exists, and the accessibility adapter
+/// replaces it with the focused input's own name for as long as that input is
+/// focused. It is a fixed string: a name comes from a label and never from a
+/// value, so nothing a person has typed can reach it.
+pub(crate) const FALLBACK_INPUT_NAME: &str = "Text input";
+
+/// The accessible name a conduit should carry for a focused input whose own
+/// label is `label`.
+///
+/// A blank label is no label: an empty `aria-label` suppresses name
+/// computation instead of supplying one, so it falls back like an absent one.
+pub(crate) fn conduit_name(label: Option<&str>) -> &str {
+    label
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or(FALLBACK_INPUT_NAME)
+}
+
 /// What the browser would draw of a native conduit *except* the caret and the
 /// selection.
 ///
@@ -345,6 +367,7 @@ impl ImeMirror {
             .dyn_into()
             .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
         element.set_id(IME_INPUT_ELEMENT_ID);
+        element.set_attribute("aria-label", FALLBACK_INPUT_NAME).ok();
         let style = element.style();
         // Both paths place the element in viewport coordinates, because the
         // canvas fills the viewport: one `update_position` then serves both,
@@ -469,6 +492,7 @@ impl ImeMirror {
             .dyn_into()
             .map_err(|e| anyhow::anyhow!("Created element is not an input: {e:?}"))?;
         element.set_id(conduit_element_id(capability));
+        element.set_attribute("aria-label", FALLBACK_INPUT_NAME).ok();
         // The attribute rather than the IDL property, and set before the
         // element is in the document, so the browser builds the input the
         // capability names rather than re-typing one it already made.
