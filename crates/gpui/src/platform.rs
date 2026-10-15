@@ -1176,6 +1176,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// This is an intent, separate from a change in native focus ownership.
     fn request_text_input_focus(&self) {}
 
+    /// Whether the platform currently owns an open text composition, including
+    /// the empty phase before the document has received marked text.
+    fn is_text_composing(&self) -> bool {
+        false
+    }
+
     /// Inform the operating system that the text input state has changed
     fn text_input_state_changed(&self, _change: TextInputStateChange) {}
 

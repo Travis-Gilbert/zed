@@ -770,6 +770,10 @@ impl PlatformWindow for WebWindow {
         self.inner.ime_mirror.apply_configuration(&configuration);
     }
 
+    fn is_text_composing(&self) -> bool {
+        self.inner.is_composing.get()
+    }
+
     fn request_text_input_focus(&self) {
         // The IME owns its element until commit/cancel. An explicit later
         // editor focus intent must not move an open composition.

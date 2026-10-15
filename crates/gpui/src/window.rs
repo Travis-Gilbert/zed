@@ -2240,6 +2240,12 @@ impl Window {
         true
     }
 
+    /// Read the current platform composition fact without importing text or
+    /// changing focus. Platforms which do not report this retain false.
+    pub fn is_text_composing(&self) -> bool {
+        self.platform_window.is_text_composing()
+    }
+
     /// Remove focus from all elements within this context's window.
     pub fn blur(&mut self, cx: &mut App) {
         self.clear_pending_keystrokes(cx);

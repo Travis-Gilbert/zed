@@ -309,6 +309,35 @@ mod tests {
     };
 
     #[gpui::test]
+    fn platform_composition_fact_tracks_empty_open_phase_without_input_or_focus_mutation(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_, cx| ConfigurationTestView {
+            focus_handle: cx.focus_handle(),
+            configuration: TextInputConfiguration::default(),
+        });
+        let platform = cx.test_window(window.into());
+        cx.update_window(window.into(), |_, window, _| {
+            assert!(!window.is_text_composing());
+            let focus = window.focus;
+            platform.simulate_text_composing(true);
+            assert!(
+                window.is_text_composing(),
+                "empty platform composition is observable without marked text"
+            );
+            assert_eq!(window.focus, focus);
+            assert_eq!(platform.text_input_focus_requests(), 0);
+            assert!(platform.text_input_state_changes().is_empty());
+            platform.simulate_text_composing(false);
+            assert!(
+                !window.is_text_composing(),
+                "commit or cancellation closes the same fact"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
     fn explicit_input_focus_requests_survive_same_handle_and_cancel_on_owner_change(
         cx: &mut TestAppContext,
     ) {
