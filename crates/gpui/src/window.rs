@@ -7881,6 +7881,8 @@ mod tests {
             window.draw(cx).clear(cx);
             let preview = cx.new(|_| Empty);
             assert!(cx.start_drag(path.clone(), preview.clone(), Point::default(), window));
+            assert_eq!(cx.active_drag_value::<PathBuf>(), Some(&path));
+            assert!(cx.active_drag_value::<String>().is_none());
             assert!(!cx.start_drag(
                 PathBuf::from("/replacement"),
                 preview.clone(),
@@ -7908,11 +7910,32 @@ mod tests {
             window.dispatch_event(release.clone().to_platform_input(), cx);
             assert_eq!(observed_drops.borrow().as_slice(), &[path.clone()]);
             assert!(!cx.has_active_drag());
-            assert!(cx.start_drag(path.clone(), preview, Point::default(), window));
+            assert!(cx.active_drag_value::<PathBuf>().is_none());
+            assert!(cx.start_drag(path.clone(), preview.clone(), Point::default(), window));
             assert!(cx.stop_active_drag(window));
             assert!(!cx.stop_active_drag(window));
             window.dispatch_event(release.to_platform_input(), cx);
-            assert_eq!(observed_drops.borrow().as_slice(), &[path]);
+            assert_eq!(observed_drops.borrow().as_slice(), &[path.clone()]);
+            let successor = PathBuf::from("/successor");
+            assert!(cx.start_drag(successor.clone(), preview, Point::default(), window));
+            // The retired scope retains its own payload, but cannot cancel a
+            // different coordinator session through the identity check.
+            if cx.active_drag_value::<PathBuf>() == Some(&path) {
+                cx.stop_active_drag(window);
+            }
+            assert_eq!(cx.active_drag_value::<PathBuf>(), Some(&successor));
+            window.dispatch_event(
+                crate::MouseUpEvent {
+                    position,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(observed_drops.borrow().as_slice(), &[path, successor]);
+            assert!(cx.active_drag_value::<PathBuf>().is_none());
         })
         .unwrap();
     }

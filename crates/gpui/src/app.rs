@@ -2539,6 +2539,13 @@ impl App {
         self.active_drag.is_some()
     }
 
+    /// Read the current coordinator payload without changing the drag. A
+    /// platform scope can compare its typed session identity before forwarding
+    /// a delayed pointer event or canceling, so it cannot affect a successor.
+    pub fn active_drag_value<T: 'static>(&self) -> Option<&T> {
+        self.active_drag.as_ref()?.value.downcast_ref::<T>()
+    }
+
     /// Starts a typed drag initiated by a platform-owned element, using the same
     /// coordinator and drop handlers as an element's `on_drag` listener.
     /// Returns false without replacing a drag that is already active.
