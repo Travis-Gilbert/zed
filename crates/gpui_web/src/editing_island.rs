@@ -238,6 +238,36 @@ impl StyledEditingIsland {
     pub fn counts(&self) -> EditingIslandCounts {
         self.lease.counts()
     }
+    /// Validate and stage presentation metadata without writing DOM text or
+    /// moving selection. The existing mirror applies it only after its own
+    /// canonical reconciliation produces exactly `expected_text`.
+    pub fn prepare_highlights(
+        &self,
+        expected_text: &str,
+        runs: Vec<crate::styled_input::StyledTextRun>,
+    ) -> Result<(), crate::styled_input::StyledInputRefusal> {
+        use crate::styled_input::StyledInputRefusal;
+        let inner = self
+            .lease
+            .window
+            .upgrade()
+            .ok_or(StyledInputRefusal::Stale)?;
+        if !inner
+            .ime_mirror
+            .owns_island_adoption(&self.lease.element, self.lease.adoption)
+        {
+            return Err(StyledInputRefusal::Stale);
+        }
+        if inner.is_composing.get() {
+            return Err(StyledInputRefusal::Busy);
+        }
+        self.input.prepare_highlights(expected_text, runs)
+    }
+    /// Whether the current adoption has actually applied its latest prepared
+    /// metadata to exactly this text, rather than merely staged it.
+    pub fn highlights_ready(&self, expected_text: &str) -> bool {
+        self.is_current_adoption() && self.input.highlights_ready(expected_text)
+    }
     /// Publish scalar-safe, resolved native styles for exactly `expected_text`.
     /// No text or history changes; descendants stay untouched during composition.
     pub fn set_highlights(

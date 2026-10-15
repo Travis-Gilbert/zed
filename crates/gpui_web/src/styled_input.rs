@@ -120,7 +120,11 @@ impl Snapshot {
         }
     }
     fn offset(&self, node: &web_sys::Node, offset: u32) -> Option<u32> {
-        if let Some(leaf) = self.leaves.iter().find(|leaf| <web_sys::Text as AsRef<web_sys::Node>>::as_ref(&leaf.node) == node) {
+        if let Some(leaf) = self
+            .leaves
+            .iter()
+            .find(|leaf| <web_sys::Text as AsRef<web_sys::Node>>::as_ref(&leaf.node) == node)
+        {
             return (offset <= leaf.range.end - leaf.range.start)
                 .then_some(leaf.range.start + offset);
         }
@@ -146,12 +150,14 @@ impl Snapshot {
 pub(crate) struct StyledInput {
     element: web_sys::HtmlElement,
     applied: RefCell<Option<(String, Vec<StyledTextRun>)>>,
+    pending: RefCell<Option<(String, Vec<StyledTextRun>)>>,
 }
 impl StyledInput {
     pub(crate) fn new(element: web_sys::HtmlElement) -> Self {
         Self {
             element,
             applied: RefCell::new(None),
+            pending: RefCell::new(None),
         }
     }
     pub(crate) fn element(&self) -> &web_sys::HtmlElement {
@@ -267,6 +273,40 @@ impl StyledInput {
         }
         Ok(())
     }
+    pub(crate) fn prepare_highlights(
+        &self,
+        expected: &str,
+        runs: Vec<StyledTextRun>,
+    ) -> Result<(), StyledInputRefusal> {
+        validated_boundaries(expected, &runs)?;
+        if self.value() == expected
+            && self
+                .applied
+                .borrow()
+                .as_ref()
+                .is_some_and(|(text, old)| text == expected && *old == runs)
+        {
+            self.pending.replace(None);
+            return Ok(());
+        }
+        self.pending.replace(Some((expected.to_owned(), runs)));
+        Ok(())
+    }
+    pub(crate) fn apply_pending(&self) {
+        let pending = self.pending.borrow().clone();
+        if let Some((text, runs)) = pending {
+            let _ = self.set_highlights(&text, runs);
+        }
+    }
+    pub(crate) fn highlights_ready(&self, expected: &str) -> bool {
+        self.pending.borrow().is_none()
+            && self.value() == expected
+            && self
+                .applied
+                .borrow()
+                .as_ref()
+                .is_some_and(|(text, _)| text == expected)
+    }
     pub(crate) fn set_highlights(
         &self,
         expected: &str,
@@ -275,22 +315,14 @@ impl StyledInput {
         if self.value() != expected {
             return Err(StyledInputRefusal::TextMismatch);
         }
-        for run in &runs {
-            if run.range.start > run.range.end
-                || run.range.end > expected.len()
-                || !expected.is_char_boundary(run.range.start)
-                || !expected.is_char_boundary(run.range.end)
-            {
-                return Err(StyledInputRefusal::InvalidRange);
-            }
-            validate_style(&run.style)?;
-        }
+        let boundaries = validated_boundaries(expected, &runs)?;
         if self
             .applied
             .borrow()
             .as_ref()
             .is_some_and(|(text, old)| text == expected && *old == runs)
         {
+            self.pending.replace(None);
             return Ok(());
         }
         let selection = self.selection();
@@ -298,26 +330,10 @@ impl StyledInput {
             .element
             .owner_document()
             .ok_or(StyledInputRefusal::Dom)?;
-        let mut boundaries = vec![0, expected.len()];
-        for run in &runs {
-            boundaries.extend([run.range.start, run.range.end]);
-        }
-        boundaries.sort_unstable();
-        boundaries.dedup();
         let utf16: Vec<u32> = boundaries
             .iter()
             .map(|&byte| expected[..byte].encode_utf16().count() as u32)
             .collect();
-        // Validate every resulting interval before touching the retained tree.
-        for interval in boundaries.windows(2) {
-            let mut style = HighlightStyle::default();
-            for run in &runs {
-                if run.range.start <= interval[0] && interval[0] < run.range.end {
-                    merge_style(&mut style, &run.style);
-                }
-            }
-            validate_style(&style)?;
-        }
         self.normalize_blocks(&document)?;
         // Retire only our prior wrappers, preserving every browser text node.
         let wrappers = self.element.query_selector_all("[data-gpui-text-run]")?;
@@ -389,8 +405,40 @@ impl StyledInput {
             self.set_selection(start, end, reversed);
         }
         self.applied.replace(Some((expected.to_owned(), runs)));
+        self.pending.replace(None);
         Ok(())
     }
+}
+fn validated_boundaries(
+    expected: &str,
+    runs: &[StyledTextRun],
+) -> Result<Vec<usize>, StyledInputRefusal> {
+    for run in runs {
+        if run.range.start > run.range.end
+            || run.range.end > expected.len()
+            || !expected.is_char_boundary(run.range.start)
+            || !expected.is_char_boundary(run.range.end)
+        {
+            return Err(StyledInputRefusal::InvalidRange);
+        }
+        validate_style(&run.style)?;
+    }
+    let mut boundaries = vec![0, expected.len()];
+    for run in runs {
+        boundaries.extend([run.range.start, run.range.end]);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    for interval in boundaries.windows(2) {
+        let mut style = HighlightStyle::default();
+        for run in runs {
+            if run.range.start <= interval[0] && interval[0] < run.range.end {
+                merge_style(&mut style, &run.style);
+            }
+        }
+        validate_style(&style)?;
+    }
+    Ok(boundaries)
 }
 fn merge_style(target: &mut HighlightStyle, source: &HighlightStyle) {
     if source.color.is_some() {

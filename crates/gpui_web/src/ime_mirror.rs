@@ -1528,6 +1528,13 @@ impl ImeMirror {
             move || {
                 window.ime_mirror.sync_scheduled.set(false);
                 sync(&window);
+                if !window.is_composing.get() && window.ime_mirror.island_is_live() {
+                    if let Some(island) = window.ime_mirror.island.borrow().as_ref() {
+                        if let ConduitElement::Styled(input) = &island.element {
+                            input.apply_pending();
+                        }
+                    }
+                }
             }
         });
         window
