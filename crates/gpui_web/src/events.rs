@@ -813,10 +813,18 @@ impl WebWindowInner {
                 && !modifiers.control
                 && !modifiers.alt
                 && !modifiers.platform;
-            if is_tab && (this.is_composing.get() || event.is_composing()) {
-                // A composition owns its current conduit and focus until it
-                // commits or cancels. Do not run focus-navigation bindings
-                // before the composition guard below can see this key.
+            let primary = if this.is_mac {
+                modifiers.platform
+            } else {
+                modifiers.control
+            };
+            if (this.is_composing.get() || event.is_composing())
+                && crate::composition_keys::is_owned_key(&keystroke.key, primary, modifiers.alt)
+            {
+                // The platform can begin composition before any marked text
+                // reaches the input handler. Its editor bindings must not
+                // submit, cancel, navigate, or change history in that gap.
+                // Modifier state above and unrelated shortcuts remain live.
                 event.prevent_default();
                 return;
             }

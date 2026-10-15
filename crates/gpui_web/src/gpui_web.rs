@@ -15,6 +15,7 @@ mod http_client;
 mod ime_mirror;
 mod input_edit;
 mod history_intent;
+mod composition_keys;
 mod keyboard;
 mod logging;
 mod native_element;
