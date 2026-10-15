@@ -813,6 +813,13 @@ impl WebWindowInner {
                 && !modifiers.control
                 && !modifiers.alt
                 && !modifiers.platform;
+            if is_tab && (this.is_composing.get() || event.is_composing()) {
+                // A composition owns its current conduit and focus until it
+                // commits or cancels. Do not run focus-navigation bindings
+                // before the composition guard below can see this key.
+                event.prevent_default();
+                return;
+            }
             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
                 keystroke,
                 is_held,
