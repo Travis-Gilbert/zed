@@ -169,3 +169,10 @@ edge and propagate the Tab action. `gpui_web` then blurs its input conduit and
 leaves the browser's default Tab traversal enabled. Desktop tab traversal stays
 cyclic. The non-wrapping map test covers both edges, disabled stops and the
 retained desktop cycle; the consumer browser oracle proves actual DOM handoff.
+
+The composing island replacement patch refuses `EditingIsland::adopt` before
+changing the current conduit or attaching listeners while an IME composition
+is open. A retained editor therefore remains authoritative after an attempted
+replacement. The consumer editing oracle attempts a replacement during a
+composition and checks refusal, the predecessor's live state and DOM identity,
+and the subsequent composition commit through the original listener path.
