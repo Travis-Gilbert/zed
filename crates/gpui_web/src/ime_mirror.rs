@@ -412,6 +412,7 @@ pub(crate) struct ImeMirror {
     /// Whether the island, rather than a built conduit, is live.
     island_live: Cell<bool>,
     island_native_tab: Cell<bool>,
+    island_adoption: Cell<u64>,
     /// Set while the mirror itself edits the island through the browser's
     /// editing commands, which raise `beforeinput` and `input` synchronously.
     /// Those events are this module's echo, never an edit to import.
@@ -559,6 +560,7 @@ impl ImeMirror {
             island: RefCell::new(None),
             island_live: Cell::new(false),
             island_native_tab: Cell::new(false),
+            island_adoption: Cell::new(0),
             writing: Cell::new(false),
             composition_checkpoint: RefCell::new(None),
             history_intents: RefCell::new(crate::history_intent::HistoryIntentGate::default()),
@@ -1093,7 +1095,20 @@ impl ImeMirror {
 
     /// Adopt `element` as the window's editing island, replacing any island
     /// adopted before it. It is not live until [`Self::set_island_live`].
-    pub(crate) fn adopt_island(&self, element: web_sys::HtmlTextAreaElement) {
+    pub(crate) fn adopt_island(
+        &self,
+        window: &WebWindowInner,
+        element: web_sys::HtmlTextAreaElement,
+    ) -> u64 {
+        // Retire the old conduit before publishing its successor. The public
+        // adoption gate has already refused an open composition.
+        self.set_island_live(window, false);
+        if let Some(predecessor) = self.island.borrow().as_ref() {
+            predecessor
+                .as_element()
+                .remove_attribute(ISLAND_ATTRIBUTE)
+                .ok();
+        }
         let html: &web_sys::Element = element.as_ref();
         // The island names itself. The accessibility adapter reads this to
         // leave the page's label alone when it claims the island for the
@@ -1106,21 +1121,44 @@ impl ImeMirror {
         })));
         self.island_native_tab.set(false);
         self.island_counts.set(EditingIslandCounts::default());
+        let adoption = self
+            .island_adoption
+            .get()
+            .checked_add(1)
+            .expect("editing island adoption overflow");
+        self.island_adoption.set(adoption);
+        adoption
+    }
+
+    pub(crate) fn owns_island_adoption(
+        &self,
+        element: &web_sys::HtmlTextAreaElement,
+        adoption: u64,
+    ) -> bool {
+        self.island_adoption.get() == adoption && self.owns_island(element)
+    }
+
+    pub(crate) fn owns_island(&self, element: &web_sys::HtmlTextAreaElement) -> bool {
+        self.island.borrow().as_ref().is_some_and(|island| {
+            matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element)
+        })
     }
 
     pub(crate) fn set_island_native_tab(
         &self,
         element: &web_sys::HtmlTextAreaElement,
+        adoption: u64,
         enabled: bool,
     ) -> bool {
-        if !self.island.borrow().as_ref().is_some_and(|island| matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element)) { return false; }
+        if !self.owns_island_adoption(element, adoption) {
+            return false;
+        }
         self.island_native_tab.set(enabled);
         true
     }
 
     pub(crate) fn island_uses_native_tab(&self, element: &web_sys::HtmlTextAreaElement) -> bool {
-        self.island_native_tab.get() && self.island_is_live()
-            && self.island.borrow().as_ref().is_some_and(|island| matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element))
+        self.island_native_tab.get() && self.island_is_live() && self.owns_island(element)
     }
 
     /// Forget the island, if `element` is it. A live island hands the input
@@ -1129,11 +1167,9 @@ impl ImeMirror {
         &self,
         window: &WebWindowInner,
         element: &web_sys::HtmlTextAreaElement,
+        adoption: u64,
     ) {
-        let is_island = self.island.borrow().as_ref().is_some_and(|island| {
-            matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element)
-        });
-        if !is_island {
+        if !self.owns_island_adoption(element, adoption) {
             return;
         }
         self.set_island_live(window, false);

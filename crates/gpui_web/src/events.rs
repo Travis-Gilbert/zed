@@ -224,15 +224,30 @@ impl WebWindowInner {
     /// Attach every input-path listener to `target`, an element adopted after
     /// the window was created. The handles detach them when dropped.
     pub(crate) fn attach_input_listeners(
-        &self,
-        target: &web_sys::EventTarget,
+        self: &Rc<Self>,
+        element: &web_sys::HtmlTextAreaElement,
+        adoption: u64,
     ) -> Vec<EventListenerHandle> {
         self.input_listeners
             .borrow()
             .iter()
             .filter_map(|(event_name, handler)| {
                 let handler = handler.upgrade()?;
-                Some(attach_shared(target, event_name, &handler))
+                let window = Rc::downgrade(self);
+                let adopted = element.clone();
+                Some(EventListenerHandle::add(
+                    element.as_ref(),
+                    event_name,
+                    move |event: JsValue| {
+                        // A retained predecessor keeps its listener handles until
+                        // drop, but no longer has authority to import any event.
+                        if window.upgrade().is_some_and(|window| {
+                            window.ime_mirror.owns_island_adoption(&adopted, adoption)
+                        }) {
+                            (handler.borrow_mut())(event);
+                        }
+                    },
+                ))
             })
             .collect()
     }

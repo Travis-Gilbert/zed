@@ -27,6 +27,7 @@ pub(crate) fn publish_window(window: Weak<WebWindowInner>) {
 pub struct EditingIsland {
     window: Weak<WebWindowInner>,
     element: web_sys::HtmlTextAreaElement,
+    adoption: u64,
     _listeners: Vec<EventListenerHandle>,
 }
 
@@ -40,11 +41,12 @@ impl EditingIsland {
         if inner.is_composing.get() {
             return None;
         }
-        inner.ime_mirror.adopt_island(element.clone());
-        let listeners = inner.attach_input_listeners(element.as_ref());
+        let adoption = inner.ime_mirror.adopt_island(&inner, element.clone());
+        let listeners = inner.attach_input_listeners(&element, adoption);
         Some(Self {
             window,
             element,
+            adoption,
             _listeners: listeners,
         })
     }
@@ -57,11 +59,18 @@ impl EditingIsland {
     /// Make the island the live conduit (`true`) or return input to the
     /// hidden conduit (`false`). Returns whether the island is now live; a
     /// change is refused while a composition is open, because moving the
-    /// conduit would end it without a commit.
+    /// conduit would end it without a commit. A replaced handle returns false
+    /// and cannot change its successor, even when it adopts the same element.
     pub fn set_live(&self, live: bool) -> bool {
         let Some(inner) = self.window.upgrade() else {
             return false;
         };
+        if !inner
+            .ime_mirror
+            .owns_island_adoption(&self.element, self.adoption)
+        {
+            return false;
+        }
         if inner.is_composing.get() && live != inner.ime_mirror.island_is_live() {
             return inner.ime_mirror.island_is_live();
         }
@@ -80,7 +89,7 @@ impl EditingIsland {
         self.window.upgrade().is_some_and(|inner| {
             inner
                 .ime_mirror
-                .set_island_native_tab(&self.element, enabled)
+                .set_island_native_tab(&self.element, self.adoption, enabled)
         })
     }
 
@@ -90,17 +99,24 @@ impl EditingIsland {
     /// Composition keeps its current buffer until its normal commit/cancel.
     pub fn request_sync(&self) {
         if let Some(inner) = self.window.upgrade() {
-            if inner.ime_mirror.island_is_live() {
+            if inner
+                .ime_mirror
+                .owns_island_adoption(&self.element, self.adoption)
+                && inner.ime_mirror.island_is_live()
+            {
                 crate::ime_mirror::ImeMirror::schedule_sync(&inner);
             }
         }
     }
 
-    /// Whether the island is the live conduit.
+    /// Whether this adoption is still the live conduit.
     pub fn is_live(&self) -> bool {
-        self.window
-            .upgrade()
-            .is_some_and(|inner| inner.ime_mirror.island_is_live())
+        self.window.upgrade().is_some_and(|inner| {
+            inner
+                .ime_mirror
+                .owns_island_adoption(&self.element, self.adoption)
+                && inner.ime_mirror.island_is_live()
+        })
     }
 
     /// Whether a composition is open on the window.
@@ -119,10 +135,15 @@ impl EditingIsland {
         Some(state.input_handler.is_some())
     }
 
-    /// What the island has done since it was adopted.
+    /// What this adoption has done. A replaced handle returns zero counts.
     pub fn counts(&self) -> EditingIslandCounts {
         self.window
             .upgrade()
+            .filter(|inner| {
+                inner
+                    .ime_mirror
+                    .owns_island_adoption(&self.element, self.adoption)
+            })
             .map(|inner| inner.ime_mirror.island_counts())
             .unwrap_or_default()
     }
@@ -131,7 +152,9 @@ impl EditingIsland {
 impl Drop for EditingIsland {
     fn drop(&mut self) {
         if let Some(inner) = self.window.upgrade() {
-            inner.ime_mirror.release_island(&inner, &self.element);
+            inner
+                .ime_mirror
+                .release_island(&inner, &self.element, self.adoption);
         }
     }
 }
