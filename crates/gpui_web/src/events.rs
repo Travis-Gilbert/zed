@@ -939,8 +939,10 @@ impl WebWindowInner {
             // element. When `beforeinput` carried the intent the command is
             // already routed; without it, route it now.
             if let Some((key, modifiers)) = history_keystroke(&event.input_type(), this.is_mac) {
-                if !this.ime_mirror.take_routed_history() {
-                    this.ime_mirror.note_island(|counts| counts.history += 1);
+                if this
+                    .ime_mirror
+                    .input_history(history_direction(&event.input_type()))
+                {
                     this.dispatch_synthetic_keystroke(key, modifiers);
                 }
                 this.ime_mirror.adopt_element_state();
@@ -1117,8 +1119,20 @@ impl WebWindowInner {
             // and the sync replaces whatever it did with the document's
             // result.
             if let Some((key, modifiers)) = history_keystroke(&event.input_type(), this.is_mac) {
-                this.ime_mirror.route_history();
-                this.dispatch_synthetic_keystroke(key, modifiers);
+                let admission = this
+                    .ime_mirror
+                    .before_history(history_direction(&event.input_type()));
+                if admission.dispatch {
+                    this.dispatch_synthetic_keystroke(key, modifiers);
+                }
+                if let Some(generation) = admission.expire {
+                    let weak = Rc::downgrade(&this);
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Some(this) = weak.upgrade() {
+                            this.ime_mirror.expire_history(generation);
+                        }
+                    });
+                }
                 return;
             }
 
@@ -1615,6 +1629,14 @@ fn attach_shared(
     EventListenerHandle::add(target, event_name, move |event: JsValue| {
         (handler.borrow_mut())(event)
     })
+}
+
+fn history_direction(input_type: &str) -> crate::history_intent::HistoryDirection {
+    if input_type == "historyRedo" {
+        crate::history_intent::HistoryDirection::Redo
+    } else {
+        crate::history_intent::HistoryDirection::Undo
+    }
 }
 
 /// The key press a browser history intent stands for on this platform, or

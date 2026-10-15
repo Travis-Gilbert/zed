@@ -418,9 +418,9 @@ pub(crate) struct ImeMirror {
     /// The island's text when a composition began, so its end can tell a
     /// commit from a cancel.
     composition_checkpoint: RefCell<Option<String>>,
-    /// A browser history command announced by `beforeinput` and already
-    /// routed, so the `input` that follows it does not route it twice.
-    history_routed: Cell<bool>,
+    /// One command can describe several native records, notably WebKit undo.
+    history_intents: RefCell<crate::history_intent::HistoryIntentGate>,
+    history_reconcile: Cell<bool>,
     island_counts: Cell<EditingIslandCounts>,
 }
 
@@ -559,7 +559,8 @@ impl ImeMirror {
             island_live: Cell::new(false),
             writing: Cell::new(false),
             composition_checkpoint: RefCell::new(None),
-            history_routed: Cell::new(false),
+            history_intents: RefCell::new(crate::history_intent::HistoryIntentGate::default()),
+            history_reconcile: Cell::new(false),
             island_counts: Cell::new(EditingIslandCounts::default()),
         };
         // Until an input handler asks otherwise, the element is an IME
@@ -1180,7 +1181,8 @@ impl ImeMirror {
         self.selection_reversed.set(false);
         self.window_hint.set(0);
         self.composition_checkpoint.replace(None);
-        self.history_routed.set(false);
+        self.history_intents.borrow_mut().clear();
+        self.history_reconcile.set(false);
         if live {
             let configuration = self.configuration.borrow().clone();
             self.apply_configuration_to(&island, &configuration);
@@ -1242,16 +1244,30 @@ impl ImeMirror {
         }
     }
 
-    /// Record that a browser history command was routed from `beforeinput`,
-    /// so the `input` that may follow it routes nothing.
-    pub(crate) fn route_history(&self) {
-        self.history_routed.set(true);
-        self.note_island(|counts| counts.history += 1);
+    /// Admit one logical history command while accounting for native records.
+    pub(crate) fn before_history(
+        &self,
+        direction: crate::history_intent::HistoryDirection,
+    ) -> crate::history_intent::HistoryAdmission {
+        let admission = self.history_intents.borrow_mut().before(direction);
+        if admission.dispatch {
+            self.history_reconcile.set(true);
+            self.note_island(|counts| counts.history += 1);
+        }
+        admission
     }
 
-    /// Take the record left by [`Self::route_history`].
-    pub(crate) fn take_routed_history(&self) -> bool {
-        self.history_routed.replace(false)
+    pub(crate) fn input_history(&self, direction: crate::history_intent::HistoryDirection) -> bool {
+        let dispatch = self.history_intents.borrow_mut().input(direction);
+        if dispatch {
+            self.history_reconcile.set(true);
+            self.note_island(|counts| counts.history += 1);
+        }
+        dispatch
+    }
+
+    pub(crate) fn expire_history(&self, generation: u64) {
+        self.history_intents.borrow_mut().expire(generation);
     }
 
     /// Bring the island to the document, whole.
@@ -1288,8 +1304,18 @@ impl ImeMirror {
             .unwrap_or_default();
         let start = adjusted.unwrap_or(range).start;
         let current = conduit.element.value();
+        let after_history = self.history_reconcile.replace(false);
         if current != text {
-            self.write_island_value(conduit, &current, &text);
+            if after_history {
+                // The browser command may traverse several native records,
+                // while the document command traverses one canonical entry.
+                // Repair its view without adding a new native edit, which
+                // would discard the browser's redo branch.
+                conduit.element.set_value(&text);
+                self.note_island(|counts| counts.writes += 1);
+            } else {
+                self.write_island_value(conduit, &current, &text);
+            }
         }
         *self.text.borrow_mut() = conduit.element.value();
         self.window_hint.set(start);

@@ -65,11 +65,23 @@ impl EditingIsland {
         if inner.is_composing.get() && live != inner.ime_mirror.island_is_live() {
             return inner.ime_mirror.island_is_live();
         }
-        let now_live = inner.ime_mirror.set_island_live(&inner, live);
-        if now_live {
+        let changed = inner.ime_mirror.set_island_live(&inner, live);
+        if changed && inner.ime_mirror.island_is_live() {
             crate::ime_mirror::ImeMirror::schedule_sync(&inner);
         }
-        now_live
+        inner.ime_mirror.island_is_live()
+    }
+
+    /// Schedule the existing coalesced mirror reconciliation after the
+    /// canonical editor changes independently of browser input. Call on a
+    /// revision or selection change, rather than on every rendered frame.
+    /// Composition keeps its current buffer until its normal commit/cancel.
+    pub fn request_sync(&self) {
+        if let Some(inner) = self.window.upgrade() {
+            if inner.ime_mirror.island_is_live() {
+                crate::ime_mirror::ImeMirror::schedule_sync(&inner);
+            }
+        }
     }
 
     /// Whether the island is the live conduit.
@@ -84,6 +96,15 @@ impl EditingIsland {
         self.window
             .upgrade()
             .is_some_and(|inner| inner.is_composing.get())
+    }
+
+    /// Whether the platform currently holds any text input handler. This is
+    /// presence only, not evidence that it belongs to this editor. `None`
+    /// means the window is gone or its state is temporarily borrowed.
+    pub fn input_handler_present(&self) -> Option<bool> {
+        let inner = self.window.upgrade()?;
+        let state = inner.state.try_borrow().ok()?;
+        Some(state.input_handler.is_some())
     }
 
     /// What the island has done since it was adopted.

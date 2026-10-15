@@ -14,6 +14,7 @@ mod file_drop;
 mod http_client;
 mod ime_mirror;
 mod input_edit;
+mod history_intent;
 mod keyboard;
 mod logging;
 mod native_element;

@@ -777,7 +777,9 @@ impl PlatformWindow for WebWindow {
                 self.inner.sync_virtual_keyboard(false);
                 self.inner.ime_mirror.reset_position();
             }
-            TextInputStateChange::SelectionChanged | TextInputStateChange::ContentChanged => {}
+            TextInputStateChange::SelectionChanged | TextInputStateChange::ContentChanged => {
+                crate::ime_mirror::ImeMirror::schedule_sync(&self.inner);
+            }
         }
     }
 
