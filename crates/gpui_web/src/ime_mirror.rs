@@ -209,10 +209,29 @@ impl ConduitElement {
         }
     }
 
-    fn set_selection_range(&self, start: u32, end: u32) {
+    /// Whether the browser's selection has its focus at the start.
+    ///
+    /// `selectionDirection` is the one place a text control says which end
+    /// of its selection moves next. A selection imported or written without
+    /// it lands the caret at the wrong end: Shift+Arrow then grows the
+    /// selection from the anchor a person did not pick.
+    fn selection_reversed(&self) -> bool {
+        let direction = match self {
+            Self::TextArea(element) => element.selection_direction(),
+            Self::Input(element) => element.selection_direction(),
+        };
+        direction.ok().flatten().as_deref() == Some("backward")
+    }
+
+    fn set_selection_range(&self, start: u32, end: u32, reversed: bool) {
+        let direction = if reversed { "backward" } else { "forward" };
         match self {
-            Self::TextArea(element) => element.set_selection_range(start, end).ok(),
-            Self::Input(element) => element.set_selection_range(start, end).ok(),
+            Self::TextArea(element) => element
+                .set_selection_range_with_direction(start, end, direction)
+                .ok(),
+            Self::Input(element) => element
+                .set_selection_range_with_direction(start, end, direction)
+                .ok(),
         };
     }
 
@@ -252,6 +271,53 @@ struct Conduit {
     /// may serve.
     capability: PlatformNativeElement,
     element: ConduitElement,
+    /// Whether the page built this element and owns its box, style and name:
+    /// an editing island (see [`ImeMirror::adopt_island`]). The mirror drives
+    /// its value, selection and composition and nothing else.
+    page_owned: bool,
+}
+
+/// The conduit live now: one of the mirror's own, or the page's island.
+enum LiveConduit<'a> {
+    Built(&'a Conduit),
+    Island(Rc<Conduit>),
+}
+
+impl std::ops::Deref for LiveConduit<'_> {
+    type Target = Conduit;
+
+    fn deref(&self) -> &Conduit {
+        match self {
+            Self::Built(conduit) => conduit,
+            Self::Island(conduit) => conduit,
+        }
+    }
+}
+
+/// What an editing island's conduit has done, for read-only diagnostics.
+///
+/// Counted only while an island is live, so the numbers describe the island
+/// alone and never the canvas conduits beside it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EditingIslandCounts {
+    /// Values or selections the mirror wrote into the island.
+    pub writes: u64,
+    /// Input events the mirror's own writes raised, recognized and not
+    /// imported.
+    pub echoes: u64,
+    /// Browser edits imported into the document.
+    pub imports: u64,
+    /// Browser selection moves imported into the document.
+    pub selection_imports: u64,
+    /// Browser history commands (`historyUndo`, `historyRedo`) routed to the
+    /// application's own history.
+    pub history: u64,
+    /// Compositions begun on the island.
+    pub compositions_started: u64,
+    /// Compositions that ended with text.
+    pub compositions_committed: u64,
+    /// Compositions that ended leaving the island as it was at their start.
+    pub compositions_canceled: u64,
 }
 
 impl Conduit {
@@ -337,6 +403,25 @@ pub(crate) struct ImeMirror {
     /// selection has moved; a rejected import means no import is coming,
     /// so the next sync must reassert the app's state instead of waiting.
     selection_import_rejected: Cell<bool>,
+    /// Whether the element's selection, as of the last sync or import, has
+    /// its focus at the start. Stored beside `selection` so a move that only
+    /// flips the direction is still a move.
+    selection_reversed: Cell<bool>,
+    /// The page's editing island, while one is adopted.
+    island: RefCell<Option<Rc<Conduit>>>,
+    /// Whether the island, rather than a built conduit, is live.
+    island_live: Cell<bool>,
+    /// Set while the mirror itself edits the island through the browser's
+    /// editing commands, which raise `beforeinput` and `input` synchronously.
+    /// Those events are this module's echo, never an edit to import.
+    writing: Cell<bool>,
+    /// The island's text when a composition began, so its end can tell a
+    /// commit from a cancel.
+    composition_checkpoint: RefCell<Option<String>>,
+    /// A browser history command announced by `beforeinput` and already
+    /// routed, so the `input` that follows it does not route it twice.
+    history_routed: Cell<bool>,
+    island_counts: Cell<EditingIslandCounts>,
 }
 
 /// Whether the device's primary pointer is coarse (a touch screen). The
@@ -367,7 +452,9 @@ impl ImeMirror {
             .dyn_into()
             .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
         element.set_id(IME_INPUT_ELEMENT_ID);
-        element.set_attribute("aria-label", FALLBACK_INPUT_NAME).ok();
+        element
+            .set_attribute("aria-label", FALLBACK_INPUT_NAME)
+            .ok();
         let style = element.style();
         // Both paths place the element in viewport coordinates, because the
         // canvas fills the viewport: one `update_position` then serves both,
@@ -426,6 +513,7 @@ impl ImeMirror {
         let mut conduits = vec![Conduit {
             capability: PlatformNativeElement::EditableLeaf,
             element: ConduitElement::TextArea(element),
+            page_owned: false,
         }];
         // The single-line conduits are built where this window is
         // browser-native, and built here rather than on first use, because the
@@ -466,6 +554,13 @@ impl ImeMirror {
             window_hint: Cell::new(0),
             sync_scheduled: Cell::new(false),
             selection_import_rejected: Cell::new(false),
+            selection_reversed: Cell::new(false),
+            island: RefCell::new(None),
+            island_live: Cell::new(false),
+            writing: Cell::new(false),
+            composition_checkpoint: RefCell::new(None),
+            history_routed: Cell::new(false),
+            island_counts: Cell::new(EditingIslandCounts::default()),
         };
         // Until an input handler asks otherwise, the element is an IME
         // conduit, not a form field: browser-side text assistance would
@@ -492,7 +587,9 @@ impl ImeMirror {
             .dyn_into()
             .map_err(|e| anyhow::anyhow!("Created element is not an input: {e:?}"))?;
         element.set_id(conduit_element_id(capability));
-        element.set_attribute("aria-label", FALLBACK_INPUT_NAME).ok();
+        element
+            .set_attribute("aria-label", FALLBACK_INPUT_NAME)
+            .ok();
         // The attribute rather than the IDL property, and set before the
         // element is in the document, so the browser builds the input the
         // capability names rather than re-typing one it already made.
@@ -519,6 +616,7 @@ impl ImeMirror {
         let conduit = Conduit {
             capability,
             element: ConduitElement::Input(element),
+            page_owned: false,
         };
         Ok(conduit)
     }
@@ -649,8 +747,14 @@ impl ImeMirror {
         let y = f32::from(bounds.origin.y);
         let width = f32::from(bounds.size.width).max(1.0);
         let height = f32::from(bounds.size.height).max(1.0);
-        self.place(conduit, x, y, width, height);
         self.published_bounds.set(Some([x, y, width, height]));
+        // The page lays its own editor out; GPUI's caret box belongs to the
+        // canvas leaf the island stands in for, so it is recorded and the
+        // island is left where the page put it.
+        if conduit.page_owned {
+            return;
+        }
+        self.place(&conduit, x, y, width, height);
         // GPUI prepainted a caret box, so there is a live editable leaf and
         // it is here. That is both the visibility signal and the repaint
         // signal: the element moved, so its pixels are in the wrong place
@@ -687,6 +791,9 @@ impl ImeMirror {
 
     pub(crate) fn reset_position(&self) {
         let conduit = self.live_conduit();
+        if conduit.page_owned {
+            return;
+        }
         let style = conduit.as_element().style();
         let mut properties = vec![("left", "0"), ("top", "0"), ("height", "1px")];
         if self.native_elements.realization().is_browser_native() {
@@ -731,16 +838,25 @@ impl ImeMirror {
         }
     }
 
-    /// The conduit in the document, focused, drawn and claimed.
-    fn live_conduit(&self) -> &Conduit {
+    /// The conduit in the document, focused, drawn and claimed: the page's
+    /// editing island while it is live, and otherwise the built conduit for
+    /// the capability in force.
+    fn live_conduit(&self) -> LiveConduit<'_> {
+        if self.island_live.get()
+            && let Some(island) = self.island.borrow().as_ref()
+        {
+            return LiveConduit::Island(Rc::clone(island));
+        }
         let live = self.live.get();
-        self.conduits
-            .iter()
-            .find(|conduit| conduit.capability == live)
-            // The textarea is built unconditionally and is the first conduit,
-            // so this is unreachable; it exists so that the accessors below
-            // cannot fail open on a missing element.
-            .unwrap_or(&self.conduits[0])
+        LiveConduit::Built(
+            self.conduits
+                .iter()
+                .find(|conduit| conduit.capability == live)
+                // The textarea is built unconditionally and is the first
+                // conduit, so this is unreachable; it exists so that the
+                // accessors below cannot fail open on a missing element.
+                .unwrap_or(&self.conduits[0]),
+        )
     }
 
     /// The capability whose element is driving the focused editable leaf.
@@ -774,6 +890,11 @@ impl ImeMirror {
     /// bracketed as a suppressed focus change, because a conduit swap is not
     /// the window becoming inactive.
     fn settle_conduit(&self, window: &WebWindowInner) {
+        // A live island is the editor the page chose for the focused leaf;
+        // capabilities choose among the built conduits only.
+        if self.island_live.get() {
+            return;
+        }
         let wanted = self.capability_in_force();
         let live = self.live.get();
         if wanted == live {
@@ -868,7 +989,8 @@ impl ImeMirror {
     }
 
     pub(crate) fn is_focused(&self) -> bool {
-        let element: &web_sys::Element = self.live_conduit().as_element().as_ref();
+        let conduit = self.live_conduit();
+        let element: &web_sys::Element = conduit.as_element().as_ref();
         web_sys::window()
             .and_then(|window| window.document())
             .and_then(|document| document.active_element())
@@ -930,6 +1052,18 @@ impl ImeMirror {
         let selection_start = self.selection_start().unwrap_or(0);
         let selection_end = conduit.element.selection_end().unwrap_or(selection_start);
         self.selection.set((selection_start, selection_end));
+        self.selection_reversed
+            .set(conduit.element.selection_reversed());
+    }
+
+    /// Whether the element's selection is backwards.
+    pub(crate) fn element_selection_reversed(&self) -> bool {
+        self.live_conduit().element.selection_reversed()
+    }
+
+    /// Whether the stored selection is backwards.
+    pub(crate) fn stored_selection_reversed(&self) -> bool {
+        self.selection_reversed.get()
     }
 
     /// Records that an element selection move could not be imported, so
@@ -937,6 +1071,279 @@ impl ImeMirror {
     /// import that is no longer coming.
     pub(crate) fn reject_selection_import(&self) {
         self.selection_import_rejected.set(true);
+    }
+
+    // --- Editing islands --------------------------------------------------------
+    //
+    // An editing island is a text control the *page* built and draws: a
+    // visible `<textarea>` standing in for a canvas editable leaf. The page
+    // owns its box, its style and its name; this module owns what it owns of
+    // every conduit -- the value, the selection, composition and the edit
+    // import -- because there has to be exactly one writer of those or the
+    // element and the document drift apart. So an island is adopted as one
+    // more conduit, driven by the same listeners and the same coalesced sync,
+    // and the page never writes its value.
+    //
+    // It differs from a built conduit in what it mirrors. A built conduit is a
+    // window around the caret for an IME to read; an island is what a person
+    // reads, so it mirrors the whole document (within the editable range).
+
+    /// Adopt `element` as the window's editing island, replacing any island
+    /// adopted before it. It is not live until [`Self::set_island_live`].
+    pub(crate) fn adopt_island(&self, element: web_sys::HtmlTextAreaElement) {
+        let html: &web_sys::Element = element.as_ref();
+        // The island names itself. The accessibility adapter reads this to
+        // leave the page's label alone when it claims the island for the
+        // focused node.
+        html.set_attribute(ISLAND_ATTRIBUTE, "").ok();
+        self.island.replace(Some(Rc::new(Conduit {
+            capability: PlatformNativeElement::EditableLeaf,
+            element: ConduitElement::TextArea(element),
+            page_owned: true,
+        })));
+        self.island_counts.set(EditingIslandCounts::default());
+    }
+
+    /// Forget the island, if `element` is it. A live island hands the input
+    /// path back to the built conduits first.
+    pub(crate) fn release_island(
+        &self,
+        window: &WebWindowInner,
+        element: &web_sys::HtmlTextAreaElement,
+    ) {
+        let is_island = self.island.borrow().as_ref().is_some_and(|island| {
+            matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element)
+        });
+        if !is_island {
+            return;
+        }
+        self.set_island_live(window, false);
+        self.island.replace(None);
+        let html: &web_sys::Element = element.as_ref();
+        html.remove_attribute(ISLAND_ATTRIBUTE).ok();
+    }
+
+    /// Make the island the live conduit, or hand the input path back to the
+    /// built conduits. Answers whether anything changed.
+    ///
+    /// Live means focused: the browser delivers keys, input and composition
+    /// to the focused element, so the island takes focus as it becomes live
+    /// and gives it to the built conduit when it stops, unless focus has
+    /// already gone somewhere else. Either move is bracketed as a suppressed
+    /// focus change, because swapping conduits is not the window becoming
+    /// inactive. A composition in progress is never moved: it belongs to the
+    /// element holding it.
+    pub(crate) fn set_island_live(&self, window: &WebWindowInner, live: bool) -> bool {
+        let Some(island) = self.island.borrow().clone() else {
+            return false;
+        };
+        if self.island_live.get() == live || window.is_composing.get() {
+            return false;
+        }
+        let built = {
+            let wanted = self.live.get();
+            self.conduits
+                .iter()
+                .find(|conduit| conduit.capability == wanted)
+                .unwrap_or(&self.conduits[0])
+        };
+        window.suppress_focus_status_events.set(true);
+        if live {
+            if island.as_element().focus().is_err() {
+                window.suppress_focus_status_events.set(false);
+                return false;
+            }
+            if let Some(layer) = self.layer.as_deref() {
+                layer.set_visible(built.as_element(), false);
+            }
+            self.island_live.set(true);
+            self.live_element.replace(island.as_element().clone());
+        } else {
+            let focused = web_sys::window()
+                .and_then(|window| window.document())
+                .and_then(|document| document.active_element())
+                .is_some_and(|active| {
+                    let element: &web_sys::Element = island.as_element().as_ref();
+                    &active == element
+                });
+            self.island_live.set(false);
+            self.live_element.replace(built.as_element().clone());
+            if focused {
+                built.as_element().focus().ok();
+            }
+        }
+        window.suppress_focus_status_events.set(false);
+        // As at a conduit switch: the element that became live holds none of
+        // the bookkeeping, so the next sync is a rebuild.
+        self.text.borrow_mut().clear();
+        self.selection.set((0, 0));
+        self.selection_reversed.set(false);
+        self.window_hint.set(0);
+        self.composition_checkpoint.replace(None);
+        self.history_routed.set(false);
+        if live {
+            let configuration = self.configuration.borrow().clone();
+            self.apply_configuration_to(&island, &configuration);
+        }
+        true
+    }
+
+    /// Whether the island is the live conduit.
+    pub(crate) fn island_is_live(&self) -> bool {
+        self.island_live.get() && self.island.borrow().is_some()
+    }
+
+    /// What the island's conduit has done since it was adopted.
+    pub(crate) fn island_counts(&self) -> EditingIslandCounts {
+        self.island_counts.get()
+    }
+
+    /// Count something the live island did. Nothing is counted while a built
+    /// conduit is live: these numbers describe the island alone.
+    pub(crate) fn note_island(&self, count: impl FnOnce(&mut EditingIslandCounts)) {
+        if self.island_is_live() {
+            let mut counts = self.island_counts.get();
+            count(&mut counts);
+            self.island_counts.set(counts);
+        }
+    }
+
+    /// Whether an event now is the echo of the mirror's own write.
+    pub(crate) fn is_writing(&self) -> bool {
+        self.writing.get()
+    }
+
+    /// A composition began on the live conduit: remember the text it began
+    /// from, so its end can tell a commit from a cancel.
+    pub(crate) fn begin_composition(&self) {
+        if !self.island_is_live() {
+            return;
+        }
+        self.composition_checkpoint
+            .replace(Some(self.live_conduit().element.value()));
+        self.note_island(|counts| counts.compositions_started += 1);
+    }
+
+    /// The composition ended with the element holding what it holds now.
+    ///
+    /// A composition that leaves the element as it was when it began was
+    /// canceled, whatever its last update said; anything else committed.
+    /// Only the classification uses the checkpoint: the document is never
+    /// restored from it, because edits that arrived after it began (the
+    /// commit itself, a remote edit) are newer than the checkpoint.
+    pub(crate) fn end_composition(&self) {
+        let Some(checkpoint) = self.composition_checkpoint.take() else {
+            return;
+        };
+        if self.live_conduit().element.value() == checkpoint {
+            self.note_island(|counts| counts.compositions_canceled += 1);
+        } else {
+            self.note_island(|counts| counts.compositions_committed += 1);
+        }
+    }
+
+    /// Record that a browser history command was routed from `beforeinput`,
+    /// so the `input` that may follow it routes nothing.
+    pub(crate) fn route_history(&self) {
+        self.history_routed.set(true);
+        self.note_island(|counts| counts.history += 1);
+    }
+
+    /// Take the record left by [`Self::route_history`].
+    pub(crate) fn take_routed_history(&self) -> bool {
+        self.history_routed.replace(false)
+    }
+
+    /// Bring the island to the document, whole.
+    ///
+    /// The value is written as the smallest replacement that turns the
+    /// element's text into the document's, through the browser's own editing
+    /// command when the island has focus. Two things follow from writing it
+    /// that way rather than assigning `value`: the caret and the scroll
+    /// position outside the replaced span stay where the reader left them,
+    /// and the browser records the write in the control's undo stack, which
+    /// is what keeps its Undo and Redo commands available to route back into
+    /// the application's history. The command raises `beforeinput` and
+    /// `input` synchronously; `writing` marks them as this module's echo.
+    fn sync_island(
+        &self,
+        window: &WebWindowInner,
+        conduit: &Conduit,
+        selection: &gpui::UTF16Selection,
+        editable_range: Option<std::ops::Range<usize>>,
+    ) {
+        let range = match editable_range {
+            Some(range) => range,
+            None => {
+                let length = window
+                    .with_input_handler(|handler| handler.text_length_utf16())
+                    .flatten();
+                0..length.unwrap_or(usize::MAX / 2)
+            }
+        };
+        let mut adjusted = None;
+        let text = window
+            .with_input_handler(|handler| handler.text_for_range(range.clone(), &mut adjusted))
+            .flatten()
+            .unwrap_or_default();
+        let start = adjusted.unwrap_or(range).start;
+        let current = conduit.element.value();
+        if current != text {
+            self.write_island_value(conduit, &current, &text);
+        }
+        *self.text.borrow_mut() = conduit.element.value();
+        self.window_hint.set(start);
+        let selection_start = selection.range.start.saturating_sub(start) as u32;
+        let selection_end = selection.range.end.saturating_sub(start) as u32;
+        if conduit.element.selection_start() != Some(selection_start)
+            || conduit.element.selection_end() != Some(selection_end)
+            || conduit.element.selection_reversed() != selection.reversed
+        {
+            conduit
+                .element
+                .set_selection_range(selection_start, selection_end, selection.reversed);
+            self.note_island(|counts| counts.writes += 1);
+        }
+        self.selection.set((
+            conduit.element.selection_start().unwrap_or(selection_start),
+            conduit.element.selection_end().unwrap_or(selection_end),
+        ));
+        self.selection_reversed
+            .set(conduit.element.selection_reversed());
+    }
+
+    fn write_island_value(&self, conduit: &Conduit, current: &str, text: &str) {
+        let (start, removed_end, inserted) = minimal_replacement(current, text);
+        let element: &web_sys::Element = conduit.as_element().as_ref();
+        let document = element.owner_document();
+        let focused = document
+            .as_ref()
+            .and_then(|document| document.active_element())
+            .is_some_and(|active| &active == element);
+        if focused && let Some(document) = document {
+            let document: web_sys::HtmlDocument = document.unchecked_into();
+            conduit
+                .element
+                .set_selection_range(start as u32, removed_end as u32, false);
+            self.writing.set(true);
+            let command = if inserted.is_empty() {
+                "delete"
+            } else {
+                "insertText"
+            };
+            let done = document
+                .exec_command_with_show_ui_and_value(command, false, &inserted)
+                .unwrap_or(false);
+            self.writing.set(false);
+            if done && conduit.element.value() == text {
+                self.note_island(|counts| counts.writes += 1);
+                return;
+            }
+        }
+        // Unfocused (the command edits the focused element only), or a
+        // browser whose command did not produce the document: assign it.
+        conduit.element.set_value(text);
+        self.note_island(|counts| counts.writes += 1);
     }
 
     /// The window of the document to mirror, fitted to what the live
@@ -1075,6 +1482,7 @@ impl ImeMirror {
                     mirror.text.borrow_mut().clear();
                 }
                 mirror.selection.set((0, 0));
+                mirror.selection_reversed.set(false);
                 return;
             };
             // The mirrored window never crosses the handler's editable
@@ -1086,9 +1494,17 @@ impl ImeMirror {
                 .with_input_handler(|handler| handler.text_input_editable_range())
                 .flatten();
 
+            // The page's editor shows the whole document, so it is synced
+            // whole; none of the window arithmetic below applies to it.
+            if conduit.page_owned {
+                mirror.sync_island(window, &conduit, &selection, editable_range);
+                return;
+            }
+
             if is_consistent(
                 window,
                 &selection.range,
+                selection.reversed,
                 editable_range.as_ref(),
                 MIN_EDGE_CHARS,
             ) {
@@ -1103,6 +1519,7 @@ impl ImeMirror {
             if move_selection_within_window(
                 window,
                 &selection.range,
+                selection.reversed,
                 editable_range.as_ref(),
                 MIN_EDGE_CHARS,
             ) {
@@ -1139,10 +1556,13 @@ impl ImeMirror {
             let selection_end = selection.range.end.saturating_sub(window_start) as u32;
             if conduit.element.selection_start() != Some(selection_start)
                 || conduit.element.selection_end() != Some(selection_end)
+                || conduit.element.selection_reversed() != selection.reversed
             {
-                conduit
-                    .element
-                    .set_selection_range(selection_start, selection_end);
+                conduit.element.set_selection_range(
+                    selection_start,
+                    selection_end,
+                    selection.reversed,
+                );
             }
             // Read the selection back rather than trusting the computed
             // values: the browser clamps out-of-bounds positions, and a
@@ -1154,8 +1574,45 @@ impl ImeMirror {
                 actual_start.unwrap_or(selection_start),
                 actual_end.unwrap_or(selection_end),
             ));
+            mirror
+                .selection_reversed
+                .set(conduit.element.selection_reversed());
         }
     }
+}
+
+/// The attribute an adopted editing island carries while it is adopted.
+pub(crate) const ISLAND_ATTRIBUTE: &str = "data-gpui-editing-island";
+
+/// The smallest replacement turning `current` into `text`, as
+/// `(start, removed_end, inserted)` in UTF-16 code units of `current`.
+///
+/// Neither end splits a surrogate pair: a replacement that began or ended
+/// between the two halves of an astral character would write half of one.
+fn minimal_replacement(current: &str, text: &str) -> (usize, usize, String) {
+    let old: Vec<u16> = current.encode_utf16().collect();
+    let new: Vec<u16> = text.encode_utf16().collect();
+    let mut prefix = old
+        .iter()
+        .zip(new.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if prefix > 0 && (0xD800..0xDC00).contains(&old[prefix - 1]) {
+        prefix -= 1;
+    }
+    let most = old.len().min(new.len()) - prefix;
+    let mut suffix = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take(most)
+        .take_while(|(left, right)| left == right)
+        .count();
+    if suffix > 0 && (0xDC00..0xE000).contains(&new[new.len() - suffix]) {
+        suffix -= 1;
+    }
+    let inserted = String::from_utf16_lossy(&new[prefix..new.len() - suffix]);
+    (prefix, old.len() - suffix, inserted)
 }
 
 /// The line-break-free segment of `text` that contains the caret, as
@@ -1197,6 +1654,7 @@ fn line_containing(text: &str, caret: usize) -> (usize, &str) {
 fn move_selection_within_window(
     window: &WebWindowInner,
     app_selection: &std::ops::Range<usize>,
+    reversed: bool,
     editable_range: Option<&std::ops::Range<usize>>,
     min_edge: usize,
 ) -> bool {
@@ -1262,7 +1720,7 @@ fn move_selection_within_window(
     let conduit = mirror.live_conduit();
     conduit
         .element
-        .set_selection_range(selection_start as u32, selection_end as u32);
+        .set_selection_range(selection_start as u32, selection_end as u32, reversed);
     let actual_start = conduit.element.selection_start();
     let actual_end = conduit.element.selection_end();
     if actual_start != Some(selection_start as u32) || actual_end != Some(selection_end as u32) {
@@ -1271,6 +1729,9 @@ fn move_selection_within_window(
     mirror
         .selection
         .set((selection_start as u32, selection_end as u32));
+    mirror
+        .selection_reversed
+        .set(conduit.element.selection_reversed());
     true
 }
 
@@ -1281,10 +1742,18 @@ fn move_selection_within_window(
 fn is_consistent(
     window: &WebWindowInner,
     app_selection: &std::ops::Range<usize>,
+    reversed: bool,
     editable_range: Option<&std::ops::Range<usize>>,
     min_edge: usize,
 ) -> bool {
     let mirror = &window.ime_mirror;
+    // A selection that only changed direction is still a change: the
+    // element's caret is at the other end.
+    if mirror.selection_reversed.get() != reversed
+        || mirror.live_conduit().element.selection_reversed() != reversed
+    {
+        return false;
+    }
     let (element_selection_start, element_selection_end) = mirror.selection.get();
     let element_selection_start = element_selection_start as usize;
     let element_selection_end = element_selection_end as usize;
@@ -1360,4 +1829,48 @@ fn is_consistent(
     }
     // The element selection corresponds to the app selection end too?
     app_selection.end.checked_sub(app_window_start) == Some(element_selection_end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::minimal_replacement;
+
+    /// Apply the replacement to `current` in UTF-16 and require `text`, and
+    /// that neither side of the cut splits a surrogate pair.
+    fn check(current: &str, text: &str) -> (usize, usize, String) {
+        let (start, end, inserted) = minimal_replacement(current, text);
+        let mut units: Vec<u16> = current.encode_utf16().collect();
+        assert!(start <= end && end <= units.len());
+        units.splice(start..end, inserted.encode_utf16());
+        assert_eq!(String::from_utf16(&units).unwrap(), text);
+        assert!(!inserted.contains('\u{FFFD}'), "the cut split a surrogate");
+        (start, end, inserted)
+    }
+
+    #[test]
+    fn replaces_only_what_changed() {
+        assert_eq!(
+            check("hello world", "hello brave world"),
+            (6, 6, "brave ".into())
+        );
+        assert_eq!(check("hello world", "hello"), (5, 11, String::new()));
+        assert_eq!(check("same", "same"), (4, 4, String::new()));
+        assert_eq!(check("", "new"), (0, 0, "new".into()));
+    }
+
+    #[test]
+    fn never_splits_a_surrogate_pair() {
+        // Two emoji share a high surrogate; a naive prefix would stop
+        // between the halves of the second one.
+        check("a😀b", "a😁b");
+        check("👩‍👩‍👧 z", "👩‍👩‍👦 z");
+        check("x😀", "x😀😀");
+        check("😀😀y", "😀y");
+    }
+
+    #[test]
+    fn keeps_combining_text_and_direction_marks_intact() {
+        check("e\u{301}x", "e\u{301}\u{300}x");
+        check("\u{202B}שלום\u{202C}", "\u{202B}שלום עולם\u{202C}");
+    }
 }

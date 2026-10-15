@@ -39,7 +39,7 @@ use gpui::accesskit::{self, Action, ActionRequest, Live, NodeId, Rect, Role, Tog
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
-use crate::ime_mirror::{FALLBACK_INPUT_NAME, conduit_name};
+use crate::ime_mirror::{FALLBACK_INPUT_NAME, ISLAND_ATTRIBUTE, conduit_name};
 use crate::native_element::NativeElements;
 
 /// The attribute that carries a node's AccessKit id on its mirror element.
@@ -677,8 +677,12 @@ impl WebA11yAdapter {
             && previous != input_element
         {
             clear_claim(previous.as_ref());
-            // A hidden conduit keeps the fixed name it was built with.
-            set_if_changed(previous.as_ref(), "aria-label", Some(FALLBACK_INPUT_NAME));
+            // A hidden conduit keeps the fixed name it was built with; an
+            // editing island keeps the name its page gave it.
+            let previous: &web_sys::Element = previous.as_ref();
+            if !previous.has_attribute(ISLAND_ATTRIBUTE) {
+                set_if_changed(previous, "aria-label", Some(FALLBACK_INPUT_NAME));
+            }
         }
         match claimed {
             // The capability is not needed here: it was declared above, and
@@ -708,6 +712,11 @@ impl WebA11yAdapter {
         let (label, description) = entry_name.map_or((None, None), |(label, description)| {
             (label.as_deref(), description.as_deref())
         });
+        // A page-owned editing island is named by its page, which drew the
+        // visible label beside it; the mirror never renames it.
+        if element.has_attribute(ISLAND_ATTRIBUTE) {
+            return;
+        }
         set_if_changed(element, "aria-label", Some(conduit_name(label)));
         set_if_changed(element, "aria-description", description);
     }

@@ -8,6 +8,7 @@
 mod a11y;
 mod dispatcher;
 mod display;
+mod editing_island;
 mod events;
 mod file_drop;
 mod http_client;
@@ -22,6 +23,8 @@ mod window;
 pub use a11y::{A11yMirrorSummary, a11y_mirror_summary};
 pub use dispatcher::WebDispatcher;
 pub use display::WebDisplay;
+pub use editing_island::EditingIsland;
+pub use ime_mirror::EditingIslandCounts;
 pub use file_drop::{WebFileDrop, web_file_drops};
 pub use gpui_wgpu::WebBackendPreference;
 pub use http_client::{FetchCredentials, FetchHttpClient};

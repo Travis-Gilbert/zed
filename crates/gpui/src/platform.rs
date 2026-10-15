@@ -1824,6 +1824,13 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    /// See [`InputHandler::set_text_selection`].
+    pub fn set_text_selection(&mut self, selection: UTF16Selection) {
+        self.cx
+            .update(|window, cx| self.handler.set_text_selection(selection, window, cx))
+            .ok();
+    }
+
     /// See [`InputHandler::element_bounds`].
     pub fn element_bounds(&mut self) -> Option<Bounds<Pixels>> {
         self.cx
@@ -2010,6 +2017,19 @@ pub trait InputHandler: 'static {
         _window: &mut Window,
         _cx: &mut App,
     ) {
+    }
+
+    /// Set the user's selection together with its direction.
+    ///
+    /// The directional form of [`Self::set_selected_text_range`], for
+    /// platforms whose text machinery reports which end of the selection is
+    /// the focus: a browser `<textarea>` reports `selectionDirection`, and a
+    /// backwards selection imported without it would put the caret at the
+    /// wrong end. `selection.reversed` means the focus is at `range.start`.
+    /// The default drops the direction, which is what a handler that keeps
+    /// no direction can honor.
+    fn set_text_selection(&mut self, selection: UTF16Selection, window: &mut Window, cx: &mut App) {
+        self.set_selected_text_range(selection.range, window, cx);
     }
 
     /// Get the bounds of the focused text element in window coordinates, if known.

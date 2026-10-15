@@ -1,0 +1,100 @@
+//! A page-owned, visible text field adopted as the window's IME conduit.
+//!
+//! The page creates and places the element; GPUI never moves, restyles, or
+//! renames it. While the island is live it receives exactly the listeners
+//! the hidden conduit has, so input, selection, composition, paste, and
+//! history reach the focused input handler through the one import path, and
+//! the mirror writes the handler's document back to it as the smallest
+//! replacement. The input handler stays the only owner of the text, the
+//! selection, the composition, and the history: the element is a view of
+//! them that the browser may edit.
+
+use std::{cell::RefCell, rc::Weak};
+
+use crate::{events::EventListenerHandle, ime_mirror::EditingIslandCounts, window::WebWindowInner};
+
+thread_local! {
+    static WINDOW: RefCell<Weak<WebWindowInner>> = const { RefCell::new(Weak::new()) };
+}
+
+/// Record the window that islands adopted on this thread attach to.
+pub(crate) fn publish_window(window: Weak<WebWindowInner>) {
+    WINDOW.with(|slot| *slot.borrow_mut() = window);
+}
+
+/// An adopted editing island. Dropping it releases the element back to the
+/// page and returns the window to its hidden conduit.
+pub struct EditingIsland {
+    window: Weak<WebWindowInner>,
+    element: web_sys::HtmlTextAreaElement,
+    _listeners: Vec<EventListenerHandle>,
+}
+
+impl EditingIsland {
+    /// Adopt `element` as the window's editing island, or `None` when no
+    /// window has opened on this thread.
+    pub fn adopt(element: web_sys::HtmlTextAreaElement) -> Option<Self> {
+        let window = WINDOW.with(|slot| slot.borrow().clone());
+        let inner = window.upgrade()?;
+        inner.ime_mirror.adopt_island(element.clone());
+        let listeners = inner.attach_input_listeners(element.as_ref());
+        Some(Self {
+            window,
+            element,
+            _listeners: listeners,
+        })
+    }
+
+    /// The adopted element.
+    pub fn element(&self) -> &web_sys::HtmlTextAreaElement {
+        &self.element
+    }
+
+    /// Make the island the live conduit (`true`) or return input to the
+    /// hidden conduit (`false`). Returns whether the island is now live; a
+    /// change is refused while a composition is open, because moving the
+    /// conduit would end it without a commit.
+    pub fn set_live(&self, live: bool) -> bool {
+        let Some(inner) = self.window.upgrade() else {
+            return false;
+        };
+        if inner.is_composing.get() && live != inner.ime_mirror.island_is_live() {
+            return inner.ime_mirror.island_is_live();
+        }
+        let now_live = inner.ime_mirror.set_island_live(&inner, live);
+        if now_live {
+            crate::ime_mirror::ImeMirror::schedule_sync(&inner);
+        }
+        now_live
+    }
+
+    /// Whether the island is the live conduit.
+    pub fn is_live(&self) -> bool {
+        self.window
+            .upgrade()
+            .is_some_and(|inner| inner.ime_mirror.island_is_live())
+    }
+
+    /// Whether a composition is open on the window.
+    pub fn composing(&self) -> bool {
+        self.window
+            .upgrade()
+            .is_some_and(|inner| inner.is_composing.get())
+    }
+
+    /// What the island has done since it was adopted.
+    pub fn counts(&self) -> EditingIslandCounts {
+        self.window
+            .upgrade()
+            .map(|inner| inner.ime_mirror.island_counts())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for EditingIsland {
+    fn drop(&mut self) {
+        if let Some(inner) = self.window.upgrade() {
+            inner.ime_mirror.release_island(&inner, &self.element);
+        }
+    }
+}

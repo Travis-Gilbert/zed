@@ -75,6 +75,9 @@ pub(crate) struct WebWindowInner {
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
+    /// Every input-path listener, kept so an element the page adopts later
+    /// (an editing island) receives the same handlers as the built conduits.
+    pub(crate) input_listeners: RefCell<Vec<(&'static str, crate::events::SharedListenerRecord)>>,
     /// Set while `sync_virtual_keyboard` blur/focus-cycles the hidden input.
     /// The cycle is a keyboard-visibility hint, not a real activity change;
     /// letting the focus/blur listeners report it would re-enter GPUI
@@ -238,6 +241,7 @@ impl WebWindow {
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
+            input_listeners: RefCell::new(Vec::new()),
             suppress_focus_status_events: Cell::new(false),
             visual_viewport_probe: Cell::new((0.0, 0.0)),
             gesture_start_visual_viewport_height: Cell::new(0.0),
@@ -278,6 +282,7 @@ impl WebWindow {
         }
 
         let event_listeners = inner.register_event_listeners();
+        crate::editing_island::publish_window(Rc::downgrade(&inner));
 
         Ok(Self {
             inner,

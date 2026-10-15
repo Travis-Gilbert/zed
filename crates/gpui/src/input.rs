@@ -90,6 +90,16 @@ pub trait EntityInputHandler: 'static + Sized {
     ) {
     }
 
+    /// See [`InputHandler::set_text_selection`] for details
+    fn set_text_selection(
+        &mut self,
+        selection: UTF16Selection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_selected_text_range(selection.range, window, cx);
+    }
+
     /// See [`InputHandler::text_length_utf16`] for details
     fn text_length_utf16(
         &mut self,
@@ -243,6 +253,11 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         self.view.update(cx, |view, cx| {
             view.set_selected_text_range(range_utf16, window, cx)
         })
+    }
+
+    fn set_text_selection(&mut self, selection: UTF16Selection, window: &mut Window, cx: &mut App) {
+        self.view
+            .update(cx, |view, cx| view.set_text_selection(selection, window, cx))
     }
 
     fn element_bounds(&mut self, _window: &mut Window, _cx: &mut App) -> Option<Bounds<Pixels>> {
