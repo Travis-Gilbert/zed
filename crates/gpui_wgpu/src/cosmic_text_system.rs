@@ -156,6 +156,24 @@ impl PlatformTextSystem for CosmicTextSystem {
         Ok(candidates[ix])
     }
 
+    fn resolved_font_face(&self, font_id: FontId) -> Option<gpui::ResolvedFontFace> {
+        let state = self.0.read();
+        let loaded = state.loaded_fonts.get(font_id.0)?;
+        let face = state.font_system.db().face(loaded.font.id())?;
+        let family = face.families.first()?.0.clone().into();
+        let style = match face.style {
+            Style::Normal => gpui::FontStyle::Normal,
+            Style::Italic => gpui::FontStyle::Italic,
+            Style::Oblique => gpui::FontStyle::Oblique,
+        };
+        Some(gpui::ResolvedFontFace::new(
+            family,
+            face.post_script_name.clone().into(),
+            gpui::FontWeight(face.weight.0 as f32),
+            style,
+        ))
+    }
+
     fn prewarm_fonts(&self, font_ids: &[FontId]) {
         self.0.write().prewarm_fonts(font_ids);
     }
@@ -1062,6 +1080,44 @@ mod tests {
 
     const IBM_PLEX: &[u8] =
         include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+
+    #[test]
+    fn resolved_face_reports_actual_weight_and_style_instead_of_requested_descriptor() -> Result<()>
+    {
+        let platform = text_system()?;
+        platform.add_fonts(vec![Cow::Borrowed(include_bytes!(
+            "../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"
+        ))])?;
+        let system = gpui::TextSystem::new(Arc::new(platform));
+        let requested = gpui::Font {
+            weight: gpui::FontWeight(450.),
+            style: gpui::FontStyle::Italic,
+            ..gpui::font("IBM Plex Sans")
+        };
+        let id = system.resolve_font(&requested);
+        let face = system
+            .resolved_font_face(id)
+            .expect("actual selected embedded face");
+        assert_eq!(face.family().as_ref(), "IBM Plex Sans");
+        assert_eq!(face.weight(), gpui::FontWeight::NORMAL);
+        assert_eq!(face.style(), gpui::FontStyle::Normal);
+        assert_eq!(face.post_script_name().as_ref(), "IBMPlexSans");
+        assert_eq!(
+            system.get_font_for_id(id),
+            Some(requested),
+            "old cache API reports the request"
+        );
+        let bold = system.resolve_font(&gpui::Font {
+            weight: gpui::FontWeight::BOLD,
+            ..gpui::font("IBM Plex Sans")
+        });
+        assert_eq!(
+            system.resolved_font_face(bold).unwrap().weight(),
+            gpui::FontWeight(600.)
+        );
+        assert!(system.resolved_font_face(FontId(usize::MAX)).is_none());
+        Ok(())
+    }
 
     /// Every code point of `Bidi_Class=B`, each of which starts a new bidi
     /// paragraph and so can split one line into mixed-direction paragraphs.

@@ -225,7 +225,7 @@ impl WebWindowInner {
     /// the window was created. The handles detach them when dropped.
     pub(crate) fn attach_input_listeners(
         self: &Rc<Self>,
-        element: &web_sys::HtmlTextAreaElement,
+        element: &web_sys::HtmlElement,
         adoption: u64,
     ) -> Vec<EventListenerHandle> {
         self.input_listeners
@@ -846,7 +846,7 @@ impl WebWindowInner {
             if is_tab
                 && event
                     .target()
-                    .and_then(|target| target.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
+                    .and_then(|target| target.dyn_into::<web_sys::HtmlElement>().ok())
                     .is_some_and(|element| this.ime_mirror.island_uses_native_tab(&element))
             {
                 // The visible page-owned editor participates in browser

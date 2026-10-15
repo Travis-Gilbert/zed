@@ -170,6 +170,7 @@ enum ConduitElement {
     /// A single-line capability: an input, whose value sanitization strips
     /// line breaks from an assigned value.
     Input(web_sys::HtmlInputElement),
+    Styled(Rc<crate::styled_input::StyledInput>),
 }
 
 impl ConduitElement {
@@ -177,6 +178,7 @@ impl ConduitElement {
         let element: &web_sys::HtmlElement = match self {
             Self::TextArea(element) => element.as_ref(),
             Self::Input(element) => element.as_ref(),
+            Self::Styled(element) => element.element(),
         };
         element
     }
@@ -185,6 +187,7 @@ impl ConduitElement {
         match self {
             Self::TextArea(element) => element.value(),
             Self::Input(element) => element.value(),
+            Self::Styled(element) => element.value(),
         }
     }
 
@@ -192,6 +195,7 @@ impl ConduitElement {
         match self {
             Self::TextArea(element) => element.set_value(value),
             Self::Input(element) => element.set_value(value),
+            Self::Styled(element) => element.set_value(value),
         }
     }
 
@@ -199,6 +203,7 @@ impl ConduitElement {
         match self {
             Self::TextArea(element) => element.selection_start().ok().flatten(),
             Self::Input(element) => element.selection_start().ok().flatten(),
+            Self::Styled(element) => element.selection().map(|(start, _, _)| start),
         }
     }
 
@@ -206,6 +211,7 @@ impl ConduitElement {
         match self {
             Self::TextArea(element) => element.selection_end().ok().flatten(),
             Self::Input(element) => element.selection_end().ok().flatten(),
+            Self::Styled(element) => element.selection().map(|(_, end, _)| end),
         }
     }
 
@@ -219,6 +225,9 @@ impl ConduitElement {
         let direction = match self {
             Self::TextArea(element) => element.selection_direction(),
             Self::Input(element) => element.selection_direction(),
+            Self::Styled(element) => {
+                return element.selection().is_some_and(|(_, _, reversed)| reversed);
+            }
         };
         direction.ok().flatten().as_deref() == Some("backward")
     }
@@ -232,6 +241,10 @@ impl ConduitElement {
             Self::Input(element) => element
                 .set_selection_range_with_direction(start, end, direction)
                 .ok(),
+            Self::Styled(element) => {
+                element.set_selection(start, end, reversed);
+                None
+            }
         };
     }
 
@@ -239,6 +252,7 @@ impl ConduitElement {
         match self {
             Self::TextArea(element) => element.read_only(),
             Self::Input(element) => element.read_only(),
+            Self::Styled(element) => element.element().content_editable() == "false",
         }
     }
 
@@ -246,6 +260,11 @@ impl ConduitElement {
         match self {
             Self::TextArea(element) => element.set_read_only(read_only),
             Self::Input(element) => element.set_read_only(read_only),
+            Self::Styled(element) => element.element().set_content_editable(if read_only {
+                "false"
+            } else {
+                "plaintext-only"
+            }),
         }
     }
 
@@ -259,7 +278,7 @@ impl ConduitElement {
     /// document edit -- would be computed against text that is not there.
     fn holds(&self, text: &str) -> bool {
         match self {
-            Self::TextArea(_) => true,
+            Self::TextArea(_) | Self::Styled(_) => true,
             Self::Input(_) => !text.contains(['\n', '\r']),
         }
     }
@@ -1053,6 +1072,9 @@ impl ImeMirror {
     /// back would restart the IME mid-gesture.
     pub(crate) fn adopt_element_state(&self) {
         let conduit = self.live_conduit();
+        if let ConduitElement::Styled(input) = &conduit.element {
+            input.invalidate_styles();
+        }
         *self.text.borrow_mut() = conduit.element.value();
         let selection_start = self.selection_start().unwrap_or(0);
         let selection_end = conduit.element.selection_end().unwrap_or(selection_start);
@@ -1100,6 +1122,18 @@ impl ImeMirror {
         window: &WebWindowInner,
         element: web_sys::HtmlTextAreaElement,
     ) -> u64 {
+        self.adopt_conduit(window, ConduitElement::TextArea(element))
+    }
+
+    pub(crate) fn adopt_styled_island(
+        &self,
+        window: &WebWindowInner,
+        element: Rc<crate::styled_input::StyledInput>,
+    ) -> u64 {
+        self.adopt_conduit(window, ConduitElement::Styled(element))
+    }
+
+    fn adopt_conduit(&self, window: &WebWindowInner, element: ConduitElement) -> u64 {
         // Retire the old conduit before publishing its successor. The public
         // adoption gate has already refused an open composition.
         self.set_island_live(window, false);
@@ -1109,14 +1143,14 @@ impl ImeMirror {
                 .remove_attribute(ISLAND_ATTRIBUTE)
                 .ok();
         }
-        let html: &web_sys::Element = element.as_ref();
+        let html: &web_sys::Element = element.as_element().as_ref();
         // The island names itself. The accessibility adapter reads this to
         // leave the page's label alone when it claims the island for the
         // focused node.
         html.set_attribute(ISLAND_ATTRIBUTE, "").ok();
         self.island.replace(Some(Rc::new(Conduit {
             capability: PlatformNativeElement::EditableLeaf,
-            element: ConduitElement::TextArea(element),
+            element,
             page_owned: true,
         })));
         self.island_native_tab.set(false);
@@ -1132,21 +1166,22 @@ impl ImeMirror {
 
     pub(crate) fn owns_island_adoption(
         &self,
-        element: &web_sys::HtmlTextAreaElement,
+        element: &web_sys::HtmlElement,
         adoption: u64,
     ) -> bool {
         self.island_adoption.get() == adoption && self.owns_island(element)
     }
 
-    pub(crate) fn owns_island(&self, element: &web_sys::HtmlTextAreaElement) -> bool {
-        self.island.borrow().as_ref().is_some_and(|island| {
-            matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element)
-        })
+    pub(crate) fn owns_island(&self, element: &web_sys::HtmlElement) -> bool {
+        self.island
+            .borrow()
+            .as_ref()
+            .is_some_and(|island| island.as_element() == element)
     }
 
     pub(crate) fn set_island_native_tab(
         &self,
-        element: &web_sys::HtmlTextAreaElement,
+        element: &web_sys::HtmlElement,
         adoption: u64,
         enabled: bool,
     ) -> bool {
@@ -1157,7 +1192,7 @@ impl ImeMirror {
         true
     }
 
-    pub(crate) fn island_uses_native_tab(&self, element: &web_sys::HtmlTextAreaElement) -> bool {
+    pub(crate) fn island_uses_native_tab(&self, element: &web_sys::HtmlElement) -> bool {
         self.island_native_tab.get() && self.island_is_live() && self.owns_island(element)
     }
 
@@ -1166,7 +1201,7 @@ impl ImeMirror {
     pub(crate) fn release_island(
         &self,
         window: &WebWindowInner,
-        element: &web_sys::HtmlTextAreaElement,
+        element: &web_sys::HtmlElement,
         adoption: u64,
     ) {
         if !self.owns_island_adoption(element, adoption) {
@@ -1665,36 +1700,7 @@ impl ImeMirror {
 /// The attribute an adopted editing island carries while it is adopted.
 pub(crate) const ISLAND_ATTRIBUTE: &str = "data-gpui-editing-island";
 
-/// The smallest replacement turning `current` into `text`, as
-/// `(start, removed_end, inserted)` in UTF-16 code units of `current`.
-///
-/// Neither end splits a surrogate pair: a replacement that began or ended
-/// between the two halves of an astral character would write half of one.
-fn minimal_replacement(current: &str, text: &str) -> (usize, usize, String) {
-    let old: Vec<u16> = current.encode_utf16().collect();
-    let new: Vec<u16> = text.encode_utf16().collect();
-    let mut prefix = old
-        .iter()
-        .zip(new.iter())
-        .take_while(|(left, right)| left == right)
-        .count();
-    if prefix > 0 && (0xD800..0xDC00).contains(&old[prefix - 1]) {
-        prefix -= 1;
-    }
-    let most = old.len().min(new.len()) - prefix;
-    let mut suffix = old
-        .iter()
-        .rev()
-        .zip(new.iter().rev())
-        .take(most)
-        .take_while(|(left, right)| left == right)
-        .count();
-    if suffix > 0 && (0xDC00..0xE000).contains(&new[new.len() - suffix]) {
-        suffix -= 1;
-    }
-    let inserted = String::from_utf16_lossy(&new[prefix..new.len() - suffix]);
-    (prefix, old.len() - suffix, inserted)
-}
+use crate::input_edit::minimal_replacement;
 
 /// The line-break-free segment of `text` that contains the caret, as
 /// `(start, line)` in UTF-16 code units from `text`'s start.

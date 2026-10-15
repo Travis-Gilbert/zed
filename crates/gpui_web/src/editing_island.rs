@@ -9,7 +9,11 @@
 //! selection, the composition, and the history: the element is a view of
 //! them that the browser may edit.
 
-use std::{cell::RefCell, rc::Weak};
+use std::{
+    cell::RefCell,
+    rc::{Rc, Weak},
+};
+use wasm_bindgen::JsCast;
 
 use crate::{events::EventListenerHandle, ime_mirror::EditingIslandCounts, window::WebWindowInner};
 
@@ -26,7 +30,7 @@ pub(crate) fn publish_window(window: Weak<WebWindowInner>) {
 /// page and returns the window to its hidden conduit.
 pub struct EditingIsland {
     window: Weak<WebWindowInner>,
-    element: web_sys::HtmlTextAreaElement,
+    element: web_sys::HtmlElement,
     adoption: u64,
     _listeners: Vec<EventListenerHandle>,
 }
@@ -42,6 +46,7 @@ impl EditingIsland {
             return None;
         }
         let adoption = inner.ime_mirror.adopt_island(&inner, element.clone());
+        let element: web_sys::HtmlElement = element.unchecked_into();
         let listeners = inner.attach_input_listeners(&element, adoption);
         Some(Self {
             window,
@@ -53,7 +58,7 @@ impl EditingIsland {
 
     /// The adopted element.
     pub fn element(&self) -> &web_sys::HtmlTextAreaElement {
-        &self.element
+        self.element.unchecked_ref()
     }
 
     /// Make the island the live conduit (`true`) or return input to the
@@ -109,6 +114,16 @@ impl EditingIsland {
         }
     }
 
+    /// Whether this handle still owns the current adopted incarnation,
+    /// independently of whether it is live. Retired handles stay retired.
+    pub fn is_current_adoption(&self) -> bool {
+        self.window.upgrade().is_some_and(|inner| {
+            inner
+                .ime_mirror
+                .owns_island_adoption(&self.element, self.adoption)
+        })
+    }
+
     /// Whether this adoption is still the live conduit.
     pub fn is_live(&self) -> bool {
         self.window.upgrade().is_some_and(|inner| {
@@ -156,5 +171,95 @@ impl Drop for EditingIsland {
                 .ime_mirror
                 .release_island(&inner, &self.element, self.adoption);
         }
+    }
+}
+
+/// A page-owned contenteditable realization of the same focused input handler.
+/// The conduit alone writes text, selection and styled descendants. Styles are
+/// presentation metadata, never edits or an independent history.
+pub struct StyledEditingIsland {
+    lease: EditingIsland,
+    input: Rc<crate::styled_input::StyledInput>,
+}
+impl StyledEditingIsland {
+    /// Adopt a retained root; refusal during composition preserves its predecessor.
+    pub fn adopt(element: web_sys::HtmlElement) -> Option<Self> {
+        let window = WINDOW.with(|slot| slot.borrow().clone());
+        let inner = window.upgrade()?;
+        if inner.is_composing.get() {
+            return None;
+        }
+        let input = Rc::new(crate::styled_input::StyledInput::new(element.clone()));
+        let adoption = inner.ime_mirror.adopt_styled_island(&inner, input.clone());
+        let listeners = inner.attach_input_listeners(&element, adoption);
+        Some(Self {
+            lease: EditingIsland {
+                window,
+                element,
+                adoption,
+                _listeners: listeners,
+            },
+            input,
+        })
+    }
+    /// The retained page-owned root.
+    pub fn element(&self) -> &web_sys::HtmlElement {
+        &self.lease.element
+    }
+    /// Activate or deactivate this adoption, refusing swaps during composition.
+    pub fn set_live(&self, live: bool) -> bool {
+        self.lease.set_live(live)
+    }
+    /// Whether this handle owns the current adoption, including while inactive.
+    pub fn is_current_adoption(&self) -> bool {
+        self.lease.is_current_adoption()
+    }
+    /// Whether this incarnation is still the live conduit.
+    pub fn is_live(&self) -> bool {
+        self.lease.is_live()
+    }
+    /// Whether the platform composition is open.
+    pub fn composing(&self) -> bool {
+        self.lease.composing()
+    }
+    /// Use normal browser focus order for unmodified Tab on the live root.
+    pub fn set_native_tab_navigation(&self, enabled: bool) -> bool {
+        self.lease.set_native_tab_navigation(enabled)
+    }
+    /// Request the existing coalesced canonical reconciliation.
+    pub fn request_sync(&self) {
+        self.lease.request_sync();
+    }
+    /// Whether a platform input handler is registered.
+    pub fn input_handler_present(&self) -> Option<bool> {
+        self.lease.input_handler_present()
+    }
+    /// Read-only counts for this adoption only.
+    pub fn counts(&self) -> EditingIslandCounts {
+        self.lease.counts()
+    }
+    /// Publish scalar-safe, resolved native styles for exactly `expected_text`.
+    /// No text or history changes; descendants stay untouched during composition.
+    pub fn set_highlights(
+        &self,
+        expected_text: &str,
+        runs: Vec<crate::styled_input::StyledTextRun>,
+    ) -> Result<(), crate::styled_input::StyledInputRefusal> {
+        use crate::styled_input::StyledInputRefusal;
+        let inner = self
+            .lease
+            .window
+            .upgrade()
+            .ok_or(StyledInputRefusal::Stale)?;
+        if !inner
+            .ime_mirror
+            .owns_island_adoption(&self.lease.element, self.lease.adoption)
+        {
+            return Err(StyledInputRefusal::Stale);
+        }
+        if inner.is_composing.get() {
+            return Err(StyledInputRefusal::Busy);
+        }
+        self.input.set_highlights(expected_text, runs)
     }
 }

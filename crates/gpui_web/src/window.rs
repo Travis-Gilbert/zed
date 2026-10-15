@@ -770,6 +770,15 @@ impl PlatformWindow for WebWindow {
         self.inner.ime_mirror.apply_configuration(&configuration);
     }
 
+    fn request_text_input_focus(&self) {
+        // The IME owns its element until commit/cancel. An explicit later
+        // editor focus intent must not move an open composition.
+        if !self.inner.is_composing.get() {
+            self.inner.sync_virtual_keyboard(true);
+            crate::ime_mirror::ImeMirror::schedule_sync(&self.inner);
+        }
+    }
+
     fn text_input_state_changed(&self, change: TextInputStateChange) {
         match change {
             TextInputStateChange::FocusGained => self.inner.sync_virtual_keyboard(true),

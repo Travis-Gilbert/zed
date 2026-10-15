@@ -1175,6 +1175,7 @@ pub struct Window {
     /// input session can restart the IME connection).
     last_text_input_configuration: Option<TextInputConfiguration>,
     focused_text_input_active: bool,
+    requested_text_input_focus: Option<FocusId>,
     /// The caret rectangle last pushed to the platform, so the push happens
     /// on change rather than every frame.
     last_ime_bounds: Option<Bounds<Pixels>>,
@@ -2005,6 +2006,7 @@ impl Window {
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
+            requested_text_input_focus: None,
             last_ime_bounds: None,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
@@ -2223,6 +2225,19 @@ impl Window {
         self.clear_pending_keystrokes(cx);
 
         self.refresh();
+    }
+
+    /// Request platform focus for an explicit focus intent on the current
+    /// native handle, including when that handle was already focused. Delivery
+    /// waits for the next paint to install its actual input handler. A later
+    /// focus/blur cancels the request; ordinary redraws never request focus.
+    pub fn request_text_input_focus(&mut self, handle: &FocusHandle) -> bool {
+        if !self.focus_enabled || self.focus != Some(handle.id) {
+            return false;
+        }
+        self.requested_text_input_focus = Some(handle.id);
+        self.refresh();
+        true
     }
 
     /// Remove focus from all elements within this context's window.
@@ -3141,6 +3156,15 @@ impl Window {
                 } else {
                     TextInputStateChange::FocusLost
                 });
+        }
+
+        if self
+            .requested_text_input_focus
+            .take()
+            .is_some_and(|requested| self.focus == Some(requested))
+            && focused_text_input_active
+        {
+            self.platform_window.request_text_input_focus();
         }
 
         self.layout_engine.as_mut().unwrap().clear();

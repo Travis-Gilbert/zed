@@ -174,3 +174,34 @@ mod tests {
         }
     }
 }
+
+/// The smallest replacement turning `current` into `text`, as
+/// `(start, removed_end, inserted)` in UTF-16 code units of `current`.
+///
+/// Neither end splits a surrogate pair: a replacement that began or ended
+/// between the two halves of an astral character would write half of one.
+pub(crate) fn minimal_replacement(current: &str, text: &str) -> (usize, usize, String) {
+    let old: Vec<u16> = current.encode_utf16().collect();
+    let new: Vec<u16> = text.encode_utf16().collect();
+    let mut prefix = old
+        .iter()
+        .zip(new.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if prefix > 0 && (0xD800..0xDC00).contains(&old[prefix - 1]) {
+        prefix -= 1;
+    }
+    let most = old.len().min(new.len()) - prefix;
+    let mut suffix = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take(most)
+        .take_while(|(left, right)| left == right)
+        .count();
+    if suffix > 0 && (0xDC00..0xE000).contains(&new[new.len() - suffix]) {
+        suffix -= 1;
+    }
+    let inserted = String::from_utf16_lossy(&new[prefix..new.len() - suffix]);
+    (prefix, old.len() - suffix, inserted)
+}

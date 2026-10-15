@@ -1172,6 +1172,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Requests that the soft keyboard be hidden.
     fn hide_soft_keyboard(&self) {}
 
+    /// Explicitly restore the currently installed text input's platform focus.
+    /// This is an intent, separate from a change in native focus ownership.
+    fn request_text_input_focus(&self) {}
+
     /// Inform the operating system that the text input state has changed
     fn text_input_state_changed(&self, _change: TextInputStateChange) {}
 
@@ -1287,6 +1291,10 @@ pub trait PlatformTextSystem: Send + Sync {
     fn all_font_names(&self) -> Vec<String>;
     /// Get the font ID for a font descriptor.
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
+    /// Observe an already selected face without rerunning a platform matcher.
+    fn resolved_font_face(&self, _font_id: FontId) -> Option<crate::ResolvedFontFace> {
+        None
+    }
     /// Prewarm any system font caches needed to shape text.
     fn prewarm_fonts(&self, _font_ids: &[FontId]) {}
     /// Get metrics for a font.
