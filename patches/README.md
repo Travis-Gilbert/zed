@@ -196,3 +196,12 @@ Native focus intent and selected-face behavior tests pass. The same Rust DOM
 adapter passes 14 assertions on each of Chromium, WebKit and Firefox. Those
 scoped proofs do not replace the consumer's full retained editor, OS IME,
 composition/history, glyph geometry, or deployed product acceptance gates.
+
+## Staged native presentation (patch 0045)
+
+A cold visible root can prepare validated presentation metadata before canonical
+text has reached it. The existing mirror applies that metadata only after its
+own current, live conduit reconciles exactly the expected text and selection.
+Preparation never writes text or moves selection; the strict setter still
+refuses mismatched text. Active composition and retired adoption incarnations
+refuse preparation, and identical already-applied metadata remains ready.
