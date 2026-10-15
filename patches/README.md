@@ -176,3 +176,23 @@ is open. A retained editor therefore remains authoritative after an attempted
 replacement. The consumer editing oracle attempts a replacement during a
 composition and checks refusal, the predecessor's live state and DOM identity,
 and the subsequent composition commit through the original listener path.
+
+## Styled input and explicit focus intent (patch 0044)
+
+`StyledEditingIsland` adopts a page-owned contenteditable root through the same
+conduit listeners, import, history and composition path as `EditingIsland`. The
+conduit owns literal text, UTF-16 directional selection and presentation spans.
+Resolved native styles are expected-text gated; composition and retired adoption
+incarnations refuse style writes. Restyling retains original browser Text nodes
+so Firefox continues emitting its native history intent. No user HTML is parsed.
+
+Explicit InputState focus requests can restore platform focus even when the
+native handle is already focused. Requests wait for the current input handler's
+paint and are cancelled by a changed focus owner. Native platform implementations
+retain the default no-op. Read-only selected-face metadata and an opt-in test
+context text-system constructor support actual font/caret qualification.
+
+Native focus intent and selected-face behavior tests pass. The same Rust DOM
+adapter passes 14 assertions on each of Chromium, WebKit and Firefox. Those
+scoped proofs do not replace the consumer's full retained editor, OS IME,
+composition/history, glyph geometry, or deployed product acceptance gates.
