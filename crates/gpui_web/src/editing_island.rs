@@ -32,10 +32,14 @@ pub struct EditingIsland {
 
 impl EditingIsland {
     /// Adopt `element` as the window's editing island, or `None` when no
-    /// window has opened on this thread.
+    /// window has opened on this thread or an IME composition is active.
+    /// Refusal leaves the predecessor and its listeners untouched.
     pub fn adopt(element: web_sys::HtmlTextAreaElement) -> Option<Self> {
         let window = WINDOW.with(|slot| slot.borrow().clone());
         let inner = window.upgrade()?;
+        if inner.is_composing.get() {
+            return None;
+        }
         inner.ime_mirror.adopt_island(element.clone());
         let listeners = inner.attach_input_listeners(element.as_ref());
         Some(Self {
