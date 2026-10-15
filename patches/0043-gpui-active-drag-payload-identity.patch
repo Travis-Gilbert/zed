@@ -1,0 +1,79 @@
+From 54b39a02abcdb6e889a1be3a119d8051bb6b9555 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 15:05:24 -0400
+Subject: [PATCH] feat(gpui): expose typed active drag payload identity
+
+---
+ crates/gpui/src/app.rs    |  7 +++++++
+ crates/gpui/src/window.rs | 27 +++++++++++++++++++++++++--
+ 2 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/crates/gpui/src/app.rs b/crates/gpui/src/app.rs
+index 52b3452..9a1aa06 100644
+--- a/crates/gpui/src/app.rs
++++ b/crates/gpui/src/app.rs
+@@ -2539,6 +2539,13 @@ impl App {
+         self.active_drag.is_some()
+     }
+ 
++    /// Read the current coordinator payload without changing the drag. A
++    /// platform scope can compare its typed session identity before forwarding
++    /// a delayed pointer event or canceling, so it cannot affect a successor.
++    pub fn active_drag_value<T: 'static>(&self) -> Option<&T> {
++        self.active_drag.as_ref()?.value.downcast_ref::<T>()
++    }
++
+     /// Starts a typed drag initiated by a platform-owned element, using the same
+     /// coordinator and drop handlers as an element's `on_drag` listener.
+     /// Returns false without replacing a drag that is already active.
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 44a744b..87b29dd 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -7881,6 +7881,8 @@ mod tests {
+             window.draw(cx).clear(cx);
+             let preview = cx.new(|_| Empty);
+             assert!(cx.start_drag(path.clone(), preview.clone(), Point::default(), window));
++            assert_eq!(cx.active_drag_value::<PathBuf>(), Some(&path));
++            assert!(cx.active_drag_value::<String>().is_none());
+             assert!(!cx.start_drag(
+                 PathBuf::from("/replacement"),
+                 preview.clone(),
+@@ -7908,11 +7910,32 @@ mod tests {
+             window.dispatch_event(release.clone().to_platform_input(), cx);
+             assert_eq!(observed_drops.borrow().as_slice(), &[path.clone()]);
+             assert!(!cx.has_active_drag());
+-            assert!(cx.start_drag(path.clone(), preview, Point::default(), window));
++            assert!(cx.active_drag_value::<PathBuf>().is_none());
++            assert!(cx.start_drag(path.clone(), preview.clone(), Point::default(), window));
+             assert!(cx.stop_active_drag(window));
+             assert!(!cx.stop_active_drag(window));
+             window.dispatch_event(release.to_platform_input(), cx);
+-            assert_eq!(observed_drops.borrow().as_slice(), &[path]);
++            assert_eq!(observed_drops.borrow().as_slice(), &[path.clone()]);
++            let successor = PathBuf::from("/successor");
++            assert!(cx.start_drag(successor.clone(), preview, Point::default(), window));
++            // The retired scope retains its own payload, but cannot cancel a
++            // different coordinator session through the identity check.
++            if cx.active_drag_value::<PathBuf>() == Some(&path) {
++                cx.stop_active_drag(window);
++            }
++            assert_eq!(cx.active_drag_value::<PathBuf>(), Some(&successor));
++            window.dispatch_event(
++                crate::MouseUpEvent {
++                    position,
++                    button: MouseButton::Left,
++                    modifiers: Default::default(),
++                    click_count: 1,
++                }
++                .to_platform_input(),
++                cx,
++            );
++            assert_eq!(observed_drops.borrow().as_slice(), &[path, successor]);
++            assert!(cx.active_drag_value::<PathBuf>().is_none());
+         })
+         .unwrap();
+     }
+-- 
+2.53.0
+

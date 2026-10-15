@@ -29,3 +29,4 @@
 0040-gpui-web-owned-composition-keys.patch
 0041-gpui-web-visible-island-browser-tab-order.patch
 0042-gpui-web-replaced-island-authority.patch
+0043-gpui-active-drag-payload-identity.patch
