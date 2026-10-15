@@ -156,3 +156,16 @@ Undo, and browser history intents are routed to the document's one history
 through the keybinding path rather than imported. Selection direction is
 carried both ways through the new `set_text_selection`. The page keeps the
 element's placement and its accessible name.
+
+The platform-element drag and web tab-boundary patch lets a DOM-owned source
+start a typed drag through `App::start_drag`, which installs the same `AnyDrag`
+consumed by GPUI's existing drag-over and drop handlers. It refuses replacement
+of an active or platform-owned drag. Existing `stop_active_drag` cancels it;
+the platform-element test proves typed movement, exactly one drop and cancellation.
+No second drag controller or domain operation is introduced.
+
+Browser windows traverse tab stops without wrapping, clear GPUI focus at an
+edge and propagate the Tab action. `gpui_web` then blurs its input conduit and
+leaves the browser's default Tab traversal enabled. Desktop tab traversal stays
+cyclic. The non-wrapping map test covers both edges, disabled stops and the
+retained desktop cycle; the consumer browser oracle proves actual DOM handoff.
