@@ -1,0 +1,127 @@
+From b016d1ab24b6fbedfae191ca2ad718c963f67a7f Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 13:52:52 -0400
+Subject: [PATCH] fix(gpui-web): defer owned editor keys through empty
+ composition
+
+---
+ crates/gpui_web/src/composition_keys.rs | 66 +++++++++++++++++++++++++
+ crates/gpui_web/src/events.rs           | 16 ++++--
+ crates/gpui_web/src/gpui_web.rs         |  1 +
+ 3 files changed, 79 insertions(+), 4 deletions(-)
+ create mode 100644 crates/gpui_web/src/composition_keys.rs
+
+diff --git a/crates/gpui_web/src/composition_keys.rs b/crates/gpui_web/src/composition_keys.rs
+new file mode 100644
+index 0000000..6f63492
+--- /dev/null
++++ b/crates/gpui_web/src/composition_keys.rs
+@@ -0,0 +1,66 @@
++//! Keys whose GPUI bindings can mutate the composing editor or its focus.
++//! The platform composition owns those changes until commit/cancel. Copy and
++//! unrelated application shortcuts keep their existing keybinding path.
++
++pub(crate) fn is_owned_key(key: &str, primary: bool, alt: bool) -> bool {
++    matches!(
++        key,
++        "enter"
++            | "escape"
++            | "tab"
++            | "backspace"
++            | "delete"
++            | "left"
++            | "right"
++            | "up"
++            | "down"
++            | "home"
++            | "end"
++            | "pageup"
++            | "pagedown"
++    ) || (primary && !alt && matches!(key, "a" | "x" | "v" | "z" | "y"))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn composing_editor_keeps_submit_cancel_focus_selection_and_deletion() {
++        for key in [
++            "enter",
++            "escape",
++            "tab",
++            "backspace",
++            "delete",
++            "left",
++            "right",
++            "up",
++            "down",
++            "home",
++            "end",
++            "pageup",
++            "pagedown",
++        ] {
++            assert!(is_owned_key(key, false, false), "{key}");
++            assert!(is_owned_key(key, true, true), "modified {key}");
++        }
++    }
++
++    #[test]
++    fn composing_editor_keeps_its_cut_paste_selection_and_history_bindings() {
++        for key in ["a", "x", "v", "z", "y"] {
++            assert!(is_owned_key(key, true, false), "primary {key}");
++            assert!(!is_owned_key(key, false, false), "plain {key}");
++            assert!(!is_owned_key(key, true, true), "unbound alternate {key}");
++        }
++    }
++
++    #[test]
++    fn copy_and_unrelated_shortcuts_keep_their_existing_dispatch() {
++        for key in ["c", "f", "r", "p", "F6", "Unidentified"] {
++            assert!(!is_owned_key(key, true, false), "{key}");
++            assert!(!is_owned_key(key, false, false), "plain {key}");
++        }
++    }
++}
+diff --git a/crates/gpui_web/src/events.rs b/crates/gpui_web/src/events.rs
+index 82c576f..307ebd3 100644
+--- a/crates/gpui_web/src/events.rs
++++ b/crates/gpui_web/src/events.rs
+@@ -813,10 +813,18 @@ impl WebWindowInner {
+                 && !modifiers.control
+                 && !modifiers.alt
+                 && !modifiers.platform;
+-            if is_tab && (this.is_composing.get() || event.is_composing()) {
+-                // A composition owns its current conduit and focus until it
+-                // commits or cancels. Do not run focus-navigation bindings
+-                // before the composition guard below can see this key.
++            let primary = if this.is_mac {
++                modifiers.platform
++            } else {
++                modifiers.control
++            };
++            if (this.is_composing.get() || event.is_composing())
++                && crate::composition_keys::is_owned_key(&keystroke.key, primary, modifiers.alt)
++            {
++                // The platform can begin composition before any marked text
++                // reaches the input handler. Its editor bindings must not
++                // submit, cancel, navigate, or change history in that gap.
++                // Modifier state above and unrelated shortcuts remain live.
+                 event.prevent_default();
+                 return;
+             }
+diff --git a/crates/gpui_web/src/gpui_web.rs b/crates/gpui_web/src/gpui_web.rs
+index 17b0781..7f837ad 100644
+--- a/crates/gpui_web/src/gpui_web.rs
++++ b/crates/gpui_web/src/gpui_web.rs
+@@ -15,6 +15,7 @@ mod http_client;
+ mod ime_mirror;
+ mod input_edit;
+ mod history_intent;
++mod composition_keys;
+ mod keyboard;
+ mod logging;
+ mod native_element;
+-- 
+2.53.0
+
