@@ -828,6 +828,17 @@ impl WebWindowInner {
                 event.prevent_default();
                 return;
             }
+            if is_tab
+                && event
+                    .target()
+                    .and_then(|target| target.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
+                    .is_some_and(|element| this.ime_mirror.island_uses_native_tab(&element))
+            {
+                // The visible page-owned editor participates in browser
+                // focus order. Let the same event bubble/default normally;
+                // entering the hidden conduit still uses GPUI's tab order.
+                return;
+            }
             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
                 keystroke,
                 is_held,

@@ -72,6 +72,18 @@ impl EditingIsland {
         inner.ime_mirror.island_is_live()
     }
 
+    /// Let plain Tab and Shift-Tab from this live textarea use browser focus
+    /// order. The hidden conduit retains GPUI traversal. An open composition
+    /// still owns those keys. Returns false after this island was replaced
+    /// or its window closed; a predecessor cannot configure its successor.
+    pub fn set_native_tab_navigation(&self, enabled: bool) -> bool {
+        self.window.upgrade().is_some_and(|inner| {
+            inner
+                .ime_mirror
+                .set_island_native_tab(&self.element, enabled)
+        })
+    }
+
     /// Schedule the existing coalesced mirror reconciliation after the
     /// canonical editor changes independently of browser input. Call on a
     /// revision or selection change, rather than on every rendered frame.

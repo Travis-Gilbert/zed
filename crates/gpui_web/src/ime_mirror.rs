@@ -411,6 +411,7 @@ pub(crate) struct ImeMirror {
     island: RefCell<Option<Rc<Conduit>>>,
     /// Whether the island, rather than a built conduit, is live.
     island_live: Cell<bool>,
+    island_native_tab: Cell<bool>,
     /// Set while the mirror itself edits the island through the browser's
     /// editing commands, which raise `beforeinput` and `input` synchronously.
     /// Those events are this module's echo, never an edit to import.
@@ -557,6 +558,7 @@ impl ImeMirror {
             selection_reversed: Cell::new(false),
             island: RefCell::new(None),
             island_live: Cell::new(false),
+            island_native_tab: Cell::new(false),
             writing: Cell::new(false),
             composition_checkpoint: RefCell::new(None),
             history_intents: RefCell::new(crate::history_intent::HistoryIntentGate::default()),
@@ -1102,7 +1104,23 @@ impl ImeMirror {
             element: ConduitElement::TextArea(element),
             page_owned: true,
         })));
+        self.island_native_tab.set(false);
         self.island_counts.set(EditingIslandCounts::default());
+    }
+
+    pub(crate) fn set_island_native_tab(
+        &self,
+        element: &web_sys::HtmlTextAreaElement,
+        enabled: bool,
+    ) -> bool {
+        if !self.island.borrow().as_ref().is_some_and(|island| matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element)) { return false; }
+        self.island_native_tab.set(enabled);
+        true
+    }
+
+    pub(crate) fn island_uses_native_tab(&self, element: &web_sys::HtmlTextAreaElement) -> bool {
+        self.island_native_tab.get() && self.island_is_live()
+            && self.island.borrow().as_ref().is_some_and(|island| matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element))
     }
 
     /// Forget the island, if `element` is it. A live island hands the input
@@ -1120,6 +1138,7 @@ impl ImeMirror {
         }
         self.set_island_live(window, false);
         self.island.replace(None);
+        self.island_native_tab.set(false);
         let html: &web_sys::Element = element.as_ref();
         html.remove_attribute(ISLAND_ATTRIBUTE).ok();
     }
