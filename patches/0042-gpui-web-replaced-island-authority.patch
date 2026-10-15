@@ -1,0 +1,270 @@
+From fd12ccc9c2bb4677b5fabaab09742036c88cd025 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 14:06:54 -0400
+Subject: [PATCH] fix(gpui-web): fence replaced editing island authority
+
+---
+ crates/gpui_web/src/editing_island.rs | 45 +++++++++++++++++------
+ crates/gpui_web/src/events.rs         | 21 +++++++++--
+ crates/gpui_web/src/ime_mirror.rs     | 52 ++++++++++++++++++++++-----
+ 3 files changed, 96 insertions(+), 22 deletions(-)
+
+diff --git a/crates/gpui_web/src/editing_island.rs b/crates/gpui_web/src/editing_island.rs
+index 2e60f94..8b8c88d 100644
+--- a/crates/gpui_web/src/editing_island.rs
++++ b/crates/gpui_web/src/editing_island.rs
+@@ -27,6 +27,7 @@ pub(crate) fn publish_window(window: Weak<WebWindowInner>) {
+ pub struct EditingIsland {
+     window: Weak<WebWindowInner>,
+     element: web_sys::HtmlTextAreaElement,
++    adoption: u64,
+     _listeners: Vec<EventListenerHandle>,
+ }
+ 
+@@ -40,11 +41,12 @@ impl EditingIsland {
+         if inner.is_composing.get() {
+             return None;
+         }
+-        inner.ime_mirror.adopt_island(element.clone());
+-        let listeners = inner.attach_input_listeners(element.as_ref());
++        let adoption = inner.ime_mirror.adopt_island(&inner, element.clone());
++        let listeners = inner.attach_input_listeners(&element, adoption);
+         Some(Self {
+             window,
+             element,
++            adoption,
+             _listeners: listeners,
+         })
+     }
+@@ -57,11 +59,18 @@ impl EditingIsland {
+     /// Make the island the live conduit (`true`) or return input to the
+     /// hidden conduit (`false`). Returns whether the island is now live; a
+     /// change is refused while a composition is open, because moving the
+-    /// conduit would end it without a commit.
++    /// conduit would end it without a commit. A replaced handle returns false
++    /// and cannot change its successor, even when it adopts the same element.
+     pub fn set_live(&self, live: bool) -> bool {
+         let Some(inner) = self.window.upgrade() else {
+             return false;
+         };
++        if !inner
++            .ime_mirror
++            .owns_island_adoption(&self.element, self.adoption)
++        {
++            return false;
++        }
+         if inner.is_composing.get() && live != inner.ime_mirror.island_is_live() {
+             return inner.ime_mirror.island_is_live();
+         }
+@@ -80,7 +89,7 @@ impl EditingIsland {
+         self.window.upgrade().is_some_and(|inner| {
+             inner
+                 .ime_mirror
+-                .set_island_native_tab(&self.element, enabled)
++                .set_island_native_tab(&self.element, self.adoption, enabled)
+         })
+     }
+ 
+@@ -90,17 +99,24 @@ impl EditingIsland {
+     /// Composition keeps its current buffer until its normal commit/cancel.
+     pub fn request_sync(&self) {
+         if let Some(inner) = self.window.upgrade() {
+-            if inner.ime_mirror.island_is_live() {
++            if inner
++                .ime_mirror
++                .owns_island_adoption(&self.element, self.adoption)
++                && inner.ime_mirror.island_is_live()
++            {
+                 crate::ime_mirror::ImeMirror::schedule_sync(&inner);
+             }
+         }
+     }
+ 
+-    /// Whether the island is the live conduit.
++    /// Whether this adoption is still the live conduit.
+     pub fn is_live(&self) -> bool {
+-        self.window
+-            .upgrade()
+-            .is_some_and(|inner| inner.ime_mirror.island_is_live())
++        self.window.upgrade().is_some_and(|inner| {
++            inner
++                .ime_mirror
++                .owns_island_adoption(&self.element, self.adoption)
++                && inner.ime_mirror.island_is_live()
++        })
+     }
+ 
+     /// Whether a composition is open on the window.
+@@ -119,10 +135,15 @@ impl EditingIsland {
+         Some(state.input_handler.is_some())
+     }
+ 
+-    /// What the island has done since it was adopted.
++    /// What this adoption has done. A replaced handle returns zero counts.
+     pub fn counts(&self) -> EditingIslandCounts {
+         self.window
+             .upgrade()
++            .filter(|inner| {
++                inner
++                    .ime_mirror
++                    .owns_island_adoption(&self.element, self.adoption)
++            })
+             .map(|inner| inner.ime_mirror.island_counts())
+             .unwrap_or_default()
+     }
+@@ -131,7 +152,9 @@ impl EditingIsland {
+ impl Drop for EditingIsland {
+     fn drop(&mut self) {
+         if let Some(inner) = self.window.upgrade() {
+-            inner.ime_mirror.release_island(&inner, &self.element);
++            inner
++                .ime_mirror
++                .release_island(&inner, &self.element, self.adoption);
+         }
+     }
+ }
+diff --git a/crates/gpui_web/src/events.rs b/crates/gpui_web/src/events.rs
+index 44bea7d..895d7c9 100644
+--- a/crates/gpui_web/src/events.rs
++++ b/crates/gpui_web/src/events.rs
+@@ -224,15 +224,30 @@ impl WebWindowInner {
+     /// Attach every input-path listener to `target`, an element adopted after
+     /// the window was created. The handles detach them when dropped.
+     pub(crate) fn attach_input_listeners(
+-        &self,
+-        target: &web_sys::EventTarget,
++        self: &Rc<Self>,
++        element: &web_sys::HtmlTextAreaElement,
++        adoption: u64,
+     ) -> Vec<EventListenerHandle> {
+         self.input_listeners
+             .borrow()
+             .iter()
+             .filter_map(|(event_name, handler)| {
+                 let handler = handler.upgrade()?;
+-                Some(attach_shared(target, event_name, &handler))
++                let window = Rc::downgrade(self);
++                let adopted = element.clone();
++                Some(EventListenerHandle::add(
++                    element.as_ref(),
++                    event_name,
++                    move |event: JsValue| {
++                        // A retained predecessor keeps its listener handles until
++                        // drop, but no longer has authority to import any event.
++                        if window.upgrade().is_some_and(|window| {
++                            window.ime_mirror.owns_island_adoption(&adopted, adoption)
++                        }) {
++                            (handler.borrow_mut())(event);
++                        }
++                    },
++                ))
+             })
+             .collect()
+     }
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index 0fae3a4..7b89685 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -412,6 +412,7 @@ pub(crate) struct ImeMirror {
+     /// Whether the island, rather than a built conduit, is live.
+     island_live: Cell<bool>,
+     island_native_tab: Cell<bool>,
++    island_adoption: Cell<u64>,
+     /// Set while the mirror itself edits the island through the browser's
+     /// editing commands, which raise `beforeinput` and `input` synchronously.
+     /// Those events are this module's echo, never an edit to import.
+@@ -559,6 +560,7 @@ impl ImeMirror {
+             island: RefCell::new(None),
+             island_live: Cell::new(false),
+             island_native_tab: Cell::new(false),
++            island_adoption: Cell::new(0),
+             writing: Cell::new(false),
+             composition_checkpoint: RefCell::new(None),
+             history_intents: RefCell::new(crate::history_intent::HistoryIntentGate::default()),
+@@ -1093,7 +1095,20 @@ impl ImeMirror {
+ 
+     /// Adopt `element` as the window's editing island, replacing any island
+     /// adopted before it. It is not live until [`Self::set_island_live`].
+-    pub(crate) fn adopt_island(&self, element: web_sys::HtmlTextAreaElement) {
++    pub(crate) fn adopt_island(
++        &self,
++        window: &WebWindowInner,
++        element: web_sys::HtmlTextAreaElement,
++    ) -> u64 {
++        // Retire the old conduit before publishing its successor. The public
++        // adoption gate has already refused an open composition.
++        self.set_island_live(window, false);
++        if let Some(predecessor) = self.island.borrow().as_ref() {
++            predecessor
++                .as_element()
++                .remove_attribute(ISLAND_ATTRIBUTE)
++                .ok();
++        }
+         let html: &web_sys::Element = element.as_ref();
+         // The island names itself. The accessibility adapter reads this to
+         // leave the page's label alone when it claims the island for the
+@@ -1106,21 +1121,44 @@ impl ImeMirror {
+         })));
+         self.island_native_tab.set(false);
+         self.island_counts.set(EditingIslandCounts::default());
++        let adoption = self
++            .island_adoption
++            .get()
++            .checked_add(1)
++            .expect("editing island adoption overflow");
++        self.island_adoption.set(adoption);
++        adoption
++    }
++
++    pub(crate) fn owns_island_adoption(
++        &self,
++        element: &web_sys::HtmlTextAreaElement,
++        adoption: u64,
++    ) -> bool {
++        self.island_adoption.get() == adoption && self.owns_island(element)
++    }
++
++    pub(crate) fn owns_island(&self, element: &web_sys::HtmlTextAreaElement) -> bool {
++        self.island.borrow().as_ref().is_some_and(|island| {
++            matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element)
++        })
+     }
+ 
+     pub(crate) fn set_island_native_tab(
+         &self,
+         element: &web_sys::HtmlTextAreaElement,
++        adoption: u64,
+         enabled: bool,
+     ) -> bool {
+-        if !self.island.borrow().as_ref().is_some_and(|island| matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element)) { return false; }
++        if !self.owns_island_adoption(element, adoption) {
++            return false;
++        }
+         self.island_native_tab.set(enabled);
+         true
+     }
+ 
+     pub(crate) fn island_uses_native_tab(&self, element: &web_sys::HtmlTextAreaElement) -> bool {
+-        self.island_native_tab.get() && self.island_is_live()
+-            && self.island.borrow().as_ref().is_some_and(|island| matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element))
++        self.island_native_tab.get() && self.island_is_live() && self.owns_island(element)
+     }
+ 
+     /// Forget the island, if `element` is it. A live island hands the input
+@@ -1129,11 +1167,9 @@ impl ImeMirror {
+         &self,
+         window: &WebWindowInner,
+         element: &web_sys::HtmlTextAreaElement,
++        adoption: u64,
+     ) {
+-        let is_island = self.island.borrow().as_ref().is_some_and(|island| {
+-            matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element)
+-        });
+-        if !is_island {
++        if !self.owns_island_adoption(element, adoption) {
+             return;
+         }
+         self.set_island_live(window, false);
+-- 
+2.53.0
+
