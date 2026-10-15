@@ -178,6 +178,7 @@ fn aria_role(role: Role) -> Option<&'static str> {
 /// touches no DOM at all.
 #[derive(Default, PartialEq)]
 struct Mirrored {
+    author_id: Option<String>,
     role: Option<&'static str>,
     label: Option<String>,
     description: Option<String>,
@@ -289,6 +290,7 @@ impl Mirrored {
         let value = non_empty(node.value());
         let children = node.children().to_vec();
         Self {
+            author_id: non_empty(node.author_id()),
             role,
             label: non_empty(node.label()),
             description: non_empty(node.description()),
@@ -807,6 +809,7 @@ fn state_attributes(node: &Mirrored) -> [(&'static str, Option<&str>); 4] {
 }
 
 fn write_node(element: &web_sys::Element, node: &Mirrored, scale_factor: f32) {
+    set_or_clear(element, "data-gpui-a11y-author-id", node.author_id.as_deref());
     set_or_clear(element, "role", node.role);
     set_or_clear(element, "aria-label", node.label.as_deref());
     set_or_clear(element, "aria-valuetext", node.value_text.as_deref());
