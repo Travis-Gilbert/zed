@@ -205,3 +205,13 @@ own current, live conduit reconciles exactly the expected text and selection.
 Preparation never writes text or moves selection; the strict setter still
 refuses mismatched text. Active composition and retired adoption incarnations
 refuse preparation, and identical already-applied metadata remains ready.
+
+## Platform composition fact (patch 0046)
+
+`Window::is_text_composing` reads the platform's current composition phase.
+The web implementation returns its existing current-conduit flag, including
+an empty hidden-input composition before marked text exists. Other platforms
+retain the default false unless they report that fact. This observation never
+imports text, changes focus, or creates a second composition state. A native
+forwarding/phase-transition test and the web library wasm check qualify the API;
+consumer refusal tests remain separate.
