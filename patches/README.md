@@ -145,3 +145,14 @@ the availability attributes the mirror writes (`aria-disabled`,
 `aria-description`, `aria-required`, `aria-readonly`) into one pure table,
 `state_attributes`, which the unit tests exercise without a DOM; the
 projection itself was already on the mirror element, never a synthetic child.
+
+The editing island patch lets a page hand the window a visible textarea it
+created. While live, the island is the IME conduit: it shares the hidden
+conduit's listeners, so every edit is imported through the one path, and the
+mirror writes the focused input handler's whole document back as the smallest
+replacement (`minimal_replacement`, which never cuts a surrogate pair; unit
+tested). Focused writes go through `execCommand` so the browser keeps offering
+Undo, and browser history intents are routed to the document's one history
+through the keybinding path rather than imported. Selection direction is
+carried both ways through the new `set_text_selection`. The page keeps the
+element's placement and its accessible name.
