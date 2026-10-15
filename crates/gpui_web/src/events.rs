@@ -809,6 +809,10 @@ impl WebWindowInner {
                 key_char: key_char.clone(),
             };
 
+            let is_tab = keystroke.key == "tab"
+                && !modifiers.control
+                && !modifiers.alt
+                && !modifiers.platform;
             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
                 keystroke,
                 is_held,
@@ -821,6 +825,13 @@ impl WebWindowInner {
                     this.schedule_ime_mirror_sync();
                     return;
                 }
+            }
+
+            if is_tab && !this.is_composing.get() && !event.is_composing() {
+                // GPUI propagated at the edge of its tab order. Let the
+                // browser continue from the canvas's input conduit into DOM.
+                this.ime_mirror.blur();
+                return;
             }
 
             if this.is_composing.get() || event.is_composing() {

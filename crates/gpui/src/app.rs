@@ -2539,6 +2539,30 @@ impl App {
         self.active_drag.is_some()
     }
 
+    /// Starts a typed drag initiated by a platform-owned element, using the same
+    /// coordinator and drop handlers as an element's `on_drag` listener.
+    /// Returns false without replacing a drag that is already active.
+    pub fn start_drag<T: 'static>(
+        &mut self,
+        value: T,
+        view: impl Into<AnyView>,
+        cursor_offset: Point<Pixels>,
+        window: &mut Window,
+    ) -> bool {
+        if self.has_active_drag() || self.platform_owned_drag.is_some() {
+            return false;
+        }
+        self.active_drag = Some(AnyDrag {
+            view: view.into(),
+            value: Arc::new(value),
+            cursor_offset,
+            cursor_style: None,
+            external_payload_source: None,
+        });
+        window.refresh();
+        true
+    }
+
     /// Gets the cursor style of the currently active drag operation.
     pub fn active_drag_cursor_style(&self) -> Option<CursorStyle> {
         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)

@@ -132,6 +132,28 @@ impl TabStopMap {
         }
     }
 
+    /// Traverse without wrapping, allowing an embedded window to return focus
+    /// to its platform's surrounding tab order at either edge.
+    #[cfg(any(target_family = "wasm", test))]
+    pub fn next_no_wrap(&self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {
+        match focused_id.and_then(|id| self.tab_node_for_focus_id(id)) {
+            Some(node) => self
+                .next_inner(node)
+                .and_then(|node| self.focus_handle_for_order(node)),
+            None => self.next(None),
+        }
+    }
+
+    #[cfg(any(target_family = "wasm", test))]
+    pub fn prev_no_wrap(&self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {
+        match focused_id.and_then(|id| self.tab_node_for_focus_id(id)) {
+            Some(node) => self
+                .prev_inner(node)
+                .and_then(|node| self.focus_handle_for_order(node)),
+            None => self.prev(None),
+        }
+    }
+
     fn next_inner(&self, node: &TabStopNode) -> Option<&TabStopNode> {
         let mut cursor = self.order.cursor::<TabStopNode>(());
         cursor.seek(&node, Bias::Left);
@@ -406,6 +428,29 @@ mod tests {
             tab_index_map.prev(Some(&expected[4].id)),
             Some(expected[3].clone())
         );
+    }
+
+    #[test]
+    fn non_wrapping_traversal_reports_both_edges_and_skips_disabled_stops() {
+        let focus_map = Arc::new(FocusMap::default());
+        let mut map = TabStopMap::default();
+        assert!(map.next_no_wrap(None).is_none());
+        assert!(map.prev_no_wrap(None).is_none());
+        let first = FocusHandle::new(&focus_map).tab_stop(true);
+        let disabled = FocusHandle::new(&focus_map);
+        let last = FocusHandle::new(&focus_map).tab_stop(true);
+        for handle in [&first, &disabled, &last] {
+            map.insert(handle);
+        }
+        assert_eq!(map.next_no_wrap(None), Some(first.clone()));
+        assert_eq!(map.prev_no_wrap(None), Some(last.clone()));
+        assert_eq!(map.next_no_wrap(Some(&first.id)), Some(last.clone()));
+        assert_eq!(map.prev_no_wrap(Some(&last.id)), Some(first.clone()));
+        assert!(map.next_no_wrap(Some(&last.id)).is_none());
+        assert!(map.prev_no_wrap(Some(&first.id)).is_none());
+        // Desktop callers retain their existing cyclic traversal.
+        assert_eq!(map.next(Some(&last.id)), Some(first.clone()));
+        assert_eq!(map.prev(Some(&first.id)), Some(last));
     }
 
     #[test]

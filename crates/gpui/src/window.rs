@@ -2252,8 +2252,21 @@ impl Window {
             return;
         }
 
-        if let Some(handle) = self.rendered_frame.tab_stops.next(self.focus.as_ref()) {
+        #[cfg(target_family = "wasm")]
+        let next = self
+            .rendered_frame
+            .tab_stops
+            .next_no_wrap(self.focus.as_ref());
+        #[cfg(not(target_family = "wasm"))]
+        let next = self.rendered_frame.tab_stops.next(self.focus.as_ref());
+        if let Some(handle) = next {
             self.focus(&handle, cx)
+        } else {
+            #[cfg(target_family = "wasm")]
+            {
+                self.blur(cx);
+                cx.propagate();
+            }
         }
     }
 
@@ -2263,8 +2276,21 @@ impl Window {
             return;
         }
 
-        if let Some(handle) = self.rendered_frame.tab_stops.prev(self.focus.as_ref()) {
+        #[cfg(target_family = "wasm")]
+        let prev = self
+            .rendered_frame
+            .tab_stops
+            .prev_no_wrap(self.focus.as_ref());
+        #[cfg(not(target_family = "wasm"))]
+        let prev = self.rendered_frame.tab_stops.prev(self.focus.as_ref());
+        if let Some(handle) = prev {
             self.focus(&handle, cx)
+        } else {
+            #[cfg(target_family = "wasm")]
+            {
+                self.blur(cx);
+                cx.propagate();
+            }
         }
     }
 
@@ -7832,6 +7858,63 @@ mod tests {
                     move |path: &PathBuf, _, _| observed_drops.borrow_mut().push(path.clone())
                 })
         }
+    }
+
+    #[gpui::test]
+    fn platform_element_drag_uses_typed_drop_dispatch_and_cancels(cx: &mut TestAppContext) {
+        let observed_drag_moves = Rc::new(RefCell::new(Vec::new()));
+        let observed_drops = Rc::new(RefCell::new(Vec::new()));
+        let path = PathBuf::from("/platform-element");
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let observed_drag_moves = observed_drag_moves.clone();
+                let observed_drops = observed_drops.clone();
+                let path = path.clone();
+                move |_, _| FileDragView {
+                    path,
+                    observed_drag_moves,
+                    observed_drops,
+                }
+            })
+            .into();
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let preview = cx.new(|_| Empty);
+            assert!(cx.start_drag(path.clone(), preview.clone(), Point::default(), window));
+            assert!(!cx.start_drag(
+                PathBuf::from("/replacement"),
+                preview.clone(),
+                Point::default(),
+                window
+            ));
+            let position = point(px(30.), px(30.));
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(observed_drag_moves.borrow().as_slice(), &[position]);
+            let release = crate::MouseUpEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+            };
+            window.dispatch_event(release.clone().to_platform_input(), cx);
+            window.dispatch_event(release.clone().to_platform_input(), cx);
+            assert_eq!(observed_drops.borrow().as_slice(), &[path.clone()]);
+            assert!(!cx.has_active_drag());
+            assert!(cx.start_drag(path.clone(), preview, Point::default(), window));
+            assert!(cx.stop_active_drag(window));
+            assert!(!cx.stop_active_drag(window));
+            window.dispatch_event(release.to_platform_input(), cx);
+            assert_eq!(observed_drops.borrow().as_slice(), &[path]);
+        })
+        .unwrap();
     }
 
     #[gpui::test]
