@@ -215,3 +215,25 @@ retain the default false unless they report that fact. This observation never
 imports text, changes focus, or creates a second composition state. A native
 forwarding/phase-transition test and the web library wasm check qualify the API;
 consumer refusal tests remain separate.
+
+
+## Current input capability and platform claim (patch0047)
+
+A conduit handoff carries the current session's readonly capability before focus.
+Styled roots without a page-supplied tabindex remain focusable while readonly,
+matching the native input/textarea shortcut path; explicit tabindex is retained.
+
+The existing accessibility adapter's actual current text-entry association binds
+one semantic NodeId per adoption, including painted platforms. Presented islands
+retire the passive built conduit's AX/tab claim for that verified field or a
+nontext focus target. Unknown/hidden/inert warming preserves fallback, and a
+different native text field restores its captured prior aria-hidden/tabindex.
+Composition and current-adoption guards precede mutation. Idempotent live calls
+only reconcile changed attributes, without refocusing or granting editability.
+
+Locked gpui_web wasm library checks pass. The exact private helper compiled into
+a tiny WASM DOM proof passes23 controls in each of Chromium, WebKit and Firefox,
+including readonly refusal, explicit tabindex, original duplicate AX2→1, warm
+fallback, cross-control identity, once-only binding and successor reset. This is
+helper-level real-browser evidence; the full product backend journey and new
+artifact adoption/IME regressions remain independent acceptance gates.
