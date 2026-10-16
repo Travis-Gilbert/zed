@@ -249,23 +249,11 @@ impl ConduitElement {
     }
 
     fn read_only(&self) -> bool {
-        match self {
-            Self::TextArea(element) => element.read_only(),
-            Self::Input(element) => element.read_only(),
-            Self::Styled(element) => element.element().content_editable() == "false",
-        }
+        crate::input_capability::read_only(self.as_element())
     }
 
     fn set_read_only(&self, read_only: bool) {
-        match self {
-            Self::TextArea(element) => element.set_read_only(read_only),
-            Self::Input(element) => element.set_read_only(read_only),
-            Self::Styled(element) => element.element().set_content_editable(if read_only {
-                "false"
-            } else {
-                "plaintext-only"
-            }),
-        }
+        crate::input_capability::set_read_only(self.as_element(), read_only);
     }
 
     /// Whether this element can hold `text` exactly as written.
@@ -430,6 +418,11 @@ pub(crate) struct ImeMirror {
     island: RefCell<Option<Rc<Conduit>>>,
     /// Whether the island, rather than a built conduit, is live.
     island_live: Cell<bool>,
+    retired_built_claims: RefCell<Vec<crate::input_capability::RetiredInputClaim>>,
+    // Accessibility identity observed from the existing focused text leaf,
+    // never a second input owner. An adoption retains its field identity while
+    // focus visits non-text controls and yields to a different native field.
+    text_claim: crate::input_capability::TextInputClaimIdentity,
     island_native_tab: Cell<bool>,
     island_adoption: Cell<u64>,
     /// Set while the mirror itself edits the island through the browser's
@@ -578,6 +571,8 @@ impl ImeMirror {
             selection_reversed: Cell::new(false),
             island: RefCell::new(None),
             island_live: Cell::new(false),
+            retired_built_claims: RefCell::new(Vec::new()),
+            text_claim: crate::input_capability::TextInputClaimIdentity::default(),
             island_native_tab: Cell::new(false),
             island_adoption: Cell::new(0),
             writing: Cell::new(false),
@@ -935,6 +930,10 @@ impl ImeMirror {
             .conduits
             .iter()
             .find(|conduit| conduit.capability == live);
+        crate::input_capability::inherit_read_only(
+            self.live_conduit().as_element(),
+            next.as_element(),
+        );
         window.suppress_focus_status_events.set(true);
         // Focus first, and stop here if it does not take. Everything below
         // assumes the browser is delivering input to the element that becomes
@@ -1154,6 +1153,7 @@ impl ImeMirror {
             page_owned: true,
         })));
         self.island_native_tab.set(false);
+        self.text_claim.reset();
         self.island_counts.set(EditingIslandCounts::default());
         let adoption = self
             .island_adoption
@@ -1209,6 +1209,8 @@ impl ImeMirror {
         }
         self.set_island_live(window, false);
         self.island.replace(None);
+        self.text_claim.reset();
+        self.retired_built_claims.borrow_mut().clear();
         self.island_native_tab.set(false);
         let html: &web_sys::Element = element.as_ref();
         html.remove_attribute(ISLAND_ATTRIBUTE).ok();
@@ -1228,7 +1230,11 @@ impl ImeMirror {
         let Some(island) = self.island.borrow().clone() else {
             return false;
         };
-        if self.island_live.get() == live || window.is_composing.get() {
+        if window.is_composing.get() {
+            return false;
+        }
+        if self.island_live.get() == live {
+            self.reconcile_built_claims(&island);
             return false;
         }
         let built = {
@@ -1238,6 +1244,11 @@ impl ImeMirror {
                 .find(|conduit| conduit.capability == wanted)
                 .unwrap_or(&self.conduits[0])
         };
+        let successor = if live { island.as_ref() } else { built };
+        crate::input_capability::inherit_read_only(
+            self.live_conduit().as_element(),
+            successor.as_element(),
+        );
         window.suppress_focus_status_events.set(true);
         if live {
             if island.as_element().focus().is_err() {
@@ -1264,6 +1275,7 @@ impl ImeMirror {
             }
         }
         window.suppress_focus_status_events.set(false);
+        self.reconcile_built_claims(&island);
         // As at a conduit switch: the element that became live holds none of
         // the bookkeeping, so the next sync is a rebuild.
         self.text.borrow_mut().clear();
@@ -1278,6 +1290,49 @@ impl ImeMirror {
             self.apply_configuration_to(&island, &configuration);
         }
         true
+    }
+
+    pub(crate) fn observe_text_focus(
+        &self,
+        window: &WebWindowInner,
+        node: Option<gpui::accesskit::NodeId>,
+        claimed: Option<(web_sys::HtmlElement, gpui::accesskit::NodeId)>,
+    ) {
+        if window.is_composing.get() {
+            return;
+        }
+        // Bind only the adapter's actual current text-entry association on
+        // this adopted element, including painted platforms. Never use a
+        // stale focus sample from before it became live or hidden warming.
+        let current_island_association = claimed.is_some_and(|(element, _)| {
+            self.island_live.get()
+                && self.owns_island(&element)
+                && crate::input_capability::is_presented(&element)
+        });
+        self.text_claim
+            .observe(node.map(|id| id.0), current_island_association);
+        if let Some(island) = self.island.borrow().as_ref() {
+            self.reconcile_built_claims(island);
+        }
+    }
+
+    fn reconcile_built_claims(&self, island: &Conduit) {
+        let mut claims = self.retired_built_claims.borrow_mut();
+        if crate::input_capability::is_presented(island.as_element())
+            && self.text_claim.is_passive_builtin()
+        {
+            if claims.is_empty() {
+                claims.extend(self.conduits.iter().map(|conduit| {
+                    crate::input_capability::RetiredInputClaim::retire(conduit.as_element())
+                }));
+            } else {
+                for claim in claims.iter() {
+                    claim.reconcile();
+                }
+            }
+        } else {
+            claims.clear();
+        }
     }
 
     /// Whether the island is the live conduit.

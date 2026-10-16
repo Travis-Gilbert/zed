@@ -344,6 +344,7 @@ pub(crate) struct WebA11yAdapter {
     /// of the node it claims. Declaring it here rather than querying it keeps
     /// one authority for what a node is.
     declared: Rc<Cell<PlatformNativeElement>>,
+    text_focus: Rc<dyn Fn(Option<NodeId>, Option<(web_sys::HtmlElement, NodeId)>)>,
     nodes: HashMap<NodeId, MirrorNode>,
     focus: Option<NodeId>,
     announced: String,
@@ -394,6 +395,7 @@ impl WebA11yAdapter {
         document: web_sys::Document,
         input_element: Rc<RefCell<web_sys::HtmlElement>>,
         declared: Rc<Cell<PlatformNativeElement>>,
+        text_focus: Rc<dyn Fn(Option<NodeId>, Option<(web_sys::HtmlElement, NodeId)>)>,
         native_elements: NativeElements,
         action: Rc<dyn Fn(ActionRequest)>,
     ) -> anyhow::Result<Self> {
@@ -485,6 +487,7 @@ impl WebA11yAdapter {
             live_region,
             input_element,
             declared,
+            text_focus,
             native_elements,
             nodes: HashMap::default(),
             focus: None,
@@ -549,6 +552,13 @@ impl WebA11yAdapter {
                 }),
         );
         self.apply_native_realization(claimed.as_ref(), entry_name.as_ref());
+        // This is the same focused leaf used above to name the conduit. The
+        // handoff may retire a passive fallback, but must not conceal a built
+        // control serving a different actual text field.
+        (self.text_focus)(
+            focused_text.map(|(node_id, _)| *node_id),
+            focused_text.map(|(node_id, _)| (self.input_element.borrow().clone(), *node_id)),
+        );
 
         for (node_id, node) in &update.nodes {
             if Some(*node_id) == self.natively_realized {

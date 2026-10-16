@@ -154,6 +154,7 @@ pub(crate) struct StyledInput {
 }
 impl StyledInput {
     pub(crate) fn new(element: web_sys::HtmlElement) -> Self {
+        crate::input_capability::ensure_styled_focusability(&element);
         Self {
             element,
             applied: RefCell::new(None),

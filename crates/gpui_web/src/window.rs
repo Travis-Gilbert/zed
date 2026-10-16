@@ -997,10 +997,22 @@ impl PlatformWindow for WebWindow {
         let action: Rc<dyn Fn(gpui::accesskit::ActionRequest)> =
             Rc::new(move |request| action(request));
 
+        let weak = Rc::downgrade(&self.inner);
+        let text_focus: Rc<
+            dyn Fn(
+                Option<gpui::accesskit::NodeId>,
+                Option<(web_sys::HtmlElement, gpui::accesskit::NodeId)>,
+            ),
+        > = Rc::new(move |node, claimed| {
+            if let Some(window) = weak.upgrade() {
+                window.ime_mirror.observe_text_focus(&window, node, claimed);
+            }
+        });
         let adapter = match WebA11yAdapter::new(
             document,
             self.inner.ime_mirror.accessibility_element_handle(),
             self.inner.ime_mirror.declared_capability_handle(),
+            text_focus,
             self.inner.native_elements,
             action,
         ) {
