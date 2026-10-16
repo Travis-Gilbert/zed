@@ -237,3 +237,9 @@ including readonly refusal, explicit tabindex, original duplicate AX2→1, warm
 fallback, cross-control identity, once-only binding and successor reset. This is
 helper-level real-browser evidence; the full product backend journey and new
 artifact adoption/IME regressions remain independent acceptance gates.
+
+The replacement follow-up (patch0048) restores captured built claim attributes
+when adoption resets the verified field identity, before the successor is
+admitted. An unknown successor cannot retain its predecessor's AX/tab suppression.
+The locked wasm library check passes; full product replacement acceptance still
+runs against the next immutable consumer artifact.
