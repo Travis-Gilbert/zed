@@ -243,3 +243,13 @@ when adoption resets the verified field identity, before the successor is
 admitted. An unknown successor cannot retain its predecessor's AX/tab suppression.
 The locked wasm library check passes; full product replacement acceptance still
 runs against the next immutable consumer artifact.
+
+Patch0049 captures the adapter's synchronous current adopted/live text-entry
+identity while the island is warming. The native text role may disappear at DOM
+delegation, so waiting for visibility would miss that association. Retirement
+still requires presented plus verified identity; unknown or hidden warming never
+retires the fallback, and a different native field restores its claim.
+The locked gpui_web wasm check passes. The exact private helper browser proof
+now passes25 controls per engine, including the modeled warm-native-field to
+admitted-DOM/delegated-native-role transition. Actual product AX admission is
+still proved separately against the next immutable consumer artifact.

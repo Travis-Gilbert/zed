@@ -1,0 +1,35 @@
+From 91a8123ba0297b93c9c5f1da8497075027781b12 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 20:40:53 -0400
+Subject: [PATCH] fix(gpui-web): bind current warm text entry before delegation
+
+---
+ crates/gpui_web/src/ime_mirror.rs | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index 307b63a..e5436c3 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -1302,13 +1302,12 @@ impl ImeMirror {
+         if window.is_composing.get() {
+             return;
+         }
+-        // Bind only the adapter's actual current text-entry association on
+-        // this adopted element, including painted platforms. Never use a
+-        // stale focus sample from before it became live or hidden warming.
++        // Bind only the adapter's synchronous current text-entry association
++        // on this live adopted element. Warming may precede DOM delegation,
++        // which removes the native text leaf; presentation gates retirement,
++        // not this verified identity capture. Never reuse an older focus sample.
+         let current_island_association = claimed.is_some_and(|(element, _)| {
+-            self.island_live.get()
+-                && self.owns_island(&element)
+-                && crate::input_capability::is_presented(&element)
++            self.island_live.get() && self.owns_island(&element)
+         });
+         self.text_claim
+             .observe(node.map(|id| id.0), current_island_association);
+-- 
+2.53.0
+
