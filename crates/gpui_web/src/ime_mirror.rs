@@ -1302,13 +1302,12 @@ impl ImeMirror {
         if window.is_composing.get() {
             return;
         }
-        // Bind only the adapter's actual current text-entry association on
-        // this adopted element, including painted platforms. Never use a
-        // stale focus sample from before it became live or hidden warming.
+        // Bind only the adapter's synchronous current text-entry association
+        // on this live adopted element. Warming may precede DOM delegation,
+        // which removes the native text leaf; presentation gates retirement,
+        // not this verified identity capture. Never reuse an older focus sample.
         let current_island_association = claimed.is_some_and(|(element, _)| {
-            self.island_live.get()
-                && self.owns_island(&element)
-                && crate::input_capability::is_presented(&element)
+            self.island_live.get() && self.owns_island(&element)
         });
         self.text_claim
             .observe(node.map(|id| id.0), current_island_association);
