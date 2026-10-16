@@ -1154,6 +1154,7 @@ impl ImeMirror {
         })));
         self.island_native_tab.set(false);
         self.text_claim.reset();
+        self.retired_built_claims.borrow_mut().clear();
         self.island_counts.set(EditingIslandCounts::default());
         let adoption = self
             .island_adoption
