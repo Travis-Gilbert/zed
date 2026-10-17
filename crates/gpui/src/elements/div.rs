@@ -1354,6 +1354,15 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Mark this element as disabled for assistive technology (AccessKit's
+    /// `disabled`). This is the accessibility state only: it neither blocks
+    /// input nor changes how the element is drawn, so the caller keeps owning
+    /// both. `false` publishes nothing, which is how a node says it is enabled.
+    fn aria_disabled(mut self, disabled: bool) -> Self {
+        self.interactivity().aria.disabled = disabled;
+        self
+    }
+
     /// Set the expanded state for this element.
     fn aria_expanded(mut self, expanded: bool) -> Self {
         self.interactivity().aria.expanded = Some(expanded);
@@ -2060,6 +2069,7 @@ pub(crate) struct AriaProperties {
     pub(crate) description: Option<SharedString>,
     pub(crate) keyshortcuts: Option<SharedString>,
     pub(crate) selected: Option<bool>,
+    pub(crate) disabled: bool,
     pub(crate) expanded: Option<bool>,
     pub(crate) toggled: Option<accesskit::Toggled>,
     pub(crate) numeric_value: Option<f64>,
@@ -3475,6 +3485,9 @@ impl Interactivity {
         }
         if let Some(selected) = self.aria.selected {
             node.set_selected(selected);
+        }
+        if self.aria.disabled {
+            node.set_disabled();
         }
         if let Some(expanded) = self.aria.expanded {
             node.set_expanded(expanded);

@@ -1,0 +1,33 @@
+From 82f373442518b430df0709920e6306cafc38aab6 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 12:26:45 -0400
+Subject: [PATCH] fix(gpui_web): refuse editing island replacement during
+ composition
+
+---
+ crates/gpui_web/src/editing_island.rs | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/crates/gpui_web/src/editing_island.rs b/crates/gpui_web/src/editing_island.rs
+index 4979b31..89ca1e3 100644
+--- a/crates/gpui_web/src/editing_island.rs
++++ b/crates/gpui_web/src/editing_island.rs
+@@ -32,10 +32,14 @@ pub struct EditingIsland {
+ 
+ impl EditingIsland {
+     /// Adopt `element` as the window's editing island, or `None` when no
+-    /// window has opened on this thread.
++    /// window has opened on this thread or an IME composition is active.
++    /// Refusal leaves the predecessor and its listeners untouched.
+     pub fn adopt(element: web_sys::HtmlTextAreaElement) -> Option<Self> {
+         let window = WINDOW.with(|slot| slot.borrow().clone());
+         let inner = window.upgrade()?;
++        if inner.is_composing.get() {
++            return None;
++        }
+         inner.ime_mirror.adopt_island(element.clone());
+         let listeners = inner.attach_input_listeners(element.as_ref());
+         Some(Self {
+-- 
+2.53.0
+

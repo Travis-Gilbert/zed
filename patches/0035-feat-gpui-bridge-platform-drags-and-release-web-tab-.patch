@@ -1,0 +1,257 @@
+From 8d9bb7899133d6857829641b4657e34893cd735a Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 11:57:47 -0400
+Subject: [PATCH] feat(gpui): bridge platform drags and release web tab
+ boundaries
+
+---
+ crates/gpui/src/app.rs        | 24 ++++++++++
+ crates/gpui/src/tab_stop.rs   | 45 ++++++++++++++++++
+ crates/gpui/src/window.rs     | 87 ++++++++++++++++++++++++++++++++++-
+ crates/gpui_web/src/events.rs | 11 +++++
+ 4 files changed, 165 insertions(+), 2 deletions(-)
+
+diff --git a/crates/gpui/src/app.rs b/crates/gpui/src/app.rs
+index c97907f..52b3452 100644
+--- a/crates/gpui/src/app.rs
++++ b/crates/gpui/src/app.rs
+@@ -2539,6 +2539,30 @@ impl App {
+         self.active_drag.is_some()
+     }
+ 
++    /// Starts a typed drag initiated by a platform-owned element, using the same
++    /// coordinator and drop handlers as an element's `on_drag` listener.
++    /// Returns false without replacing a drag that is already active.
++    pub fn start_drag<T: 'static>(
++        &mut self,
++        value: T,
++        view: impl Into<AnyView>,
++        cursor_offset: Point<Pixels>,
++        window: &mut Window,
++    ) -> bool {
++        if self.has_active_drag() || self.platform_owned_drag.is_some() {
++            return false;
++        }
++        self.active_drag = Some(AnyDrag {
++            view: view.into(),
++            value: Arc::new(value),
++            cursor_offset,
++            cursor_style: None,
++            external_payload_source: None,
++        });
++        window.refresh();
++        true
++    }
++
+     /// Gets the cursor style of the currently active drag operation.
+     pub fn active_drag_cursor_style(&self) -> Option<CursorStyle> {
+         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)
+diff --git a/crates/gpui/src/tab_stop.rs b/crates/gpui/src/tab_stop.rs
+index bde651a..c612915 100644
+--- a/crates/gpui/src/tab_stop.rs
++++ b/crates/gpui/src/tab_stop.rs
+@@ -132,6 +132,28 @@ impl TabStopMap {
+         }
+     }
+ 
++    /// Traverse without wrapping, allowing an embedded window to return focus
++    /// to its platform's surrounding tab order at either edge.
++    #[cfg(any(target_family = "wasm", test))]
++    pub fn next_no_wrap(&self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {
++        match focused_id.and_then(|id| self.tab_node_for_focus_id(id)) {
++            Some(node) => self
++                .next_inner(node)
++                .and_then(|node| self.focus_handle_for_order(node)),
++            None => self.next(None),
++        }
++    }
++
++    #[cfg(any(target_family = "wasm", test))]
++    pub fn prev_no_wrap(&self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {
++        match focused_id.and_then(|id| self.tab_node_for_focus_id(id)) {
++            Some(node) => self
++                .prev_inner(node)
++                .and_then(|node| self.focus_handle_for_order(node)),
++            None => self.prev(None),
++        }
++    }
++
+     fn next_inner(&self, node: &TabStopNode) -> Option<&TabStopNode> {
+         let mut cursor = self.order.cursor::<TabStopNode>(());
+         cursor.seek(&node, Bias::Left);
+@@ -408,6 +430,29 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn non_wrapping_traversal_reports_both_edges_and_skips_disabled_stops() {
++        let focus_map = Arc::new(FocusMap::default());
++        let mut map = TabStopMap::default();
++        assert!(map.next_no_wrap(None).is_none());
++        assert!(map.prev_no_wrap(None).is_none());
++        let first = FocusHandle::new(&focus_map).tab_stop(true);
++        let disabled = FocusHandle::new(&focus_map);
++        let last = FocusHandle::new(&focus_map).tab_stop(true);
++        for handle in [&first, &disabled, &last] {
++            map.insert(handle);
++        }
++        assert_eq!(map.next_no_wrap(None), Some(first.clone()));
++        assert_eq!(map.prev_no_wrap(None), Some(last.clone()));
++        assert_eq!(map.next_no_wrap(Some(&first.id)), Some(last.clone()));
++        assert_eq!(map.prev_no_wrap(Some(&last.id)), Some(first.clone()));
++        assert!(map.next_no_wrap(Some(&last.id)).is_none());
++        assert!(map.prev_no_wrap(Some(&first.id)).is_none());
++        // Desktop callers retain their existing cyclic traversal.
++        assert_eq!(map.next(Some(&last.id)), Some(first.clone()));
++        assert_eq!(map.prev(Some(&first.id)), Some(last));
++    }
++
+     #[test]
+     fn test_tab_non_stop_filtering() {
+         let focus_map = Arc::new(FocusMap::default());
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index b52c457..44a744b 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -2252,8 +2252,21 @@ impl Window {
+             return;
+         }
+ 
+-        if let Some(handle) = self.rendered_frame.tab_stops.next(self.focus.as_ref()) {
++        #[cfg(target_family = "wasm")]
++        let next = self
++            .rendered_frame
++            .tab_stops
++            .next_no_wrap(self.focus.as_ref());
++        #[cfg(not(target_family = "wasm"))]
++        let next = self.rendered_frame.tab_stops.next(self.focus.as_ref());
++        if let Some(handle) = next {
+             self.focus(&handle, cx)
++        } else {
++            #[cfg(target_family = "wasm")]
++            {
++                self.blur(cx);
++                cx.propagate();
++            }
+         }
+     }
+ 
+@@ -2263,8 +2276,21 @@ impl Window {
+             return;
+         }
+ 
+-        if let Some(handle) = self.rendered_frame.tab_stops.prev(self.focus.as_ref()) {
++        #[cfg(target_family = "wasm")]
++        let prev = self
++            .rendered_frame
++            .tab_stops
++            .prev_no_wrap(self.focus.as_ref());
++        #[cfg(not(target_family = "wasm"))]
++        let prev = self.rendered_frame.tab_stops.prev(self.focus.as_ref());
++        if let Some(handle) = prev {
+             self.focus(&handle, cx)
++        } else {
++            #[cfg(target_family = "wasm")]
++            {
++                self.blur(cx);
++                cx.propagate();
++            }
+         }
+     }
+ 
+@@ -7834,6 +7860,63 @@ mod tests {
+         }
+     }
+ 
++    #[gpui::test]
++    fn platform_element_drag_uses_typed_drop_dispatch_and_cancels(cx: &mut TestAppContext) {
++        let observed_drag_moves = Rc::new(RefCell::new(Vec::new()));
++        let observed_drops = Rc::new(RefCell::new(Vec::new()));
++        let path = PathBuf::from("/platform-element");
++        let window: AnyWindowHandle = cx
++            .add_window({
++                let observed_drag_moves = observed_drag_moves.clone();
++                let observed_drops = observed_drops.clone();
++                let path = path.clone();
++                move |_, _| FileDragView {
++                    path,
++                    observed_drag_moves,
++                    observed_drops,
++                }
++            })
++            .into();
++        cx.update_window(window, |_, window, cx| {
++            window.draw(cx).clear(cx);
++            let preview = cx.new(|_| Empty);
++            assert!(cx.start_drag(path.clone(), preview.clone(), Point::default(), window));
++            assert!(!cx.start_drag(
++                PathBuf::from("/replacement"),
++                preview.clone(),
++                Point::default(),
++                window
++            ));
++            let position = point(px(30.), px(30.));
++            window.dispatch_event(
++                MouseMoveEvent {
++                    position,
++                    pressed_button: Some(MouseButton::Left),
++                    modifiers: Default::default(),
++                }
++                .to_platform_input(),
++                cx,
++            );
++            assert_eq!(observed_drag_moves.borrow().as_slice(), &[position]);
++            let release = crate::MouseUpEvent {
++                position,
++                button: MouseButton::Left,
++                modifiers: Default::default(),
++                click_count: 1,
++            };
++            window.dispatch_event(release.clone().to_platform_input(), cx);
++            window.dispatch_event(release.clone().to_platform_input(), cx);
++            assert_eq!(observed_drops.borrow().as_slice(), &[path.clone()]);
++            assert!(!cx.has_active_drag());
++            assert!(cx.start_drag(path.clone(), preview, Point::default(), window));
++            assert!(cx.stop_active_drag(window));
++            assert!(!cx.stop_active_drag(window));
++            window.dispatch_event(release.to_platform_input(), cx);
++            assert_eq!(observed_drops.borrow().as_slice(), &[path]);
++        })
++        .unwrap();
++    }
++
+     #[gpui::test]
+     fn file_drag_is_promoted_once_and_restored_in_source_window(cx: &mut TestAppContext) {
+         struct Drag {
+diff --git a/crates/gpui_web/src/events.rs b/crates/gpui_web/src/events.rs
+index 40c6223..2bd693a 100644
+--- a/crates/gpui_web/src/events.rs
++++ b/crates/gpui_web/src/events.rs
+@@ -809,6 +809,10 @@ impl WebWindowInner {
+                 key_char: key_char.clone(),
+             };
+ 
++            let is_tab = keystroke.key == "tab"
++                && !modifiers.control
++                && !modifiers.alt
++                && !modifiers.platform;
+             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+                 keystroke,
+                 is_held,
+@@ -823,6 +827,13 @@ impl WebWindowInner {
+                 }
+             }
+ 
++            if is_tab && !this.is_composing.get() && !event.is_composing() {
++                // GPUI propagated at the edge of its tab order. Let the
++                // browser continue from the canvas's input conduit into DOM.
++                this.ime_mirror.blur();
++                return;
++            }
++
+             if this.is_composing.get() || event.is_composing() {
+                 event.prevent_default();
+                 return;
+-- 
+2.53.0
+

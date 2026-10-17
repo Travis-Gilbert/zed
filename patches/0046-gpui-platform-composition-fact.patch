@@ -1,0 +1,148 @@
+From f3abcd6a7377c2f5d243bb3431d66b17e0f0fa51 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 17:30:49 -0400
+Subject: [PATCH] feat(gpui): expose current platform text composition
+
+---
+ crates/gpui/src/input.rs                | 29 +++++++++++++++++++++++++
+ crates/gpui/src/platform.rs             |  6 +++++
+ crates/gpui/src/platform/test/window.rs | 11 ++++++++++
+ crates/gpui/src/window.rs               |  6 +++++
+ crates/gpui_web/src/window.rs           |  4 ++++
+ 5 files changed, 56 insertions(+)
+
+diff --git a/crates/gpui/src/input.rs b/crates/gpui/src/input.rs
+index 6038f6e..fc9bb6c 100644
+--- a/crates/gpui/src/input.rs
++++ b/crates/gpui/src/input.rs
+@@ -308,6 +308,35 @@ mod tests {
+         TextInputStateChange, canvas, div,
+     };
+ 
++    #[gpui::test]
++    fn platform_composition_fact_tracks_empty_open_phase_without_input_or_focus_mutation(
++        cx: &mut TestAppContext,
++    ) {
++        let window = cx.add_window(|_, cx| ConfigurationTestView {
++            focus_handle: cx.focus_handle(),
++            configuration: TextInputConfiguration::default(),
++        });
++        let platform = cx.test_window(window.into());
++        cx.update_window(window.into(), |_, window, _| {
++            assert!(!window.is_text_composing());
++            let focus = window.focus;
++            platform.simulate_text_composing(true);
++            assert!(
++                window.is_text_composing(),
++                "empty platform composition is observable without marked text"
++            );
++            assert_eq!(window.focus, focus);
++            assert_eq!(platform.text_input_focus_requests(), 0);
++            assert!(platform.text_input_state_changes().is_empty());
++            platform.simulate_text_composing(false);
++            assert!(
++                !window.is_text_composing(),
++                "commit or cancellation closes the same fact"
++            );
++        })
++        .unwrap();
++    }
++
+     #[gpui::test]
+     fn explicit_input_focus_requests_survive_same_handle_and_cancel_on_owner_change(
+         cx: &mut TestAppContext,
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index c7d9ad1..803e64d 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1176,6 +1176,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     /// This is an intent, separate from a change in native focus ownership.
+     fn request_text_input_focus(&self) {}
+ 
++    /// Whether the platform currently owns an open text composition, including
++    /// the empty phase before the document has received marked text.
++    fn is_text_composing(&self) -> bool {
++        false
++    }
++
+     /// Inform the operating system that the text input state has changed
+     fn text_input_state_changed(&self, _change: TextInputStateChange) {}
+ 
+diff --git a/crates/gpui/src/platform/test/window.rs b/crates/gpui/src/platform/test/window.rs
+index 1ce6a77..78bbfbb 100644
+--- a/crates/gpui/src/platform/test/window.rs
++++ b/crates/gpui/src/platform/test/window.rs
+@@ -46,6 +46,7 @@ pub(crate) struct TestWindowState {
+     text_input_configurations: Vec<TextInputConfiguration>,
+     text_input_state_changes: Vec<TextInputStateChange>,
+     text_input_focus_requests: u64,
++    text_composing: bool,
+     is_fullscreen: bool,
+     appearance: WindowAppearance,
+     external_drag_files: Vec<(PathBuf, bool)>,
+@@ -111,6 +112,7 @@ impl TestWindow {
+             text_input_configurations: Vec::new(),
+             text_input_state_changes: Vec::new(),
+             text_input_focus_requests: 0,
++            text_composing: false,
+             is_fullscreen: false,
+             appearance: WindowAppearance::Light,
+             external_drag_files: Vec::new(),
+@@ -140,6 +142,11 @@ impl TestWindow {
+         self.0.lock().frame_scheduled
+     }
+ 
++    /// Simulate the platform's composition phase independently of marked text.
++    pub fn simulate_text_composing(&self, composing: bool) {
++        self.0.lock().text_composing = composing;
++    }
++
+     /// Every [`TextInputConfiguration`] forwarded to this window, in order.
+     pub fn text_input_configurations(&self) -> Vec<TextInputConfiguration> {
+         self.0.lock().text_input_configurations.clone()
+@@ -283,6 +290,10 @@ impl PlatformWindow for TestWindow {
+         self.0.lock().text_input_configurations.push(configuration);
+     }
+ 
++    fn is_text_composing(&self) -> bool {
++        self.0.lock().text_composing
++    }
++
+     fn request_text_input_focus(&self) {
+         self.0.lock().text_input_focus_requests += 1;
+     }
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index cde0ab7..ecadeb2 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -2240,6 +2240,12 @@ impl Window {
+         true
+     }
+ 
++    /// Read the current platform composition fact without importing text or
++    /// changing focus. Platforms which do not report this retain false.
++    pub fn is_text_composing(&self) -> bool {
++        self.platform_window.is_text_composing()
++    }
++
+     /// Remove focus from all elements within this context's window.
+     pub fn blur(&mut self, cx: &mut App) {
+         self.clear_pending_keystrokes(cx);
+diff --git a/crates/gpui_web/src/window.rs b/crates/gpui_web/src/window.rs
+index 934b8e2..43818bc 100644
+--- a/crates/gpui_web/src/window.rs
++++ b/crates/gpui_web/src/window.rs
+@@ -770,6 +770,10 @@ impl PlatformWindow for WebWindow {
+         self.inner.ime_mirror.apply_configuration(&configuration);
+     }
+ 
++    fn is_text_composing(&self) -> bool {
++        self.inner.is_composing.get()
++    }
++
+     fn request_text_input_focus(&self) {
+         // The IME owns its element until commit/cancel. An explicit later
+         // editor focus intent must not move an open composition.
+-- 
+2.53.0
+

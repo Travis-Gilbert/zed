@@ -1,0 +1,524 @@
+From 1d04bd4770406698bd2e59505d2fd58ec8822c93 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Wed, 30 Sep 2026 10:07:58 -0400
+Subject: [PATCH] feat(gpui): adopt the native macOS reduced-motion preference
+
+---
+ crates/gpui/src/app.rs                      | 103 ++++++++++++++
+ crates/gpui/src/platform.rs                 |  11 ++
+ crates/gpui/src/platform/test/platform.rs   |  19 ++-
+ crates/gpui_macos/examples/native_motion.rs | 144 ++++++++++++++++++++
+ crates/gpui_macos/src/gpui_macos.rs         |   1 +
+ crates/gpui_macos/src/platform.rs           |  12 ++
+ crates/gpui_macos/src/reduce_motion.rs      | 101 ++++++++++++++
+ 7 files changed, 390 insertions(+), 1 deletion(-)
+ create mode 100644 crates/gpui_macos/examples/native_motion.rs
+ create mode 100644 crates/gpui_macos/src/reduce_motion.rs
+
+diff --git a/crates/gpui/src/app.rs b/crates/gpui/src/app.rs
+index 9811fc3..c97907f 100644
+--- a/crates/gpui/src/app.rs
++++ b/crates/gpui/src/app.rs
+@@ -878,6 +878,20 @@ impl App {
+         init_app_menus(platform.as_ref(), &app.borrow());
+         SystemWindowTabController::init(&mut app.borrow_mut());
+ 
++        // Subscribe before reading so a preference change during setup is not
++        // lost. The platform delivers later changes outside native callbacks.
++        platform.on_reduce_motion_change(Box::new({
++            let app = Rc::downgrade(&app);
++            move |reduced| {
++                if let Some(app) = app.upgrade() {
++                    app.borrow_mut().update(|cx| cx.set_reduce_motion(reduced));
++                }
++            }
++        }));
++        if let Some(reduced) = platform.reduce_motion() {
++            app.borrow_mut().update(|cx| cx.set_reduce_motion(reduced));
++        }
++
+         platform.on_keyboard_layout_change(Box::new({
+             let app = Rc::downgrade(&app);
+             move || {
+@@ -3111,6 +3125,77 @@ mod test {
+ 
+     use crate::{AppContext, Context, Empty, IntoElement, Render, TestAppContext, Window};
+ 
++    fn motion_test_platform() -> Rc<crate::TestPlatform> {
++        let dispatcher = std::sync::Arc::new(crate::TestDispatcher::new(0));
++        crate::TestPlatform::new(
++            crate::BackgroundExecutor::new(dispatcher.clone()),
++            crate::ForegroundExecutor::new(dispatcher),
++        )
++    }
++
++    fn motion_test_app(platform: Rc<crate::TestPlatform>) -> Rc<crate::AppCell> {
++        super::App::new_app(
++            platform,
++            std::sync::Arc::new(()),
++            http_client::FakeHttpClient::with_404_response(),
++        )
++    }
++
++    #[test]
++    fn reduced_motion_reads_native_preference_at_startup() {
++        for preference in [None, Some(false), Some(true)] {
++            let platform = motion_test_platform();
++            platform.fake_reduce_motion.set(preference);
++            let app = motion_test_app(platform);
++            assert_eq!(app.borrow().reduce_motion(), preference.unwrap_or(false));
++            if preference.is_some() {
++                assert!(app.borrow().pending_effects.is_empty());
++            }
++        }
++    }
++
++    #[test]
++    fn reduced_motion_subscribes_before_reading_preference() {
++        let platform = motion_test_platform();
++        platform.fake_reduce_motion.set(Some(false));
++        platform.fake_reduce_motion_on_subscribe.set(Some(true));
++        let app = motion_test_app(platform);
++        assert!(app.borrow().reduce_motion());
++    }
++
++    #[test]
++    fn reduced_motion_notification_flushes_refresh_and_ignores_duplicates() {
++        let platform = motion_test_platform();
++        let app = motion_test_app(platform.clone());
++        let mut callback = platform
++            .fake_reduce_motion_callback
++            .borrow_mut()
++            .take()
++            .unwrap();
++        for value in [true, true, false, false] {
++            callback(value);
++            assert_eq!(app.borrow().reduce_motion(), value);
++            assert!(app.borrow().pending_effects.is_empty());
++        }
++        app.borrow_mut().set_reduce_motion(false);
++        assert!(app.borrow().pending_effects.is_empty());
++    }
++
++    #[test]
++    fn reduced_motion_platform_callback_does_not_retain_app() {
++        let platform = motion_test_platform();
++        let app = motion_test_app(platform.clone());
++        let weak_app = Rc::downgrade(&app);
++        drop(app);
++        assert!(weak_app.upgrade().is_none());
++        let mut callback = platform
++            .fake_reduce_motion_callback
++            .borrow_mut()
++            .take()
++            .unwrap();
++        callback(true);
++    }
++
+     struct RenderCounter(Rc<Cell<usize>>);
+ 
+     impl Render for RenderCounter {
+@@ -3120,6 +3205,24 @@ mod test {
+         }
+     }
+ 
++    #[gpui::test]
++    fn reduced_motion_duplicate_does_not_redraw_windows(cx: &mut TestAppContext) {
++        let render_count = Rc::new(Cell::new(0));
++        let _window = cx.add_window({
++            let render_count = render_count.clone();
++            move |_, _| RenderCounter(render_count)
++        });
++        cx.run_until_parked();
++        let before = render_count.get();
++        cx.update(|cx| cx.set_reduce_motion(true));
++        cx.run_until_parked();
++        assert!(render_count.get() > before);
++        let after = render_count.get();
++        cx.update(|cx| cx.set_reduce_motion(true));
++        cx.run_until_parked();
++        assert_eq!(render_count.get(), after);
++    }
++
+     #[gpui::test]
+     fn async_app_refresh_flushes_refresh_effect(cx: &mut TestAppContext) {
+         let render_count = Rc::new(Cell::new(0));
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 9fe4ee9..fd05ca3 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -129,6 +129,17 @@ pub trait Platform: 'static {
+     fn foreground_executor(&self) -> ForegroundExecutor;
+     fn text_system(&self) -> Arc<dyn PlatformTextSystem>;
+ 
++    /// The operating system's reduced-motion preference, if supported.
++    /// `None` leaves the application's existing motion policy unchanged.
++    fn reduce_motion(&self) -> Option<bool> {
++        None
++    }
++
++    /// Replaces the platform-owned motion listener. Delivery must be deferred
++    /// onto the foreground executor, outside any synchronous native callback.
++    /// Unsupported platforms leave the application policy unchanged.
++    fn on_reduce_motion_change(&self, _callback: Box<dyn FnMut(bool)>) {}
++
+     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>);
+     fn quit(&self);
+     fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<OsString>);
+diff --git a/crates/gpui/src/platform/test/platform.rs b/crates/gpui/src/platform/test/platform.rs
+index 5e82fbe..e9040e3 100644
+--- a/crates/gpui/src/platform/test/platform.rs
++++ b/crates/gpui/src/platform/test/platform.rs
+@@ -16,7 +16,7 @@ use collections::VecDeque;
+ use futures::channel::oneshot;
+ use parking_lot::Mutex;
+ use std::{
+-    cell::RefCell,
++    cell::{Cell, RefCell},
+     path::{Path, PathBuf},
+     rc::{Rc, Weak},
+     sync::Arc,
+@@ -26,6 +26,9 @@ use std::{
+ pub(crate) struct TestPlatform {
+     background_executor: BackgroundExecutor,
+     foreground_executor: ForegroundExecutor,
++    pub(crate) fake_reduce_motion: Cell<Option<bool>>,
++    pub(crate) fake_reduce_motion_on_subscribe: Cell<Option<bool>>,
++    pub(crate) fake_reduce_motion_callback: RefCell<Option<Box<dyn FnMut(bool)>>>,
+ 
+     pub(crate) active_window: RefCell<Option<TestWindow>>,
+     active_display: Rc<dyn PlatformDisplay>,
+@@ -142,6 +145,9 @@ impl TestPlatform {
+         Rc::new_cyclic(|weak| TestPlatform {
+             background_executor: executor,
+             foreground_executor,
++            fake_reduce_motion: Cell::new(None),
++            fake_reduce_motion_on_subscribe: Cell::new(None),
++            fake_reduce_motion_callback: RefCell::new(None),
+             #[cfg(any(test, feature = "test-support"))]
+             prompts: Default::default(),
+             screen_capture_sources: Default::default(),
+@@ -359,6 +365,17 @@ impl Platform for TestPlatform {
+         self.text_system.clone()
+     }
+ 
++    fn reduce_motion(&self) -> Option<bool> {
++        self.fake_reduce_motion.get()
++    }
++
++    fn on_reduce_motion_change(&self, callback: Box<dyn FnMut(bool)>) {
++        *self.fake_reduce_motion_callback.borrow_mut() = Some(callback);
++        if let Some(value) = self.fake_reduce_motion_on_subscribe.take() {
++            self.fake_reduce_motion.set(Some(value));
++        }
++    }
++
+     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
+         Box::new(TestKeyboardLayout)
+     }
+diff --git a/crates/gpui_macos/examples/native_motion.rs b/crates/gpui_macos/examples/native_motion.rs
+new file mode 100644
+index 0000000..dc1a41a
+--- /dev/null
++++ b/crates/gpui_macos/examples/native_motion.rs
+@@ -0,0 +1,144 @@
++//! Real macOS preference smoke test. Does not change system settings.
++//!
++//! Startup proof:
++//! `cargo run --locked -p gpui_macos --example native_motion`
++//! Live-change proof (toggle System Settings > Accessibility > Display > Reduce motion):
++//! `GPUI_NATIVE_MOTION_WAIT_FOR_CHANGE=1 cargo run --locked -p gpui_macos --example native_motion`
++
++#[cfg(target_os = "macos")]
++fn main() {
++    use gpui::Platform as _;
++    use std::{
++        cell::Cell,
++        rc::Rc,
++        time::{Duration, Instant},
++    };
++
++    let platform = Rc::new(gpui_macos::MacPlatform::new(false));
++    let initial = platform
++        .reduce_motion()
++        .expect("macOS preference available");
++    let wait_for_change = std::env::var_os("GPUI_NATIVE_MOTION_WAIT_FOR_CHANGE").is_some();
++    gpui::Application::with_platform(platform.clone()).run(move |cx| {
++        assert_eq!(
++            cx.reduce_motion(),
++            initial,
++            "startup preference synchronization"
++        );
++        println!("native-motion: startup matched OS ({initial})");
++        // Post the real native notification while App is already borrowed.
++        // This tests adapter delivery, not an OS setting change.
++        cx.set_reduce_motion(!initial);
++        for _ in 0..1_000 {
++            post_display_notification();
++        }
++        assert_eq!(cx.reduce_motion(), !initial, "native callback must not re-enter App");
++
++        let canceled_calls = Rc::new(Cell::new(0));
++        let dropped_platform = gpui_macos::MacPlatform::new(true);
++        dropped_platform.on_reduce_motion_change(Box::new({
++            let calls = canceled_calls.clone();
++            move |_| calls.set(calls.get() + 1)
++        }));
++        post_display_notification();
++        drop(dropped_platform);
++
++        let replaced_calls = Rc::new(Cell::new(0));
++        let replacement_calls = Rc::new(Cell::new(0));
++        let replacement_platform = gpui_macos::MacPlatform::new(true);
++        replacement_platform.on_reduce_motion_change(Box::new({
++            let calls = replaced_calls.clone();
++            move |_| calls.set(calls.get() + 1)
++        }));
++        post_display_notification();
++        replacement_platform.on_reduce_motion_change(Box::new({
++            let calls = replacement_calls.clone();
++            move |_| calls.set(calls.get() + 1)
++        }));
++        post_display_notification();
++        let self_replaced_calls = Rc::new(Cell::new(0));
++        let self_replacement_calls = Rc::new(Cell::new(0));
++        let self_replacement_platform = Rc::new(gpui_macos::MacPlatform::new(true));
++        self_replacement_platform.on_reduce_motion_change(Box::new({
++            let platform = Rc::downgrade(&self_replacement_platform);
++            let old_calls = self_replaced_calls.clone();
++            let new_calls = self_replacement_calls.clone();
++            move |_| {
++                old_calls.set(old_calls.get() + 1);
++                let platform = platform.upgrade().expect("smoke retains platform");
++                platform.on_reduce_motion_change(Box::new({
++                    let calls = new_calls.clone();
++                    move |_| calls.set(calls.get() + 1)
++                }));
++            }
++        }));
++        for _ in 0..1_000 {
++            post_display_notification();
++        }
++        cx.spawn(async move |cx| {
++            cx.background_executor().timer(Duration::from_millis(100)).await;
++            assert_eq!(cx.update(|cx| cx.reduce_motion()), platform.reduce_motion().unwrap());
++            assert_eq!(canceled_calls.get(), 0, "dropped platform cancels pending delivery");
++            assert_eq!(replaced_calls.get(), 0, "replacement cancels old delivery");
++            assert!(replacement_calls.get() > 0, "replacement receives notification");
++            assert!(replacement_calls.get() <= 2, "no-poll burst has bounded delivery");
++            assert_eq!(self_replaced_calls.get(), 1, "self-replacement fences buffered old wakes");
++            post_display_notification();
++            cx.background_executor().timer(Duration::from_millis(100)).await;
++            assert!(self_replacement_calls.get() > 0, "self-replacement receives new wake");
++            drop(replacement_platform);
++            drop(self_replacement_platform);
++            println!("native-motion: native notification deferral, burst coalescing, replacement and teardown passed");
++            if !wait_for_change {
++                cx.update(|cx| cx.quit());
++                return;
++            }
++            println!("native-motion: toggle Reduce motion in System Settings within 60 seconds");
++            let deadline = Instant::now() + Duration::from_secs(60);
++            loop {
++                cx.background_executor()
++                    .timer(Duration::from_millis(50))
++                    .await;
++                let native = platform
++                    .reduce_motion()
++                    .expect("macOS preference available");
++                let adopted = cx.update(|cx| cx.reduce_motion());
++                if native != initial && adopted == native {
++                    println!("native-motion: live OS change adopted ({native})");
++                    cx.update(|cx| cx.quit());
++                    break;
++                }
++                assert!(
++                    Instant::now() < deadline,
++                    "no live OS change adopted before deadline"
++                );
++            }
++        })
++        .detach();
++    });
++}
++
++#[cfg(target_os = "macos")]
++fn post_display_notification() {
++    use cocoa::base::{id, nil};
++    use objc::{class, msg_send, sel, sel_impl};
++    // SAFETY: this smoke runs on AppKit's main thread. The notification is
++    // intentionally posted to NSWorkspace's center without changing settings.
++    unsafe {
++        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
++        let center: id = msg_send![workspace, notificationCenter];
++        let name = cocoa::foundation::NSString::alloc(nil);
++        let name = cocoa::foundation::NSString::init_str(
++            name,
++            "NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification",
++        );
++        let _: () = msg_send![center, postNotificationName: name object: workspace];
++        let _: () = msg_send![name, release];
++    }
++}
++
++#[cfg(not(target_os = "macos"))]
++fn main() {
++    eprintln!("native-motion: macOS-only OS preference smoke test");
++    std::process::exit(2);
++}
+diff --git a/crates/gpui_macos/src/gpui_macos.rs b/crates/gpui_macos/src/gpui_macos.rs
+index 52877ef..53c470c 100644
+--- a/crates/gpui_macos/src/gpui_macos.rs
++++ b/crates/gpui_macos/src/gpui_macos.rs
+@@ -10,6 +10,7 @@ mod display_link;
+ mod events;
+ mod keyboard;
+ mod pasteboard;
++mod reduce_motion;
+ mod system_notifications;
+ 
+ #[cfg(feature = "screen-capture")]
+diff --git a/crates/gpui_macos/src/platform.rs b/crates/gpui_macos/src/platform.rs
+index 53d4927..1ee83d0 100644
+--- a/crates/gpui_macos/src/platform.rs
++++ b/crates/gpui_macos/src/platform.rs
+@@ -192,6 +192,7 @@ pub(crate) struct MacPlatformState {
+     /// Mirrors `[NSCursor setHiddenUntilMouseMoves:]` state, which AppKit doesn't expose.
+     cursor_visible: Arc<AtomicBool>,
+     system_notifications: crate::system_notifications::SystemNotificationState,
++    reduced_motion_observer: Option<crate::reduce_motion::ReducedMotionObserver>,
+ }
+ 
+ impl MacPlatform {
+@@ -240,6 +241,7 @@ impl MacPlatform {
+             keyboard_mapper,
+             cursor_visible: Arc::new(AtomicBool::new(true)),
+             system_notifications: crate::system_notifications::SystemNotificationState::new(),
++            reduced_motion_observer: None,
+         });
+         Self(state, marker)
+     }
+@@ -479,6 +481,16 @@ impl MacPlatform {
+ }
+ 
+ impl Platform for MacPlatform {
++    fn reduce_motion(&self) -> Option<bool> {
++        Some(crate::reduce_motion::current())
++    }
++
++    fn on_reduce_motion_change(&self, callback: Box<dyn FnMut(bool)>) {
++        let executor = self.foreground_executor();
++        let observer = crate::reduce_motion::ReducedMotionObserver::new(&executor, callback);
++        self.0.lock().reduced_motion_observer = Some(observer);
++    }
++
+     fn background_executor(&self) -> BackgroundExecutor {
+         self.0.lock().background_executor.clone()
+     }
+diff --git a/crates/gpui_macos/src/reduce_motion.rs b/crates/gpui_macos/src/reduce_motion.rs
+new file mode 100644
+index 0000000..f36ea04
+--- /dev/null
++++ b/crates/gpui_macos/src/reduce_motion.rs
+@@ -0,0 +1,101 @@
++//! Native preference input; GPUI's App remains the motion-policy owner.
++
++use block::ConcreteBlock;
++use cocoa::base::{BOOL, YES, id, nil};
++use futures::{StreamExt as _, channel::mpsc};
++use gpui::{ForegroundExecutor, Task};
++use objc::{class, msg_send, sel, sel_impl};
++use parking_lot::Mutex;
++use std::sync::{
++    Arc,
++    atomic::{AtomicBool, Ordering},
++};
++
++pub(crate) fn current() -> bool {
++    // SAFETY: called on GPUI's main thread. NSWorkspace and this getter are
++    // available before the platform's macOS 10.15.7 deployment target.
++    unsafe {
++        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
++        let reduced: BOOL = msg_send![workspace, accessibilityDisplayShouldReduceMotion];
++        reduced == YES
++    }
++}
++
++/// Owns both native registration and foreground delivery, without a pointer
++/// back to MacPlatform or a strong App reference.
++pub(crate) struct ReducedMotionObserver {
++    center: id,
++    token: id,
++    active: Arc<AtomicBool>,
++    _delivery: Task<()>,
++}
++
++impl ReducedMotionObserver {
++    pub(crate) fn new(executor: &ForegroundExecutor, mut callback: Box<dyn FnMut(bool)>) -> Self {
++        // Coalesce wake signals, not preference values: delivery reads the
++        // latest OS preference, so a full queue cannot lose the final value.
++        let (sender, mut receiver) = mpsc::channel(1);
++        let sender = Mutex::new(sender);
++        let block = ConcreteBlock::new(move |_: id| {
++            // Cocoa may invoke/copy the block on another thread. Capture only
++            // this sendable channel, never an Rc or a GPUI App handle.
++            let _ = sender.lock().try_send(());
++        })
++        .copy();
++        let (center, token) = unsafe {
++            // SAFETY: registration is on the main thread. Apple's display
++            // accessibility notification belongs to NSWorkspace's center,
++            // not NSNotificationCenter.defaultCenter. The center copies the
++            // block; queue:nil permits arbitrary posting threads, which only
++            // enqueue a sendable signal. Own retains for teardown below.
++            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
++            let center: id = msg_send![workspace, notificationCenter];
++            let name =
++                crate::ns_string("NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification");
++            let token: id = msg_send![center,
++                addObserverForName: name
++                object: workspace
++                queue: nil
++                usingBlock: &*block
++            ];
++            let _: id = msg_send![center, retain];
++            let _: id = msg_send![token, retain];
++            (center, token)
++        };
++        let active = Arc::new(AtomicBool::new(true));
++        let delivery_active = active.clone();
++        let delivery = executor.spawn(async move {
++            while receiver.next().await.is_some() {
++                // Cancellation cannot interrupt a callback's current poll.
++                // Fence buffered wakes if that callback replaces this observer.
++                if !delivery_active.load(Ordering::Acquire) {
++                    break;
++                }
++                // Foreground scheduling avoids synchronous App re-entry.
++                // Other accessibility options also post this notification;
++                // never interpret it as a toggle or use a stale sample.
++                callback(current());
++            }
++        });
++        Self {
++            center,
++            token,
++            active,
++            _delivery: delivery,
++        }
++    }
++}
++
++impl Drop for ReducedMotionObserver {
++    fn drop(&mut self) {
++        self.active.store(false, Ordering::Release);
++        // SAFETY: MacPlatform and its observer are main-thread-owned. Both
++        // objects were retained during registration. Removing the token
++        // releases the copied block; dropping _delivery cancels queued work.
++        unsafe {
++            let _: () = msg_send![self.center, removeObserver: self.token];
++            let _: () = msg_send![self.token, release];
++            let _: () = msg_send![self.center, release];
++        }
++    }
++}

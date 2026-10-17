@@ -16,7 +16,7 @@ use collections::VecDeque;
 use futures::channel::oneshot;
 use parking_lot::Mutex;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::Arc,
@@ -26,6 +26,9 @@ use std::{
 pub(crate) struct TestPlatform {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
+    pub(crate) fake_reduce_motion: Cell<Option<bool>>,
+    pub(crate) fake_reduce_motion_on_subscribe: Cell<Option<bool>>,
+    pub(crate) fake_reduce_motion_callback: RefCell<Option<Box<dyn FnMut(bool)>>>,
 
     pub(crate) active_window: RefCell<Option<TestWindow>>,
     active_display: Rc<dyn PlatformDisplay>,
@@ -142,6 +145,9 @@ impl TestPlatform {
         Rc::new_cyclic(|weak| TestPlatform {
             background_executor: executor,
             foreground_executor,
+            fake_reduce_motion: Cell::new(None),
+            fake_reduce_motion_on_subscribe: Cell::new(None),
+            fake_reduce_motion_callback: RefCell::new(None),
             #[cfg(any(test, feature = "test-support"))]
             prompts: Default::default(),
             screen_capture_sources: Default::default(),
@@ -357,6 +363,17 @@ impl Platform for TestPlatform {
 
     fn text_system(&self) -> Arc<dyn PlatformTextSystem> {
         self.text_system.clone()
+    }
+
+    fn reduce_motion(&self) -> Option<bool> {
+        self.fake_reduce_motion.get()
+    }
+
+    fn on_reduce_motion_change(&self, callback: Box<dyn FnMut(bool)>) {
+        *self.fake_reduce_motion_callback.borrow_mut() = Some(callback);
+        if let Some(value) = self.fake_reduce_motion_on_subscribe.take() {
+            self.fake_reduce_motion.set(Some(value));
+        }
     }
 
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {

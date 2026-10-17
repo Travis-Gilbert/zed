@@ -39,6 +39,7 @@ use gpui::accesskit::{self, Action, ActionRequest, Live, NodeId, Rect, Role, Tog
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+use crate::ime_mirror::{FALLBACK_INPUT_NAME, ISLAND_ATTRIBUTE, conduit_name};
 use crate::native_element::NativeElements;
 
 /// The attribute that carries a node's AccessKit id on its mirror element.
@@ -175,8 +176,9 @@ fn aria_role(role: Role) -> Option<&'static str> {
 ///
 /// Held beside the element so a frame that changed nothing compares equal and
 /// touches no DOM at all.
-#[derive(PartialEq)]
+#[derive(Default, PartialEq)]
 struct Mirrored {
+    author_id: Option<String>,
     role: Option<&'static str>,
     label: Option<String>,
     description: Option<String>,
@@ -288,6 +290,7 @@ impl Mirrored {
         let value = non_empty(node.value());
         let children = node.children().to_vec();
         Self {
+            author_id: non_empty(node.author_id()),
             role,
             label: non_empty(node.label()),
             description: non_empty(node.description()),
@@ -341,6 +344,7 @@ pub(crate) struct WebA11yAdapter {
     /// of the node it claims. Declaring it here rather than querying it keeps
     /// one authority for what a node is.
     declared: Rc<Cell<PlatformNativeElement>>,
+    text_focus: Rc<dyn Fn(Option<NodeId>, Option<(web_sys::HtmlElement, NodeId)>)>,
     nodes: HashMap<NodeId, MirrorNode>,
     focus: Option<NodeId>,
     announced: String,
@@ -391,6 +395,7 @@ impl WebA11yAdapter {
         document: web_sys::Document,
         input_element: Rc<RefCell<web_sys::HtmlElement>>,
         declared: Rc<Cell<PlatformNativeElement>>,
+        text_focus: Rc<dyn Fn(Option<NodeId>, Option<(web_sys::HtmlElement, NodeId)>)>,
         native_elements: NativeElements,
         action: Rc<dyn Fn(ActionRequest)>,
     ) -> anyhow::Result<Self> {
@@ -482,6 +487,7 @@ impl WebA11yAdapter {
             live_region,
             input_element,
             declared,
+            text_focus,
             native_elements,
             nodes: HashMap::default(),
             focus: None,
@@ -506,19 +512,28 @@ impl WebA11yAdapter {
         // in the tree for one semantic node, and a reader would encounter the
         // control twice. So the node is claimed here, before the mirror loop,
         // and the loop skips it.
-        let claimed = update
+        let focused_text = update
             .nodes
             .iter()
-            .find(|(node_id, node)| *node_id == update.focus && realizable_natively(node.role()))
-            .and_then(|(node_id, node)| {
-                let capability = capability_for_role(node.role())?;
-                // The gate and the role have to agree, and each answers for
-                // one half: the role says what the node is, the gate says
-                // whether this window has the element to be it.
-                self.native_elements
-                    .realizes(capability)
-                    .then(|| (*node_id, Mirrored::read(node), capability))
-            });
+            .find(|(node_id, node)| *node_id == update.focus && realizable_natively(node.role()));
+        let claimed = focused_text.and_then(|(node_id, node)| {
+            let capability = capability_for_role(node.role())?;
+            // The gate and the role have to agree, and each answers for
+            // one half: the role says what the node is, the gate says
+            // whether this window has the element to be it.
+            self.native_elements
+                .realizes(capability)
+                .then(|| (*node_id, Mirrored::read(node), capability))
+        });
+        // The focused text input names the IME entry whether or not the
+        // browser realizes it natively: on the painted path the entry is still
+        // the element holding keyboard focus, and a reader that lands on it
+        // must hear what the field is. Only the label and description are
+        // read -- a name comes from a label, never from the value.
+        let entry_name = focused_text.map(|(_, node)| {
+            let read = Mirrored::read(node);
+            (read.label, read.description)
+        });
         // Declared before the element is claimed: the mirror reads the
         // declaration to decide which conduit the focused leaf calls for, and
         // the claim below only says which name and state that conduit carries
@@ -536,7 +551,14 @@ impl WebA11yAdapter {
                     *capability
                 }),
         );
-        self.apply_native_realization(claimed.as_ref());
+        self.apply_native_realization(claimed.as_ref(), entry_name.as_ref());
+        // This is the same focused leaf used above to name the conduit. The
+        // handoff may retire a passive fallback, but must not conceal a built
+        // control serving a different actual text field.
+        (self.text_focus)(
+            focused_text.map(|(node_id, _)| *node_id),
+            focused_text.map(|(node_id, _)| (self.input_element.borrow().clone(), *node_id)),
+        );
 
         for (node_id, node) in &update.nodes {
             if Some(*node_id) == self.natively_realized {
@@ -659,6 +681,7 @@ impl WebA11yAdapter {
     fn apply_native_realization(
         &mut self,
         claimed: Option<&(NodeId, Mirrored, PlatformNativeElement)>,
+        entry_name: Option<&(Option<String>, Option<String>)>,
     ) {
         let input_element = self.input_element.borrow().clone();
         let element: &web_sys::Element = input_element.as_ref();
@@ -666,6 +689,12 @@ impl WebA11yAdapter {
             && previous != input_element
         {
             clear_claim(previous.as_ref());
+            // A hidden conduit keeps the fixed name it was built with; an
+            // editing island keeps the name its page gave it.
+            let previous: &web_sys::Element = previous.as_ref();
+            if !previous.has_attribute(ISLAND_ATTRIBUTE) {
+                set_if_changed(previous, "aria-label", Some(FALLBACK_INPUT_NAME));
+            }
         }
         match claimed {
             // The capability is not needed here: it was declared above, and
@@ -675,20 +704,33 @@ impl WebA11yAdapter {
                 self.natively_realized = Some(*node_id);
                 self.claimed_element = Some(input_element.clone());
                 let _ = element.set_attribute(NODE_ATTRIBUTE, &node_id.0.to_string());
-                set_or_clear(element, "aria-label", read.label.as_deref());
-                set_or_clear(element, "aria-description", read.description.as_deref());
                 set_flag(element, "aria-disabled", read.disabled);
                 set_flag(element, "aria-required", read.required);
                 set_flag(element, "aria-readonly", read.read_only);
             }
             None => {
                 self.claimed_element = None;
-                if self.natively_realized.take().is_none() {
-                    return;
+                if self.natively_realized.take().is_some() {
+                    clear_claim(element);
                 }
-                clear_claim(element);
             }
         }
+        // The entry's name, for the one owner of the focused field's name.
+        // When the node is claimed the entry is the only element that carries
+        // it, because the mirror loop skips the claimed node; when it is not,
+        // the entry still holds keyboard focus and has to be named. Focus
+        // moving to another field rewrites both, and focus leaving every text
+        // field puts the fixed name back and drops the description.
+        let (label, description) = entry_name.map_or((None, None), |(label, description)| {
+            (label.as_deref(), description.as_deref())
+        });
+        // A page-owned editing island is named by its page, which drew the
+        // visible label beside it; the mirror never renames it.
+        if element.has_attribute(ISLAND_ATTRIBUTE) {
+            return;
+        }
+        set_if_changed(element, "aria-label", Some(conduit_name(label)));
+        set_if_changed(element, "aria-description", description);
     }
 
     /// Make the DOM children of `node_id` match its AccessKit children, in
@@ -738,14 +780,48 @@ fn set_or_clear(element: &web_sys::Element, attribute: &str, value: Option<&str>
     }
 }
 
+/// [`set_or_clear`], except that an attribute already holding the value is not
+/// written again: a steady frame must touch no DOM, and a rewrite of an
+/// identical name is a mutation assistive technology may announce.
+fn set_if_changed(element: &web_sys::Element, attribute: &str, value: Option<&str>) {
+    if element.get_attribute(attribute).as_deref() != value {
+        set_or_clear(element, attribute, value);
+    }
+}
+
 fn set_flag(element: &web_sys::Element, attribute: &str, set: bool) {
-    set_or_clear(element, attribute, set.then_some("true"));
+    set_or_clear(element, attribute, flag_value(set));
+}
+
+/// The value of an ARIA state that is either `true` or absent.
+///
+/// Absent rather than `"false"`, because that is how a node says it is not in
+/// the state, and it is what keeps a steady frame from writing anything.
+fn flag_value(set: bool) -> Option<&'static str> {
+    set.then_some("true")
+}
+
+/// The ARIA attributes that carry a node's availability and its explanation,
+/// each with the value it takes or `None` when it must be absent.
+///
+/// A disabled node is `aria-disabled="true"` on the mirror element itself,
+/// never a child standing in for the state, and the reason it is unavailable
+/// is the node's description, projected as `aria-description`. Held as one
+/// table so the projection is a pure function of the node and the mapping can
+/// be tested without a DOM.
+fn state_attributes(node: &Mirrored) -> [(&'static str, Option<&str>); 4] {
+    [
+        ("aria-description", node.description.as_deref()),
+        ("aria-disabled", flag_value(node.disabled)),
+        ("aria-required", flag_value(node.required)),
+        ("aria-readonly", flag_value(node.read_only)),
+    ]
 }
 
 fn write_node(element: &web_sys::Element, node: &Mirrored, scale_factor: f32) {
+    set_or_clear(element, "data-gpui-a11y-author-id", node.author_id.as_deref());
     set_or_clear(element, "role", node.role);
     set_or_clear(element, "aria-label", node.label.as_deref());
-    set_or_clear(element, "aria-description", node.description.as_deref());
     set_or_clear(element, "aria-valuetext", node.value_text.as_deref());
     // A leaf's value is its content. `Mirrored::read` only fills this in for a
     // node with no children, so this can never replace a mirrored subtree.
@@ -755,9 +831,9 @@ fn write_node(element: &web_sys::Element, node: &Mirrored, scale_factor: f32) {
         element.set_text_content(None);
     }
 
-    set_flag(element, "aria-disabled", node.disabled);
-    set_flag(element, "aria-required", node.required);
-    set_flag(element, "aria-readonly", node.read_only);
+    for (attribute, value) in state_attributes(node) {
+        set_or_clear(element, attribute, value);
+    }
     set_flag(element, "aria-multiselectable", node.multiselectable);
     set_flag(element, "aria-busy", node.busy);
     // `aria-hidden` is the projection of AccessKit's own hidden flag, so a node
@@ -904,4 +980,92 @@ pub(crate) fn publish_summary_source(source: Rc<dyn Fn() -> A11yMirrorSummary>) 
 /// GPUI's own `debug_a11y_tree_json`.
 pub fn a11y_mirror_summary() -> Option<A11yMirrorSummary> {
     SUMMARY_SOURCE.with(|cell| cell.borrow().as_ref().map(|source| source()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn projected(node: &accesskit::Node) -> Vec<(&'static str, Option<String>)> {
+        state_attributes(&Mirrored::read(node))
+            .into_iter()
+            .map(|(attribute, value)| (attribute, value.map(str::to_owned)))
+            .collect()
+    }
+
+    fn value_of(attributes: &[(&'static str, Option<String>)], name: &str) -> Option<String> {
+        attributes
+            .iter()
+            .find(|(attribute, _)| *attribute == name)
+            .and_then(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn a_disabled_node_projects_aria_disabled_and_its_reason() {
+        let mut node = accesskit::Node::new(Role::Button);
+        node.set_disabled();
+        node.set_description("Sign in to send");
+        let attributes = projected(&node);
+
+        assert_eq!(
+            value_of(&attributes, "aria-disabled").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            value_of(&attributes, "aria-description").as_deref(),
+            Some("Sign in to send")
+        );
+    }
+
+    #[test]
+    fn an_enabled_node_projects_none_of_them() {
+        let attributes = projected(&accesskit::Node::new(Role::Button));
+
+        assert_eq!(attributes.len(), 4);
+        assert!(attributes.iter().all(|(_, value)| value.is_none()));
+    }
+
+    #[test]
+    fn a_blank_description_is_absent_not_empty() {
+        let mut node = accesskit::Node::new(Role::Button);
+        node.set_description("  ");
+
+        assert_eq!(value_of(&projected(&node), "aria-description"), None);
+    }
+
+    #[test]
+    fn read_only_and_required_project_as_their_own_attributes() {
+        let mut node = accesskit::Node::new(Role::TextInput);
+        node.set_read_only();
+        node.set_required();
+        let attributes = projected(&node);
+
+        assert_eq!(
+            value_of(&attributes, "aria-readonly").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            value_of(&attributes, "aria-required").as_deref(),
+            Some("true")
+        );
+        assert_eq!(value_of(&attributes, "aria-disabled"), None);
+    }
+
+    #[test]
+    fn a_focused_inputs_own_label_names_the_entry() {
+        assert_eq!(conduit_name(Some("Search messages")), "Search messages");
+    }
+
+    #[test]
+    fn a_missing_or_blank_label_falls_back_to_the_fixed_name() {
+        assert_eq!(conduit_name(None), FALLBACK_INPUT_NAME);
+        assert_eq!(conduit_name(Some("")), FALLBACK_INPUT_NAME);
+        assert_eq!(conduit_name(Some("  \n")), FALLBACK_INPUT_NAME);
+        assert!(!FALLBACK_INPUT_NAME.is_empty());
+    }
+
+    #[test]
+    fn a_label_is_trimmed_but_never_replaced() {
+        assert_eq!(conduit_name(Some("  Title ")), "Title");
+    }
 }

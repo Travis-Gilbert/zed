@@ -1,0 +1,25 @@
+From b0ce2e8bc6f976dc832dae47558bf5dc2c15a2df Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 20:11:43 -0400
+Subject: [PATCH] fix(gpui_web): restore fallback claim before replacement
+ admission
+
+---
+ crates/gpui_web/src/ime_mirror.rs | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index 5af9666..307b63a 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -1154,6 +1154,7 @@ impl ImeMirror {
+         })));
+         self.island_native_tab.set(false);
+         self.text_claim.reset();
++        self.retired_built_claims.borrow_mut().clear();
+         self.island_counts.set(EditingIslandCounts::default());
+         let adoption = self
+             .island_adoption
+-- 
+2.53.0
+

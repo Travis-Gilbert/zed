@@ -139,6 +139,12 @@ impl TextSystem {
             .next()
     }
 
+    /// Observe the platform face behind an existing font identifier.
+    /// `None` means the backend cannot expose it or the identifier is absent.
+    pub fn resolved_font_face(&self, id: FontId) -> Option<ResolvedFontFace> {
+        self.platform_text_system.resolved_font_face(id)
+    }
+
     /// Resolves the specified font, falling back to the default font stack if
     /// the font fails to load.
     ///
@@ -977,6 +983,47 @@ impl schemars::JsonSchema for FontWeight {
             "default": Self::default(),
             "description": "Font weight value between 100 (thin) and 900 (black)"
         })
+    }
+}
+
+/// Read-only identity of the face actually selected by a platform font system.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedFontFace {
+    family: SharedString,
+    post_script_name: SharedString,
+    weight: FontWeight,
+    style: FontStyle,
+}
+impl ResolvedFontFace {
+    /// Construct metadata from an already selected platform face.
+    pub fn new(
+        family: SharedString,
+        post_script_name: SharedString,
+        weight: FontWeight,
+        style: FontStyle,
+    ) -> Self {
+        Self {
+            family,
+            post_script_name,
+            weight,
+            style,
+        }
+    }
+    /// The selected face's primary family.
+    pub fn family(&self) -> &SharedString {
+        &self.family
+    }
+    /// The selected face's PostScript identity.
+    pub fn post_script_name(&self) -> &SharedString {
+        &self.post_script_name
+    }
+    /// The selected face's actual weight, which may differ from the request.
+    pub fn weight(&self) -> FontWeight {
+        self.weight
+    }
+    /// The selected face's actual style, which may differ from the request.
+    pub fn style(&self) -> FontStyle {
+        self.style
     }
 }
 

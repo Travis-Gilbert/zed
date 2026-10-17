@@ -1,5 +1,21 @@
 # Theorem Zed patch series
 
+The pin catch-up patch records browser prerequisites already present at
+`6d4d90754f7dde3e62afb6fe74a632c0b4660396` but absent from the older series.
+It changes no production source at the consumer pin. Replay now retains those
+exact pre-existing platform, single-line input and browser editing bytes before
+applying the native-motion extension.
+
+The native reduced-motion patch feeds macOS's NSWorkspace preference into
+GPUI's existing App policy. It owns its notification token and foreground task,
+coalesces wake signals through a bounded channel, and fences delivery after
+observer replacement. Unsupported platforms preserve the existing policy.
+`cargo nextest run --locked -p gpui --lib --features gpui_platform/runtime_shaders`
+checks the GPUI components. `cargo run --locked -p gpui_macos --example
+native_motion --features runtime_shaders` checks the actual macOS adapter;
+`GPUI_NATIVE_MOTION_WAIT_FOR_CHANGE=1` additionally waits for a manual OS toggle.
+Posted notification tests are not evidence of an actual System Settings change.
+
 This hard-fork series is applied in the order recorded by `series`. It is not
 an upstream contribution queue.
 
@@ -110,3 +126,161 @@ copy of the text in the user agent's font; section 11 grants the browser caret,
 selection, spellcheck and autocorrect and nothing more. `color: transparent`
 removes the duplicate glyphs and keeps the selection highlight, which paints
 behind text, and the caret, which has its own color property.
+
+The `aria_disabled` patch adds the one AccessKit state GPUI could not publish:
+`StatefulInteractiveElement::aria_disabled(bool)` writes the node's `disabled`
+flag and nothing else. It does not block input or change drawing, so a
+component that disables itself keeps owning both and the reader hears the
+state. `false` publishes nothing.
+
+The IME entry patch names the element that holds keyboard focus for canvas
+text entry. Every conduit is built with `aria-label="Text input"`; while a text
+input is focused, the accessibility adapter replaces that with the input's own
+label (and sets `aria-description` from its description), on the painted path
+as well as the browser-native one, and puts the fixed name back when focus
+leaves every text field. Names come from labels only: the node's value is never
+read. A blank label is treated as absent, because an empty `aria-label`
+suppresses name computation instead of supplying one. The same patch collects
+the availability attributes the mirror writes (`aria-disabled`,
+`aria-description`, `aria-required`, `aria-readonly`) into one pure table,
+`state_attributes`, which the unit tests exercise without a DOM; the
+projection itself was already on the mirror element, never a synthetic child.
+
+The editing island patch lets a page hand the window a visible textarea it
+created. While live, the island is the IME conduit: it shares the hidden
+conduit's listeners, so every edit is imported through the one path, and the
+mirror writes the focused input handler's whole document back as the smallest
+replacement (`minimal_replacement`, which never cuts a surrogate pair; unit
+tested). Focused writes go through `execCommand` so the browser keeps offering
+Undo, and browser history intents are routed to the document's one history
+through the keybinding path rather than imported. Selection direction is
+carried both ways through the new `set_text_selection`. The page keeps the
+element's placement and its accessible name.
+
+The platform-element drag and web tab-boundary patch lets a DOM-owned source
+start a typed drag through `App::start_drag`, which installs the same `AnyDrag`
+consumed by GPUI's existing drag-over and drop handlers. It refuses replacement
+of an active or platform-owned drag. Existing `stop_active_drag` cancels it;
+the platform-element test proves typed movement, exactly one drop and cancellation.
+No second drag controller or domain operation is introduced.
+
+Browser windows traverse tab stops without wrapping, clear GPUI focus at an
+edge and propagate the Tab action. `gpui_web` then blurs its input conduit and
+leaves the browser's default Tab traversal enabled. Desktop tab traversal stays
+cyclic. The non-wrapping map test covers both edges, disabled stops and the
+retained desktop cycle; the consumer browser oracle proves actual DOM handoff.
+
+The composing island replacement patch refuses `EditingIsland::adopt` before
+changing the current conduit or attaching listeners while an IME composition
+is open. A retained editor therefore remains authoritative after an attempted
+replacement. The consumer editing oracle attempts a replacement during a
+composition and checks refusal, the predecessor's live state and DOM identity,
+and the subsequent composition commit through the original listener path.
+
+## Styled input and explicit focus intent (patch 0044)
+
+`StyledEditingIsland` adopts a page-owned contenteditable root through the same
+conduit listeners, import, history and composition path as `EditingIsland`. The
+conduit owns literal text, UTF-16 directional selection and presentation spans.
+Resolved native styles are expected-text gated; composition and retired adoption
+incarnations refuse style writes. Restyling retains original browser Text nodes
+so Firefox continues emitting its native history intent. No user HTML is parsed.
+
+Explicit InputState focus requests can restore platform focus even when the
+native handle is already focused. Requests wait for the current input handler's
+paint and are cancelled by a changed focus owner. Native platform implementations
+retain the default no-op. Read-only selected-face metadata and an opt-in test
+context text-system constructor support actual font/caret qualification.
+
+Native focus intent and selected-face behavior tests pass. The same Rust DOM
+adapter passes 14 assertions on each of Chromium, WebKit and Firefox. Those
+scoped proofs do not replace the consumer's full retained editor, OS IME,
+composition/history, glyph geometry, or deployed product acceptance gates.
+
+## Staged native presentation (patch 0045)
+
+A cold visible root can prepare validated presentation metadata before canonical
+text has reached it. The existing mirror applies that metadata only after its
+own current, live conduit reconciles exactly the expected text and selection.
+Preparation never writes text or moves selection; the strict setter still
+refuses mismatched text. Active composition and retired adoption incarnations
+refuse preparation, and identical already-applied metadata remains ready.
+
+## Platform composition fact (patch 0046)
+
+`Window::is_text_composing` reads the platform's current composition phase.
+The web implementation returns its existing current-conduit flag, including
+an empty hidden-input composition before marked text exists. Other platforms
+retain the default false unless they report that fact. This observation never
+imports text, changes focus, or creates a second composition state. A native
+forwarding/phase-transition test and the web library wasm check qualify the API;
+consumer refusal tests remain separate.
+
+
+## Current input capability and platform claim (patch0047)
+
+A conduit handoff carries the current session's readonly capability before focus.
+Styled roots without a page-supplied tabindex remain focusable while readonly,
+matching the native input/textarea shortcut path; explicit tabindex is retained.
+
+The existing accessibility adapter's actual current text-entry association binds
+one semantic NodeId per adoption, including painted platforms. Presented islands
+retire the passive built conduit's AX/tab claim for that verified field or a
+nontext focus target. Unknown/hidden/inert warming preserves fallback, and a
+different native text field restores its captured prior aria-hidden/tabindex.
+Composition and current-adoption guards precede mutation. Idempotent live calls
+only reconcile changed attributes, without refocusing or granting editability.
+
+Locked gpui_web wasm library checks pass. The exact private helper compiled into
+a tiny WASM DOM proof passes23 controls in each of Chromium, WebKit and Firefox,
+including readonly refusal, explicit tabindex, original duplicate AX2→1, warm
+fallback, cross-control identity, once-only binding and successor reset. This is
+helper-level real-browser evidence; the full product backend journey and new
+artifact adoption/IME regressions remain independent acceptance gates.
+
+The replacement follow-up (patch0048) restores captured built claim attributes
+when adoption resets the verified field identity, before the successor is
+admitted. An unknown successor cannot retain its predecessor's AX/tab suppression.
+The locked wasm library check passes; full product replacement acceptance still
+runs against the next immutable consumer artifact.
+
+Patch0049 captures the adapter's synchronous current adopted/live text-entry
+identity while the island is warming. The native text role may disappear at DOM
+delegation, so waiting for visibility would miss that association. Retirement
+still requires presented plus verified identity; unknown or hidden warming never
+retires the fallback, and a different native field restores its claim.
+The locked gpui_web wasm check passes. The exact private helper browser proof
+now passes25 controls per engine, including the modeled warm-native-field to
+admitted-DOM/delegated-native-role transition. Actual product AX admission is
+still proved separately against the next immutable consumer artifact.
+
+## Focus keeps the stored caret (patch 0050)
+
+The document has one selection, and a sync of another conduit can leave it
+outside the conduit about to be focused. WebKit focuses a contenteditable root
+whose selection lies elsewhere by putting the caret at its start; the
+`selectionchange` that move queues used to be imported as the person's caret.
+A styled draft returning from Command therefore took its next keystroke at
+offset 0 in WebKit while Chromium kept it at the end. `ImeMirror::focus` now
+reasserts the stored selection synchronously after focusing, while the
+mirror's bookkeeping still describes the element, so the queued event finds
+nothing to import. Bookkeeping that no longer matches the element is left to
+the next sync's rebuild, as at a conduit switch.
+
+The locked gpui_web wasm library check passes. Product acceptance is the
+TheoremWeb composer oracle's parked-draft return on WebKit against the next
+consumer artifact.
+
+## Sizing without ResizeObserver (patch 0051)
+
+The ResizeObserver callback was the only path that sized a web window. A
+browser without the observer kept the canvas's 1x1 backing store and zero GPUI
+bounds, so nothing painted, including the native fallbacks a missing capability
+is meant to leave working. The observer's measurement now feeds one
+`apply_canvas_size`, and a window created without an observer measures its
+canvas once at creation and again on every window `resize`, through the same
+path.
+
+The locked gpui_web wasm library check passes. Product acceptance is the
+TheoremWeb appearance oracle's capability-verified path with ResizeObserver
+removed, against the next consumer artifact.

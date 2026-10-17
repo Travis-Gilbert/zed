@@ -1,0 +1,54 @@
+From b38984bbd6a4d887eb3e84817f61f8233e29b8c2 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Sat, 17 Oct 2026 16:14:01 -0400
+Subject: [PATCH] fix(gpui-web): keep the stored caret when focus returns to a
+ conduit
+
+WebKit puts the caret at the start of a contenteditable root it focuses
+when the document selection lies elsewhere, and a sync of another conduit
+can leave it there. The selectionchange that move queues was imported as
+the person's caret, so a draft returning from Command took its next
+keystroke at offset 0. ImeMirror::focus now reasserts the stored selection
+synchronously after focusing, while its bookkeeping still describes the
+element; the queued event then finds nothing to import.
+---
+ crates/gpui_web/src/ime_mirror.rs | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index e5436c339f..28f2c0186f 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -1008,7 +1008,28 @@ impl ImeMirror {
+     }
+ 
+     pub(crate) fn focus(&self) {
+-        self.live_conduit().as_element().focus().ok();
++        let conduit = self.live_conduit();
++        if conduit.as_element().focus().is_err() {
++            return;
++        }
++        // The document has one selection, and a sync of another conduit can
++        // leave it outside this one. Focusing a contenteditable root then puts
++        // the caret at its start (WebKit), and the `selectionchange` that move
++        // queues would import the browser's caret as the person's. Restored
++        // here, synchronously, the event finds the stored selection and
++        // imports nothing. Bookkeeping that no longer describes the element
++        // belongs to the next sync's rebuild instead.
++        if conduit.element.value() != *self.text.borrow() {
++            return;
++        }
++        let (start, end) = self.selection.get();
++        let reversed = self.selection_reversed.get();
++        if conduit.element.selection_start() != Some(start)
++            || conduit.element.selection_end() != Some(end)
++            || conduit.element.selection_reversed() != reversed
++        {
++            conduit.element.set_selection_range(start, end, reversed);
++        }
+     }
+ 
+     pub(crate) fn is_focused(&self) -> bool {
+-- 
+2.53.0
+

@@ -1,0 +1,1346 @@
+From e4f26718dedb7097933b789edd26e16da3969836 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 02:40:40 -0400
+Subject: [PATCH] feat(gpui_web): adopt a page-owned editing island as the IME
+ conduit
+
+A page may hand GPUI a visible textarea it created and placed. While the
+island is live it is the window's conduit: it receives the same input,
+selection, composition, paste and history listeners as the hidden
+conduit, and the mirror writes the focused input handler's whole
+document back to it as the smallest replacement (execCommand while
+focused, so the element's own undo stack stays enabled; a plain value
+write otherwise). The page owns placement and the accessible name; the
+mirror never moves, restyles or renames it.
+
+- Direction travels both ways: selectionchange imports a backward
+  selection through the new set_text_selection(UTF16Selection), and the
+  sync writes it back with setSelectionRange's direction.
+- The mirror's own writes are recognized by state and counted as echoes,
+  never imported.
+- historyUndo/historyRedo from beforeinput, or from input when
+  beforeinput is absent, are routed once through the keybinding path to
+  the document's single history; the element's diff is never imported.
+- A composition is checkpointed when it begins so its end can tell a
+  commit from a cancel; the checkpoint never restores text.
+- EditingIsland (adopt, set_live, counts, composing; Drop releases) is
+  the public surface, and EditingIslandCounts reports what it did.
+- gpui: InputHandler and EntityInputHandler gain set_text_selection,
+  defaulting to set_selected_text_range.
+---
+ crates/gpui/src/input.rs              |  15 +
+ crates/gpui/src/platform.rs           |  20 +
+ crates/gpui_web/Cargo.toml            |   1 +
+ crates/gpui_web/src/a11y.rs           |  15 +-
+ crates/gpui_web/src/editing_island.rs | 100 +++++
+ crates/gpui_web/src/events.rs         | 170 +++++++-
+ crates/gpui_web/src/gpui_web.rs       |   3 +
+ crates/gpui_web/src/ime_mirror.rs     | 553 +++++++++++++++++++++++++-
+ crates/gpui_web/src/window.rs         |   5 +
+ 9 files changed, 839 insertions(+), 43 deletions(-)
+ create mode 100644 crates/gpui_web/src/editing_island.rs
+
+diff --git a/crates/gpui/src/input.rs b/crates/gpui/src/input.rs
+index 4167aa0..f267cff 100644
+--- a/crates/gpui/src/input.rs
++++ b/crates/gpui/src/input.rs
+@@ -90,6 +90,16 @@ pub trait EntityInputHandler: 'static + Sized {
+     ) {
+     }
+ 
++    /// See [`InputHandler::set_text_selection`] for details
++    fn set_text_selection(
++        &mut self,
++        selection: UTF16Selection,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        self.set_selected_text_range(selection.range, window, cx);
++    }
++
+     /// See [`InputHandler::text_length_utf16`] for details
+     fn text_length_utf16(
+         &mut self,
+@@ -245,6 +255,11 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
+         })
+     }
+ 
++    fn set_text_selection(&mut self, selection: UTF16Selection, window: &mut Window, cx: &mut App) {
++        self.view
++            .update(cx, |view, cx| view.set_text_selection(selection, window, cx))
++    }
++
+     fn element_bounds(&mut self, _window: &mut Window, _cx: &mut App) -> Option<Bounds<Pixels>> {
+         Some(self.element_bounds)
+     }
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index fd05ca3..7a013e1 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1824,6 +1824,13 @@ impl PlatformInputHandler {
+             .ok();
+     }
+ 
++    /// See [`InputHandler::set_text_selection`].
++    pub fn set_text_selection(&mut self, selection: UTF16Selection) {
++        self.cx
++            .update(|window, cx| self.handler.set_text_selection(selection, window, cx))
++            .ok();
++    }
++
+     /// See [`InputHandler::element_bounds`].
+     pub fn element_bounds(&mut self) -> Option<Bounds<Pixels>> {
+         self.cx
+@@ -2012,6 +2019,19 @@ pub trait InputHandler: 'static {
+     ) {
+     }
+ 
++    /// Set the user's selection together with its direction.
++    ///
++    /// The directional form of [`Self::set_selected_text_range`], for
++    /// platforms whose text machinery reports which end of the selection is
++    /// the focus: a browser `<textarea>` reports `selectionDirection`, and a
++    /// backwards selection imported without it would put the caret at the
++    /// wrong end. `selection.reversed` means the focus is at `range.start`.
++    /// The default drops the direction, which is what a handler that keeps
++    /// no direction can honor.
++    fn set_text_selection(&mut self, selection: UTF16Selection, window: &mut Window, cx: &mut App) {
++        self.set_selected_text_range(selection.range, window, cx);
++    }
++
+     /// Get the bounds of the focused text element in window coordinates, if known.
+     ///
+     /// This is the pull counterpart to the [`PlatformWindow::update_ime_position`]
+diff --git a/crates/gpui_web/Cargo.toml b/crates/gpui_web/Cargo.toml
+index d7f0f82..344c610 100644
+--- a/crates/gpui_web/Cargo.toml
++++ b/crates/gpui_web/Cargo.toml
+@@ -57,6 +57,7 @@ web-sys = { version = "0.3", features = [
+     "File",
+     "FileList",
+     "HtmlCanvasElement",
++    "HtmlDocument",
+     "HtmlElement",
+     "HtmlInputElement",
+     "HtmlTextAreaElement",
+diff --git a/crates/gpui_web/src/a11y.rs b/crates/gpui_web/src/a11y.rs
+index ac1b4e9..f48deda 100644
+--- a/crates/gpui_web/src/a11y.rs
++++ b/crates/gpui_web/src/a11y.rs
+@@ -39,7 +39,7 @@ use gpui::accesskit::{self, Action, ActionRequest, Live, NodeId, Rect, Role, Tog
+ use wasm_bindgen::JsCast;
+ use wasm_bindgen::prelude::*;
+ 
+-use crate::ime_mirror::{FALLBACK_INPUT_NAME, conduit_name};
++use crate::ime_mirror::{FALLBACK_INPUT_NAME, ISLAND_ATTRIBUTE, conduit_name};
+ use crate::native_element::NativeElements;
+ 
+ /// The attribute that carries a node's AccessKit id on its mirror element.
+@@ -677,8 +677,12 @@ impl WebA11yAdapter {
+             && previous != input_element
+         {
+             clear_claim(previous.as_ref());
+-            // A hidden conduit keeps the fixed name it was built with.
+-            set_if_changed(previous.as_ref(), "aria-label", Some(FALLBACK_INPUT_NAME));
++            // A hidden conduit keeps the fixed name it was built with; an
++            // editing island keeps the name its page gave it.
++            let previous: &web_sys::Element = previous.as_ref();
++            if !previous.has_attribute(ISLAND_ATTRIBUTE) {
++                set_if_changed(previous, "aria-label", Some(FALLBACK_INPUT_NAME));
++            }
+         }
+         match claimed {
+             // The capability is not needed here: it was declared above, and
+@@ -708,6 +712,11 @@ impl WebA11yAdapter {
+         let (label, description) = entry_name.map_or((None, None), |(label, description)| {
+             (label.as_deref(), description.as_deref())
+         });
++        // A page-owned editing island is named by its page, which drew the
++        // visible label beside it; the mirror never renames it.
++        if element.has_attribute(ISLAND_ATTRIBUTE) {
++            return;
++        }
+         set_if_changed(element, "aria-label", Some(conduit_name(label)));
+         set_if_changed(element, "aria-description", description);
+     }
+diff --git a/crates/gpui_web/src/editing_island.rs b/crates/gpui_web/src/editing_island.rs
+new file mode 100644
+index 0000000..4979b31
+--- /dev/null
++++ b/crates/gpui_web/src/editing_island.rs
+@@ -0,0 +1,100 @@
++//! A page-owned, visible text field adopted as the window's IME conduit.
++//!
++//! The page creates and places the element; GPUI never moves, restyles, or
++//! renames it. While the island is live it receives exactly the listeners
++//! the hidden conduit has, so input, selection, composition, paste, and
++//! history reach the focused input handler through the one import path, and
++//! the mirror writes the handler's document back to it as the smallest
++//! replacement. The input handler stays the only owner of the text, the
++//! selection, the composition, and the history: the element is a view of
++//! them that the browser may edit.
++
++use std::{cell::RefCell, rc::Weak};
++
++use crate::{events::EventListenerHandle, ime_mirror::EditingIslandCounts, window::WebWindowInner};
++
++thread_local! {
++    static WINDOW: RefCell<Weak<WebWindowInner>> = const { RefCell::new(Weak::new()) };
++}
++
++/// Record the window that islands adopted on this thread attach to.
++pub(crate) fn publish_window(window: Weak<WebWindowInner>) {
++    WINDOW.with(|slot| *slot.borrow_mut() = window);
++}
++
++/// An adopted editing island. Dropping it releases the element back to the
++/// page and returns the window to its hidden conduit.
++pub struct EditingIsland {
++    window: Weak<WebWindowInner>,
++    element: web_sys::HtmlTextAreaElement,
++    _listeners: Vec<EventListenerHandle>,
++}
++
++impl EditingIsland {
++    /// Adopt `element` as the window's editing island, or `None` when no
++    /// window has opened on this thread.
++    pub fn adopt(element: web_sys::HtmlTextAreaElement) -> Option<Self> {
++        let window = WINDOW.with(|slot| slot.borrow().clone());
++        let inner = window.upgrade()?;
++        inner.ime_mirror.adopt_island(element.clone());
++        let listeners = inner.attach_input_listeners(element.as_ref());
++        Some(Self {
++            window,
++            element,
++            _listeners: listeners,
++        })
++    }
++
++    /// The adopted element.
++    pub fn element(&self) -> &web_sys::HtmlTextAreaElement {
++        &self.element
++    }
++
++    /// Make the island the live conduit (`true`) or return input to the
++    /// hidden conduit (`false`). Returns whether the island is now live; a
++    /// change is refused while a composition is open, because moving the
++    /// conduit would end it without a commit.
++    pub fn set_live(&self, live: bool) -> bool {
++        let Some(inner) = self.window.upgrade() else {
++            return false;
++        };
++        if inner.is_composing.get() && live != inner.ime_mirror.island_is_live() {
++            return inner.ime_mirror.island_is_live();
++        }
++        let now_live = inner.ime_mirror.set_island_live(&inner, live);
++        if now_live {
++            crate::ime_mirror::ImeMirror::schedule_sync(&inner);
++        }
++        now_live
++    }
++
++    /// Whether the island is the live conduit.
++    pub fn is_live(&self) -> bool {
++        self.window
++            .upgrade()
++            .is_some_and(|inner| inner.ime_mirror.island_is_live())
++    }
++
++    /// Whether a composition is open on the window.
++    pub fn composing(&self) -> bool {
++        self.window
++            .upgrade()
++            .is_some_and(|inner| inner.is_composing.get())
++    }
++
++    /// What the island has done since it was adopted.
++    pub fn counts(&self) -> EditingIslandCounts {
++        self.window
++            .upgrade()
++            .map(|inner| inner.ime_mirror.island_counts())
++            .unwrap_or_default()
++    }
++}
++
++impl Drop for EditingIsland {
++    fn drop(&mut self) {
++        if let Some(inner) = self.window.upgrade() {
++            inner.ime_mirror.release_island(&inner, &self.element);
++        }
++    }
++}
+diff --git a/crates/gpui_web/src/events.rs b/crates/gpui_web/src/events.rs
+index 128ae84..40c6223 100644
+--- a/crates/gpui_web/src/events.rs
++++ b/crates/gpui_web/src/events.rs
+@@ -5,7 +5,7 @@ use gpui::{
+     Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
+     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
+     Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
+-    point, px,
++    UTF16Selection, point, px,
+ };
+ use wasm_bindgen::prelude::*;
+ 
+@@ -198,23 +198,41 @@ impl WebWindowInner {
+     /// DOM listener owns its closure: sharing one would mean routing every
+     /// event through a borrow to get at it, for elements that are never both
+     /// focused at once.
++    ///
++    /// The handler is also kept, so that an element the page adopts after the
++    /// window exists -- an editing island -- is given this same handler by
++    /// [`Self::attach_input_listeners`] rather than a second implementation of
++    /// the input path.
+     fn listen_input(
+         self: &Rc<Self>,
+         event_name: &'static str,
+         handler: impl FnMut(JsValue) + 'static,
+     ) -> Vec<EventListenerHandle> {
+-        let targets = self.ime_mirror.event_targets();
+-        if let [target] = targets.as_slice() {
+-            return vec![EventListenerHandle::add(target, event_name, handler)];
+-        }
+-        let handler = Rc::new(RefCell::new(handler));
+-        targets
++        let handler: SharedListener = Rc::new(RefCell::new(handler));
++        // Weak: the handler holds the window, and the listeners attached
++        // below hold the handler, so a strong reference here would be a cycle.
++        self.input_listeners
++            .borrow_mut()
++            .push((event_name, Rc::downgrade(&handler)));
++        self.ime_mirror
++            .event_targets()
+             .into_iter()
+-            .map(|target| {
+-                let handler = Rc::clone(&handler);
+-                EventListenerHandle::add(&target, event_name, move |event: JsValue| {
+-                    (handler.borrow_mut())(event)
+-                })
++            .map(|target| attach_shared(&target, event_name, &handler))
++            .collect()
++    }
++
++    /// Attach every input-path listener to `target`, an element adopted after
++    /// the window was created. The handles detach them when dropped.
++    pub(crate) fn attach_input_listeners(
++        &self,
++        target: &web_sys::EventTarget,
++    ) -> Vec<EventListenerHandle> {
++        self.input_listeners
++            .borrow()
++            .iter()
++            .filter_map(|(event_name, handler)| {
++                let handler = handler.upgrade()?;
++                Some(attach_shared(target, event_name, &handler))
+             })
+             .collect()
+     }
+@@ -889,12 +907,37 @@ impl WebWindowInner {
+         self.listen_input("input", move |event: JsValue| {
+             let event: web_sys::InputEvent = event.unchecked_into();
+ 
++            // The mirror's own minimal-diff write on the editing island
++            // reaches the element as an ordinary edit; the document already
++            // holds it.
++            if this.ime_mirror.is_writing() {
++                this.ime_mirror.note_island(|counts| counts.echoes += 1);
++                return;
++            }
++
+             // Composition text is delivered through the composition events;
+             // the mirror is reconciled once on compositionend.
+             if this.is_composing.get() || event.is_composing() {
+                 return;
+             }
+ 
++            // A browser undo or redo (context menu, Edit menu) already
++            // changed the element from the element's own stack. That change
++            // is never imported: the document's one history performs the
++            // command, and the sync writes its result back over the
++            // element. When `beforeinput` carried the intent the command is
++            // already routed; without it, route it now.
++            if let Some((key, modifiers)) = history_keystroke(&event.input_type(), this.is_mac) {
++                if !this.ime_mirror.take_routed_history() {
++                    this.ime_mirror.note_island(|counts| counts.history += 1);
++                    this.dispatch_synthetic_keystroke(key, modifiers);
++                }
++                this.ime_mirror.adopt_element_state();
++                this.ime_mirror.reject_selection_import();
++                this.schedule_ime_mirror_sync();
++                return;
++            }
++
+             let new_value = this.ime_mirror.value();
+             let old_value = this.ime_mirror.stored_text();
+             if new_value == old_value {
+@@ -906,7 +949,9 @@ impl WebWindowInner {
+                 &old_value,
+                 &new_value,
+                 selection_start as usize..selection_end as usize,
+-                this.ime_mirror.selection_start().map(|caret| caret as usize),
++                this.ime_mirror
++                    .selection_start()
++                    .map(|caret| caret as usize),
+             );
+ 
+             let applied = this.with_input_handler(|handler| {
+@@ -926,6 +971,7 @@ impl WebWindowInner {
+             }
+ 
+             this.ime_mirror.adopt_element_state();
++            this.ime_mirror.note_island(|counts| counts.imports += 1);
+ 
+             // SPEC-THEOREMWEB-PWA-HTML-CANVAS-1.1 section 58 tracks
+             // "HTML-native editor input latency" as its own row. This is that
+@@ -939,9 +985,7 @@ impl WebWindowInner {
+             // early return is not an applied input, and a number that counted
+             // them would report the cost of deciding to do nothing.
+             if let Some(performance) = web_sys::window().and_then(|window| window.performance()) {
+-                crate::native_element::record_input_latency(
+-                    performance.now() - event.time_stamp(),
+-                );
++                crate::native_element::record_input_latency(performance.now() - event.time_stamp());
+             }
+         })
+     }
+@@ -986,7 +1030,10 @@ impl WebWindowInner {
+                     .element_selection_end()
+                     .unwrap_or(element_start);
+                 let (stored_start, stored_end) = this.ime_mirror.stored_selection();
+-                if (element_start, element_end) == (stored_start, stored_end) {
++                let element_reversed = this.ime_mirror.element_selection_reversed();
++                if (element_start, element_end) == (stored_start, stored_end)
++                    && element_reversed == this.ime_mirror.stored_selection_reversed()
++                {
+                     return;
+                 }
+                 let applied = this.with_input_handler(|handler| {
+@@ -1005,13 +1052,19 @@ impl WebWindowInner {
+                         return false;
+                     }
+                     let alignment = alignment.unwrap();
+-                    handler.set_selected_text_range(
+-                        alignment + element_start as usize..alignment + element_end as usize,
+-                    );
++                    // The direction travels with the range: a backward
++                    // selection made in the element stays backward in the
++                    // app, so Shift+Arrow extends it from the same end.
++                    handler.set_text_selection(UTF16Selection {
++                        range: alignment + element_start as usize..alignment + element_end as usize,
++                        reversed: element_reversed,
++                    });
+                     true
+                 });
+                 if applied == Some(true) {
+                     this.ime_mirror.adopt_element_state();
++                    this.ime_mirror
++                        .note_island(|counts| counts.selection_imports += 1);
+                 } else {
+                     // No import is coming for this move; without a forced
+                     // sync the mirror would keep deferring to it and show
+@@ -1036,12 +1089,28 @@ impl WebWindowInner {
+         self.listen_input("beforeinput", move |event: JsValue| {
+             let event: web_sys::InputEvent = event.unchecked_into();
+ 
++            if this.ime_mirror.is_writing() {
++                return;
++            }
++
+             // During composition the composition{update,end} handlers own
+             // the text.
+             if this.is_composing.get() || event.is_composing() {
+                 return;
+             }
+ 
++            // A browser undo or redo is routed to the document's history
++            // through the keybinding path, the same path the keyboard
++            // takes. The intent is not canceled: the element's own stack
++            // must stay non-empty for the browser to keep offering Undo,
++            // and the sync replaces whatever it did with the document's
++            // result.
++            if let Some((key, modifiers)) = history_keystroke(&event.input_type(), this.is_mac) {
++                this.ime_mirror.route_history();
++                this.dispatch_synthetic_keystroke(key, modifiers);
++                return;
++            }
++
+             match event.input_type().as_str() {
+                 // Enter means "submit", not "insert a newline into the
+                 // mirror": run it through the keybinding path instead of
+@@ -1150,6 +1219,7 @@ impl WebWindowInner {
+         let this = Rc::clone(self);
+         self.listen_input("compositionstart", move |_event: JsValue| {
+             this.is_composing.set(true);
++            this.ime_mirror.begin_composition();
+         })
+     }
+ 
+@@ -1188,6 +1258,7 @@ impl WebWindowInner {
+             // the IME mid-commit. The deferred sync reconciles any
+             // app-side divergence afterwards.
+             this.ime_mirror.adopt_element_state();
++            this.ime_mirror.end_composition();
+             this.schedule_ime_mirror_sync();
+         })
+     }
+@@ -1515,3 +1586,62 @@ mod tests {
+         assert!(!should_preserve_focused_input(true, false, result(true),));
+     }
+ }
++
++/// One input-path handler, shared by every element the input path is driven
++/// from. A DOM listener owns its closure, so each element gets a small
++/// forwarding closure and the handler itself exists once.
++pub(crate) type SharedListener = Rc<RefCell<dyn FnMut(JsValue)>>;
++
++/// The window's record of a [`SharedListener`], which must not keep it alive.
++pub(crate) type SharedListenerRecord = std::rc::Weak<RefCell<dyn FnMut(JsValue)>>;
++
++fn attach_shared(
++    target: &web_sys::EventTarget,
++    event_name: &'static str,
++    handler: &SharedListener,
++) -> EventListenerHandle {
++    let handler = Rc::clone(handler);
++    EventListenerHandle::add(target, event_name, move |event: JsValue| {
++        (handler.borrow_mut())(event)
++    })
++}
++
++/// The key press a browser history intent stands for on this platform, or
++/// `None` for any other input type.
++///
++/// These are the bindings the composer's own undo and redo answer to, so a
++/// context-menu Undo and Cmd-Z reach the same command.
++fn history_keystroke(input_type: &str, is_mac: bool) -> Option<(&'static str, Modifiers)> {
++    match (input_type, is_mac) {
++        ("historyUndo", true) => Some((
++            "z",
++            Modifiers {
++                platform: true,
++                ..Modifiers::default()
++            },
++        )),
++        ("historyRedo", true) => Some((
++            "z",
++            Modifiers {
++                platform: true,
++                shift: true,
++                ..Modifiers::default()
++            },
++        )),
++        ("historyUndo", false) => Some((
++            "z",
++            Modifiers {
++                control: true,
++                ..Modifiers::default()
++            },
++        )),
++        ("historyRedo", false) => Some((
++            "y",
++            Modifiers {
++                control: true,
++                ..Modifiers::default()
++            },
++        )),
++        _ => None,
++    }
++}
+diff --git a/crates/gpui_web/src/gpui_web.rs b/crates/gpui_web/src/gpui_web.rs
+index ae0fac3..0790751 100644
+--- a/crates/gpui_web/src/gpui_web.rs
++++ b/crates/gpui_web/src/gpui_web.rs
+@@ -8,6 +8,7 @@
+ mod a11y;
+ mod dispatcher;
+ mod display;
++mod editing_island;
+ mod events;
+ mod file_drop;
+ mod http_client;
+@@ -22,6 +23,8 @@ mod window;
+ pub use a11y::{A11yMirrorSummary, a11y_mirror_summary};
+ pub use dispatcher::WebDispatcher;
+ pub use display::WebDisplay;
++pub use editing_island::EditingIsland;
++pub use ime_mirror::EditingIslandCounts;
+ pub use file_drop::{WebFileDrop, web_file_drops};
+ pub use gpui_wgpu::WebBackendPreference;
+ pub use http_client::{FetchCredentials, FetchHttpClient};
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index 6b3905d..7a0534a 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -209,10 +209,29 @@ impl ConduitElement {
+         }
+     }
+ 
+-    fn set_selection_range(&self, start: u32, end: u32) {
++    /// Whether the browser's selection has its focus at the start.
++    ///
++    /// `selectionDirection` is the one place a text control says which end
++    /// of its selection moves next. A selection imported or written without
++    /// it lands the caret at the wrong end: Shift+Arrow then grows the
++    /// selection from the anchor a person did not pick.
++    fn selection_reversed(&self) -> bool {
++        let direction = match self {
++            Self::TextArea(element) => element.selection_direction(),
++            Self::Input(element) => element.selection_direction(),
++        };
++        direction.ok().flatten().as_deref() == Some("backward")
++    }
++
++    fn set_selection_range(&self, start: u32, end: u32, reversed: bool) {
++        let direction = if reversed { "backward" } else { "forward" };
+         match self {
+-            Self::TextArea(element) => element.set_selection_range(start, end).ok(),
+-            Self::Input(element) => element.set_selection_range(start, end).ok(),
++            Self::TextArea(element) => element
++                .set_selection_range_with_direction(start, end, direction)
++                .ok(),
++            Self::Input(element) => element
++                .set_selection_range_with_direction(start, end, direction)
++                .ok(),
+         };
+     }
+ 
+@@ -252,6 +271,53 @@ struct Conduit {
+     /// may serve.
+     capability: PlatformNativeElement,
+     element: ConduitElement,
++    /// Whether the page built this element and owns its box, style and name:
++    /// an editing island (see [`ImeMirror::adopt_island`]). The mirror drives
++    /// its value, selection and composition and nothing else.
++    page_owned: bool,
++}
++
++/// The conduit live now: one of the mirror's own, or the page's island.
++enum LiveConduit<'a> {
++    Built(&'a Conduit),
++    Island(Rc<Conduit>),
++}
++
++impl std::ops::Deref for LiveConduit<'_> {
++    type Target = Conduit;
++
++    fn deref(&self) -> &Conduit {
++        match self {
++            Self::Built(conduit) => conduit,
++            Self::Island(conduit) => conduit,
++        }
++    }
++}
++
++/// What an editing island's conduit has done, for read-only diagnostics.
++///
++/// Counted only while an island is live, so the numbers describe the island
++/// alone and never the canvas conduits beside it.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct EditingIslandCounts {
++    /// Values or selections the mirror wrote into the island.
++    pub writes: u64,
++    /// Input events the mirror's own writes raised, recognized and not
++    /// imported.
++    pub echoes: u64,
++    /// Browser edits imported into the document.
++    pub imports: u64,
++    /// Browser selection moves imported into the document.
++    pub selection_imports: u64,
++    /// Browser history commands (`historyUndo`, `historyRedo`) routed to the
++    /// application's own history.
++    pub history: u64,
++    /// Compositions begun on the island.
++    pub compositions_started: u64,
++    /// Compositions that ended with text.
++    pub compositions_committed: u64,
++    /// Compositions that ended leaving the island as it was at their start.
++    pub compositions_canceled: u64,
+ }
+ 
+ impl Conduit {
+@@ -337,6 +403,25 @@ pub(crate) struct ImeMirror {
+     /// selection has moved; a rejected import means no import is coming,
+     /// so the next sync must reassert the app's state instead of waiting.
+     selection_import_rejected: Cell<bool>,
++    /// Whether the element's selection, as of the last sync or import, has
++    /// its focus at the start. Stored beside `selection` so a move that only
++    /// flips the direction is still a move.
++    selection_reversed: Cell<bool>,
++    /// The page's editing island, while one is adopted.
++    island: RefCell<Option<Rc<Conduit>>>,
++    /// Whether the island, rather than a built conduit, is live.
++    island_live: Cell<bool>,
++    /// Set while the mirror itself edits the island through the browser's
++    /// editing commands, which raise `beforeinput` and `input` synchronously.
++    /// Those events are this module's echo, never an edit to import.
++    writing: Cell<bool>,
++    /// The island's text when a composition began, so its end can tell a
++    /// commit from a cancel.
++    composition_checkpoint: RefCell<Option<String>>,
++    /// A browser history command announced by `beforeinput` and already
++    /// routed, so the `input` that follows it does not route it twice.
++    history_routed: Cell<bool>,
++    island_counts: Cell<EditingIslandCounts>,
+ }
+ 
+ /// Whether the device's primary pointer is coarse (a touch screen). The
+@@ -367,7 +452,9 @@ impl ImeMirror {
+             .dyn_into()
+             .map_err(|e| anyhow::anyhow!("Created element is not a textarea: {e:?}"))?;
+         element.set_id(IME_INPUT_ELEMENT_ID);
+-        element.set_attribute("aria-label", FALLBACK_INPUT_NAME).ok();
++        element
++            .set_attribute("aria-label", FALLBACK_INPUT_NAME)
++            .ok();
+         let style = element.style();
+         // Both paths place the element in viewport coordinates, because the
+         // canvas fills the viewport: one `update_position` then serves both,
+@@ -426,6 +513,7 @@ impl ImeMirror {
+         let mut conduits = vec![Conduit {
+             capability: PlatformNativeElement::EditableLeaf,
+             element: ConduitElement::TextArea(element),
++            page_owned: false,
+         }];
+         // The single-line conduits are built where this window is
+         // browser-native, and built here rather than on first use, because the
+@@ -466,6 +554,13 @@ impl ImeMirror {
+             window_hint: Cell::new(0),
+             sync_scheduled: Cell::new(false),
+             selection_import_rejected: Cell::new(false),
++            selection_reversed: Cell::new(false),
++            island: RefCell::new(None),
++            island_live: Cell::new(false),
++            writing: Cell::new(false),
++            composition_checkpoint: RefCell::new(None),
++            history_routed: Cell::new(false),
++            island_counts: Cell::new(EditingIslandCounts::default()),
+         };
+         // Until an input handler asks otherwise, the element is an IME
+         // conduit, not a form field: browser-side text assistance would
+@@ -492,7 +587,9 @@ impl ImeMirror {
+             .dyn_into()
+             .map_err(|e| anyhow::anyhow!("Created element is not an input: {e:?}"))?;
+         element.set_id(conduit_element_id(capability));
+-        element.set_attribute("aria-label", FALLBACK_INPUT_NAME).ok();
++        element
++            .set_attribute("aria-label", FALLBACK_INPUT_NAME)
++            .ok();
+         // The attribute rather than the IDL property, and set before the
+         // element is in the document, so the browser builds the input the
+         // capability names rather than re-typing one it already made.
+@@ -519,6 +616,7 @@ impl ImeMirror {
+         let conduit = Conduit {
+             capability,
+             element: ConduitElement::Input(element),
++            page_owned: false,
+         };
+         Ok(conduit)
+     }
+@@ -649,8 +747,14 @@ impl ImeMirror {
+         let y = f32::from(bounds.origin.y);
+         let width = f32::from(bounds.size.width).max(1.0);
+         let height = f32::from(bounds.size.height).max(1.0);
+-        self.place(conduit, x, y, width, height);
+         self.published_bounds.set(Some([x, y, width, height]));
++        // The page lays its own editor out; GPUI's caret box belongs to the
++        // canvas leaf the island stands in for, so it is recorded and the
++        // island is left where the page put it.
++        if conduit.page_owned {
++            return;
++        }
++        self.place(&conduit, x, y, width, height);
+         // GPUI prepainted a caret box, so there is a live editable leaf and
+         // it is here. That is both the visibility signal and the repaint
+         // signal: the element moved, so its pixels are in the wrong place
+@@ -687,6 +791,9 @@ impl ImeMirror {
+ 
+     pub(crate) fn reset_position(&self) {
+         let conduit = self.live_conduit();
++        if conduit.page_owned {
++            return;
++        }
+         let style = conduit.as_element().style();
+         let mut properties = vec![("left", "0"), ("top", "0"), ("height", "1px")];
+         if self.native_elements.realization().is_browser_native() {
+@@ -731,16 +838,25 @@ impl ImeMirror {
+         }
+     }
+ 
+-    /// The conduit in the document, focused, drawn and claimed.
+-    fn live_conduit(&self) -> &Conduit {
++    /// The conduit in the document, focused, drawn and claimed: the page's
++    /// editing island while it is live, and otherwise the built conduit for
++    /// the capability in force.
++    fn live_conduit(&self) -> LiveConduit<'_> {
++        if self.island_live.get()
++            && let Some(island) = self.island.borrow().as_ref()
++        {
++            return LiveConduit::Island(Rc::clone(island));
++        }
+         let live = self.live.get();
+-        self.conduits
+-            .iter()
+-            .find(|conduit| conduit.capability == live)
+-            // The textarea is built unconditionally and is the first conduit,
+-            // so this is unreachable; it exists so that the accessors below
+-            // cannot fail open on a missing element.
+-            .unwrap_or(&self.conduits[0])
++        LiveConduit::Built(
++            self.conduits
++                .iter()
++                .find(|conduit| conduit.capability == live)
++                // The textarea is built unconditionally and is the first
++                // conduit, so this is unreachable; it exists so that the
++                // accessors below cannot fail open on a missing element.
++                .unwrap_or(&self.conduits[0]),
++        )
+     }
+ 
+     /// The capability whose element is driving the focused editable leaf.
+@@ -774,6 +890,11 @@ impl ImeMirror {
+     /// bracketed as a suppressed focus change, because a conduit swap is not
+     /// the window becoming inactive.
+     fn settle_conduit(&self, window: &WebWindowInner) {
++        // A live island is the editor the page chose for the focused leaf;
++        // capabilities choose among the built conduits only.
++        if self.island_live.get() {
++            return;
++        }
+         let wanted = self.capability_in_force();
+         let live = self.live.get();
+         if wanted == live {
+@@ -868,7 +989,8 @@ impl ImeMirror {
+     }
+ 
+     pub(crate) fn is_focused(&self) -> bool {
+-        let element: &web_sys::Element = self.live_conduit().as_element().as_ref();
++        let conduit = self.live_conduit();
++        let element: &web_sys::Element = conduit.as_element().as_ref();
+         web_sys::window()
+             .and_then(|window| window.document())
+             .and_then(|document| document.active_element())
+@@ -930,6 +1052,18 @@ impl ImeMirror {
+         let selection_start = self.selection_start().unwrap_or(0);
+         let selection_end = conduit.element.selection_end().unwrap_or(selection_start);
+         self.selection.set((selection_start, selection_end));
++        self.selection_reversed
++            .set(conduit.element.selection_reversed());
++    }
++
++    /// Whether the element's selection is backwards.
++    pub(crate) fn element_selection_reversed(&self) -> bool {
++        self.live_conduit().element.selection_reversed()
++    }
++
++    /// Whether the stored selection is backwards.
++    pub(crate) fn stored_selection_reversed(&self) -> bool {
++        self.selection_reversed.get()
+     }
+ 
+     /// Records that an element selection move could not be imported, so
+@@ -939,6 +1073,279 @@ impl ImeMirror {
+         self.selection_import_rejected.set(true);
+     }
+ 
++    // --- Editing islands --------------------------------------------------------
++    //
++    // An editing island is a text control the *page* built and draws: a
++    // visible `<textarea>` standing in for a canvas editable leaf. The page
++    // owns its box, its style and its name; this module owns what it owns of
++    // every conduit -- the value, the selection, composition and the edit
++    // import -- because there has to be exactly one writer of those or the
++    // element and the document drift apart. So an island is adopted as one
++    // more conduit, driven by the same listeners and the same coalesced sync,
++    // and the page never writes its value.
++    //
++    // It differs from a built conduit in what it mirrors. A built conduit is a
++    // window around the caret for an IME to read; an island is what a person
++    // reads, so it mirrors the whole document (within the editable range).
++
++    /// Adopt `element` as the window's editing island, replacing any island
++    /// adopted before it. It is not live until [`Self::set_island_live`].
++    pub(crate) fn adopt_island(&self, element: web_sys::HtmlTextAreaElement) {
++        let html: &web_sys::Element = element.as_ref();
++        // The island names itself. The accessibility adapter reads this to
++        // leave the page's label alone when it claims the island for the
++        // focused node.
++        html.set_attribute(ISLAND_ATTRIBUTE, "").ok();
++        self.island.replace(Some(Rc::new(Conduit {
++            capability: PlatformNativeElement::EditableLeaf,
++            element: ConduitElement::TextArea(element),
++            page_owned: true,
++        })));
++        self.island_counts.set(EditingIslandCounts::default());
++    }
++
++    /// Forget the island, if `element` is it. A live island hands the input
++    /// path back to the built conduits first.
++    pub(crate) fn release_island(
++        &self,
++        window: &WebWindowInner,
++        element: &web_sys::HtmlTextAreaElement,
++    ) {
++        let is_island = self.island.borrow().as_ref().is_some_and(|island| {
++            matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element)
++        });
++        if !is_island {
++            return;
++        }
++        self.set_island_live(window, false);
++        self.island.replace(None);
++        let html: &web_sys::Element = element.as_ref();
++        html.remove_attribute(ISLAND_ATTRIBUTE).ok();
++    }
++
++    /// Make the island the live conduit, or hand the input path back to the
++    /// built conduits. Answers whether anything changed.
++    ///
++    /// Live means focused: the browser delivers keys, input and composition
++    /// to the focused element, so the island takes focus as it becomes live
++    /// and gives it to the built conduit when it stops, unless focus has
++    /// already gone somewhere else. Either move is bracketed as a suppressed
++    /// focus change, because swapping conduits is not the window becoming
++    /// inactive. A composition in progress is never moved: it belongs to the
++    /// element holding it.
++    pub(crate) fn set_island_live(&self, window: &WebWindowInner, live: bool) -> bool {
++        let Some(island) = self.island.borrow().clone() else {
++            return false;
++        };
++        if self.island_live.get() == live || window.is_composing.get() {
++            return false;
++        }
++        let built = {
++            let wanted = self.live.get();
++            self.conduits
++                .iter()
++                .find(|conduit| conduit.capability == wanted)
++                .unwrap_or(&self.conduits[0])
++        };
++        window.suppress_focus_status_events.set(true);
++        if live {
++            if island.as_element().focus().is_err() {
++                window.suppress_focus_status_events.set(false);
++                return false;
++            }
++            if let Some(layer) = self.layer.as_deref() {
++                layer.set_visible(built.as_element(), false);
++            }
++            self.island_live.set(true);
++            self.live_element.replace(island.as_element().clone());
++        } else {
++            let focused = web_sys::window()
++                .and_then(|window| window.document())
++                .and_then(|document| document.active_element())
++                .is_some_and(|active| {
++                    let element: &web_sys::Element = island.as_element().as_ref();
++                    &active == element
++                });
++            self.island_live.set(false);
++            self.live_element.replace(built.as_element().clone());
++            if focused {
++                built.as_element().focus().ok();
++            }
++        }
++        window.suppress_focus_status_events.set(false);
++        // As at a conduit switch: the element that became live holds none of
++        // the bookkeeping, so the next sync is a rebuild.
++        self.text.borrow_mut().clear();
++        self.selection.set((0, 0));
++        self.selection_reversed.set(false);
++        self.window_hint.set(0);
++        self.composition_checkpoint.replace(None);
++        self.history_routed.set(false);
++        if live {
++            let configuration = self.configuration.borrow().clone();
++            self.apply_configuration_to(&island, &configuration);
++        }
++        true
++    }
++
++    /// Whether the island is the live conduit.
++    pub(crate) fn island_is_live(&self) -> bool {
++        self.island_live.get() && self.island.borrow().is_some()
++    }
++
++    /// What the island's conduit has done since it was adopted.
++    pub(crate) fn island_counts(&self) -> EditingIslandCounts {
++        self.island_counts.get()
++    }
++
++    /// Count something the live island did. Nothing is counted while a built
++    /// conduit is live: these numbers describe the island alone.
++    pub(crate) fn note_island(&self, count: impl FnOnce(&mut EditingIslandCounts)) {
++        if self.island_is_live() {
++            let mut counts = self.island_counts.get();
++            count(&mut counts);
++            self.island_counts.set(counts);
++        }
++    }
++
++    /// Whether an event now is the echo of the mirror's own write.
++    pub(crate) fn is_writing(&self) -> bool {
++        self.writing.get()
++    }
++
++    /// A composition began on the live conduit: remember the text it began
++    /// from, so its end can tell a commit from a cancel.
++    pub(crate) fn begin_composition(&self) {
++        if !self.island_is_live() {
++            return;
++        }
++        self.composition_checkpoint
++            .replace(Some(self.live_conduit().element.value()));
++        self.note_island(|counts| counts.compositions_started += 1);
++    }
++
++    /// The composition ended with the element holding what it holds now.
++    ///
++    /// A composition that leaves the element as it was when it began was
++    /// canceled, whatever its last update said; anything else committed.
++    /// Only the classification uses the checkpoint: the document is never
++    /// restored from it, because edits that arrived after it began (the
++    /// commit itself, a remote edit) are newer than the checkpoint.
++    pub(crate) fn end_composition(&self) {
++        let Some(checkpoint) = self.composition_checkpoint.take() else {
++            return;
++        };
++        if self.live_conduit().element.value() == checkpoint {
++            self.note_island(|counts| counts.compositions_canceled += 1);
++        } else {
++            self.note_island(|counts| counts.compositions_committed += 1);
++        }
++    }
++
++    /// Record that a browser history command was routed from `beforeinput`,
++    /// so the `input` that may follow it routes nothing.
++    pub(crate) fn route_history(&self) {
++        self.history_routed.set(true);
++        self.note_island(|counts| counts.history += 1);
++    }
++
++    /// Take the record left by [`Self::route_history`].
++    pub(crate) fn take_routed_history(&self) -> bool {
++        self.history_routed.replace(false)
++    }
++
++    /// Bring the island to the document, whole.
++    ///
++    /// The value is written as the smallest replacement that turns the
++    /// element's text into the document's, through the browser's own editing
++    /// command when the island has focus. Two things follow from writing it
++    /// that way rather than assigning `value`: the caret and the scroll
++    /// position outside the replaced span stay where the reader left them,
++    /// and the browser records the write in the control's undo stack, which
++    /// is what keeps its Undo and Redo commands available to route back into
++    /// the application's history. The command raises `beforeinput` and
++    /// `input` synchronously; `writing` marks them as this module's echo.
++    fn sync_island(
++        &self,
++        window: &WebWindowInner,
++        conduit: &Conduit,
++        selection: &gpui::UTF16Selection,
++        editable_range: Option<std::ops::Range<usize>>,
++    ) {
++        let range = match editable_range {
++            Some(range) => range,
++            None => {
++                let length = window
++                    .with_input_handler(|handler| handler.text_length_utf16())
++                    .flatten();
++                0..length.unwrap_or(usize::MAX / 2)
++            }
++        };
++        let mut adjusted = None;
++        let text = window
++            .with_input_handler(|handler| handler.text_for_range(range.clone(), &mut adjusted))
++            .flatten()
++            .unwrap_or_default();
++        let start = adjusted.unwrap_or(range).start;
++        let current = conduit.element.value();
++        if current != text {
++            self.write_island_value(conduit, &current, &text);
++        }
++        *self.text.borrow_mut() = conduit.element.value();
++        self.window_hint.set(start);
++        let selection_start = selection.range.start.saturating_sub(start) as u32;
++        let selection_end = selection.range.end.saturating_sub(start) as u32;
++        if conduit.element.selection_start() != Some(selection_start)
++            || conduit.element.selection_end() != Some(selection_end)
++            || conduit.element.selection_reversed() != selection.reversed
++        {
++            conduit
++                .element
++                .set_selection_range(selection_start, selection_end, selection.reversed);
++            self.note_island(|counts| counts.writes += 1);
++        }
++        self.selection.set((
++            conduit.element.selection_start().unwrap_or(selection_start),
++            conduit.element.selection_end().unwrap_or(selection_end),
++        ));
++        self.selection_reversed
++            .set(conduit.element.selection_reversed());
++    }
++
++    fn write_island_value(&self, conduit: &Conduit, current: &str, text: &str) {
++        let (start, removed_end, inserted) = minimal_replacement(current, text);
++        let element: &web_sys::Element = conduit.as_element().as_ref();
++        let document = element.owner_document();
++        let focused = document
++            .as_ref()
++            .and_then(|document| document.active_element())
++            .is_some_and(|active| &active == element);
++        if focused && let Some(document) = document {
++            let document: web_sys::HtmlDocument = document.unchecked_into();
++            conduit
++                .element
++                .set_selection_range(start as u32, removed_end as u32, false);
++            self.writing.set(true);
++            let command = if inserted.is_empty() {
++                "delete"
++            } else {
++                "insertText"
++            };
++            let done = document
++                .exec_command_with_show_ui_and_value(command, false, &inserted)
++                .unwrap_or(false);
++            self.writing.set(false);
++            if done && conduit.element.value() == text {
++                self.note_island(|counts| counts.writes += 1);
++                return;
++            }
++        }
++        // Unfocused (the command edits the focused element only), or a
++        // browser whose command did not produce the document: assign it.
++        conduit.element.set_value(text);
++        self.note_island(|counts| counts.writes += 1);
++    }
++
+     /// The window of the document to mirror, fitted to what the live
+     /// conduit can actually hold.
+     ///
+@@ -1075,6 +1482,7 @@ impl ImeMirror {
+                     mirror.text.borrow_mut().clear();
+                 }
+                 mirror.selection.set((0, 0));
++                mirror.selection_reversed.set(false);
+                 return;
+             };
+             // The mirrored window never crosses the handler's editable
+@@ -1086,9 +1494,17 @@ impl ImeMirror {
+                 .with_input_handler(|handler| handler.text_input_editable_range())
+                 .flatten();
+ 
++            // The page's editor shows the whole document, so it is synced
++            // whole; none of the window arithmetic below applies to it.
++            if conduit.page_owned {
++                mirror.sync_island(window, &conduit, &selection, editable_range);
++                return;
++            }
++
+             if is_consistent(
+                 window,
+                 &selection.range,
++                selection.reversed,
+                 editable_range.as_ref(),
+                 MIN_EDGE_CHARS,
+             ) {
+@@ -1103,6 +1519,7 @@ impl ImeMirror {
+             if move_selection_within_window(
+                 window,
+                 &selection.range,
++                selection.reversed,
+                 editable_range.as_ref(),
+                 MIN_EDGE_CHARS,
+             ) {
+@@ -1139,10 +1556,13 @@ impl ImeMirror {
+             let selection_end = selection.range.end.saturating_sub(window_start) as u32;
+             if conduit.element.selection_start() != Some(selection_start)
+                 || conduit.element.selection_end() != Some(selection_end)
++                || conduit.element.selection_reversed() != selection.reversed
+             {
+-                conduit
+-                    .element
+-                    .set_selection_range(selection_start, selection_end);
++                conduit.element.set_selection_range(
++                    selection_start,
++                    selection_end,
++                    selection.reversed,
++                );
+             }
+             // Read the selection back rather than trusting the computed
+             // values: the browser clamps out-of-bounds positions, and a
+@@ -1154,10 +1574,47 @@ impl ImeMirror {
+                 actual_start.unwrap_or(selection_start),
+                 actual_end.unwrap_or(selection_end),
+             ));
++            mirror
++                .selection_reversed
++                .set(conduit.element.selection_reversed());
+         }
+     }
+ }
+ 
++/// The attribute an adopted editing island carries while it is adopted.
++pub(crate) const ISLAND_ATTRIBUTE: &str = "data-gpui-editing-island";
++
++/// The smallest replacement turning `current` into `text`, as
++/// `(start, removed_end, inserted)` in UTF-16 code units of `current`.
++///
++/// Neither end splits a surrogate pair: a replacement that began or ended
++/// between the two halves of an astral character would write half of one.
++fn minimal_replacement(current: &str, text: &str) -> (usize, usize, String) {
++    let old: Vec<u16> = current.encode_utf16().collect();
++    let new: Vec<u16> = text.encode_utf16().collect();
++    let mut prefix = old
++        .iter()
++        .zip(new.iter())
++        .take_while(|(left, right)| left == right)
++        .count();
++    if prefix > 0 && (0xD800..0xDC00).contains(&old[prefix - 1]) {
++        prefix -= 1;
++    }
++    let most = old.len().min(new.len()) - prefix;
++    let mut suffix = old
++        .iter()
++        .rev()
++        .zip(new.iter().rev())
++        .take(most)
++        .take_while(|(left, right)| left == right)
++        .count();
++    if suffix > 0 && (0xDC00..0xE000).contains(&new[new.len() - suffix]) {
++        suffix -= 1;
++    }
++    let inserted = String::from_utf16_lossy(&new[prefix..new.len() - suffix]);
++    (prefix, old.len() - suffix, inserted)
++}
++
+ /// The line-break-free segment of `text` that contains the caret, as
+ /// `(start, line)` in UTF-16 code units from `text`'s start.
+ ///
+@@ -1197,6 +1654,7 @@ fn line_containing(text: &str, caret: usize) -> (usize, &str) {
+ fn move_selection_within_window(
+     window: &WebWindowInner,
+     app_selection: &std::ops::Range<usize>,
++    reversed: bool,
+     editable_range: Option<&std::ops::Range<usize>>,
+     min_edge: usize,
+ ) -> bool {
+@@ -1262,7 +1720,7 @@ fn move_selection_within_window(
+     let conduit = mirror.live_conduit();
+     conduit
+         .element
+-        .set_selection_range(selection_start as u32, selection_end as u32);
++        .set_selection_range(selection_start as u32, selection_end as u32, reversed);
+     let actual_start = conduit.element.selection_start();
+     let actual_end = conduit.element.selection_end();
+     if actual_start != Some(selection_start as u32) || actual_end != Some(selection_end as u32) {
+@@ -1271,6 +1729,9 @@ fn move_selection_within_window(
+     mirror
+         .selection
+         .set((selection_start as u32, selection_end as u32));
++    mirror
++        .selection_reversed
++        .set(conduit.element.selection_reversed());
+     true
+ }
+ 
+@@ -1281,10 +1742,18 @@ fn move_selection_within_window(
+ fn is_consistent(
+     window: &WebWindowInner,
+     app_selection: &std::ops::Range<usize>,
++    reversed: bool,
+     editable_range: Option<&std::ops::Range<usize>>,
+     min_edge: usize,
+ ) -> bool {
+     let mirror = &window.ime_mirror;
++    // A selection that only changed direction is still a change: the
++    // element's caret is at the other end.
++    if mirror.selection_reversed.get() != reversed
++        || mirror.live_conduit().element.selection_reversed() != reversed
++    {
++        return false;
++    }
+     let (element_selection_start, element_selection_end) = mirror.selection.get();
+     let element_selection_start = element_selection_start as usize;
+     let element_selection_end = element_selection_end as usize;
+@@ -1361,3 +1830,47 @@ fn is_consistent(
+     // The element selection corresponds to the app selection end too?
+     app_selection.end.checked_sub(app_window_start) == Some(element_selection_end)
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::minimal_replacement;
++
++    /// Apply the replacement to `current` in UTF-16 and require `text`, and
++    /// that neither side of the cut splits a surrogate pair.
++    fn check(current: &str, text: &str) -> (usize, usize, String) {
++        let (start, end, inserted) = minimal_replacement(current, text);
++        let mut units: Vec<u16> = current.encode_utf16().collect();
++        assert!(start <= end && end <= units.len());
++        units.splice(start..end, inserted.encode_utf16());
++        assert_eq!(String::from_utf16(&units).unwrap(), text);
++        assert!(!inserted.contains('\u{FFFD}'), "the cut split a surrogate");
++        (start, end, inserted)
++    }
++
++    #[test]
++    fn replaces_only_what_changed() {
++        assert_eq!(
++            check("hello world", "hello brave world"),
++            (6, 6, "brave ".into())
++        );
++        assert_eq!(check("hello world", "hello"), (5, 11, String::new()));
++        assert_eq!(check("same", "same"), (4, 4, String::new()));
++        assert_eq!(check("", "new"), (0, 0, "new".into()));
++    }
++
++    #[test]
++    fn never_splits_a_surrogate_pair() {
++        // Two emoji share a high surrogate; a naive prefix would stop
++        // between the halves of the second one.
++        check("a😀b", "a😁b");
++        check("👩‍👩‍👧 z", "👩‍👩‍👦 z");
++        check("x😀", "x😀😀");
++        check("😀😀y", "😀y");
++    }
++
++    #[test]
++    fn keeps_combining_text_and_direction_marks_intact() {
++        check("e\u{301}x", "e\u{301}\u{300}x");
++        check("\u{202B}שלום\u{202C}", "\u{202B}שלום עולם\u{202C}");
++    }
++}
+diff --git a/crates/gpui_web/src/window.rs b/crates/gpui_web/src/window.rs
+index cda9ec0..7bd4d52 100644
+--- a/crates/gpui_web/src/window.rs
++++ b/crates/gpui_web/src/window.rs
+@@ -75,6 +75,9 @@ pub(crate) struct WebWindowInner {
+     pub(crate) last_physical_size: Cell<(u32, u32)>,
+     pub(crate) notify_scale: Cell<bool>,
+     pub(crate) is_composing: Cell<bool>,
++    /// Every input-path listener, kept so an element the page adopts later
++    /// (an editing island) receives the same handlers as the built conduits.
++    pub(crate) input_listeners: RefCell<Vec<(&'static str, crate::events::SharedListenerRecord)>>,
+     /// Set while `sync_virtual_keyboard` blur/focus-cycles the hidden input.
+     /// The cycle is a keyboard-visibility hint, not a real activity change;
+     /// letting the focus/blur listeners report it would re-enter GPUI
+@@ -238,6 +241,7 @@ impl WebWindow {
+             last_physical_size: Cell::new((0, 0)),
+             notify_scale: Cell::new(false),
+             is_composing: Cell::new(false),
++            input_listeners: RefCell::new(Vec::new()),
+             suppress_focus_status_events: Cell::new(false),
+             visual_viewport_probe: Cell::new((0.0, 0.0)),
+             gesture_start_visual_viewport_height: Cell::new(0.0),
+@@ -278,6 +282,7 @@ impl WebWindow {
+         }
+ 
+         let event_listeners = inner.register_event_listeners();
++        crate::editing_island::publish_window(Rc::downgrade(&inner));
+ 
+         Ok(Self {
+             inner,
+-- 
+2.53.0
+
