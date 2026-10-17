@@ -1008,7 +1008,28 @@ impl ImeMirror {
     }
 
     pub(crate) fn focus(&self) {
-        self.live_conduit().as_element().focus().ok();
+        let conduit = self.live_conduit();
+        if conduit.as_element().focus().is_err() {
+            return;
+        }
+        // The document has one selection, and a sync of another conduit can
+        // leave it outside this one. Focusing a contenteditable root then puts
+        // the caret at its start (WebKit), and the `selectionchange` that move
+        // queues would import the browser's caret as the person's. Restored
+        // here, synchronously, the event finds the stored selection and
+        // imports nothing. Bookkeeping that no longer describes the element
+        // belongs to the next sync's rebuild instead.
+        if conduit.element.value() != *self.text.borrow() {
+            return;
+        }
+        let (start, end) = self.selection.get();
+        let reversed = self.selection_reversed.get();
+        if conduit.element.selection_start() != Some(start)
+            || conduit.element.selection_end() != Some(end)
+            || conduit.element.selection_reversed() != reversed
+        {
+            conduit.element.set_selection_range(start, end, reversed);
+        }
     }
 
     pub(crate) fn is_focused(&self) -> bool {
