@@ -253,3 +253,20 @@ The locked gpui_web wasm check passes. The exact private helper browser proof
 now passes25 controls per engine, including the modeled warm-native-field to
 admitted-DOM/delegated-native-role transition. Actual product AX admission is
 still proved separately against the next immutable consumer artifact.
+
+## Focus keeps the stored caret (patch 0050)
+
+The document has one selection, and a sync of another conduit can leave it
+outside the conduit about to be focused. WebKit focuses a contenteditable root
+whose selection lies elsewhere by putting the caret at its start; the
+`selectionchange` that move queues used to be imported as the person's caret.
+A styled draft returning from Command therefore took its next keystroke at
+offset 0 in WebKit while Chromium kept it at the end. `ImeMirror::focus` now
+reasserts the stored selection synchronously after focusing, while the
+mirror's bookkeeping still describes the element, so the queued event finds
+nothing to import. Bookkeeping that no longer matches the element is left to
+the next sync's rebuild, as at a conduit switch.
+
+The locked gpui_web wasm library check passes. Product acceptance is the
+TheoremWeb composer oracle's parked-draft return on WebKit against the next
+consumer artifact.

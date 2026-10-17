@@ -36,3 +36,4 @@
 0047-gpui-current-input-capability-and-claim.patch
 0048-gpui-replacement-fallback-claim.patch
 0049-gpui-current-warm-text-claim.patch
+0050-gpui-web-focus-keeps-stored-caret.patch
