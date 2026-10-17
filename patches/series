@@ -37,3 +37,4 @@
 0048-gpui-replacement-fallback-claim.patch
 0049-gpui-current-warm-text-claim.patch
 0050-gpui-web-focus-keeps-stored-caret.patch
+0051-gpui-web-size-without-resize-observer.patch

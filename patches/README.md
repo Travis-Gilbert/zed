@@ -270,3 +270,17 @@ the next sync's rebuild, as at a conduit switch.
 The locked gpui_web wasm library check passes. Product acceptance is the
 TheoremWeb composer oracle's parked-draft return on WebKit against the next
 consumer artifact.
+
+## Sizing without ResizeObserver (patch 0051)
+
+The ResizeObserver callback was the only path that sized a web window. A
+browser without the observer kept the canvas's 1x1 backing store and zero GPUI
+bounds, so nothing painted, including the native fallbacks a missing capability
+is meant to leave working. The observer's measurement now feeds one
+`apply_canvas_size`, and a window created without an observer measures its
+canvas once at creation and again on every window `resize`, through the same
+path.
+
+The locked gpui_web wasm library check passes. Product acceptance is the
+TheoremWeb appearance oracle's capability-verified path with ResizeObserver
+removed, against the next consumer artifact.
