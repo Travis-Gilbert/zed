@@ -117,6 +117,9 @@ pub struct WebWindow {
     _raf_closure: Closure<dyn FnMut()>,
     _resize_observer: Option<web_sys::ResizeObserver>,
     _resize_observer_closure: Closure<dyn FnMut(js_sys::Array)>,
+    /// The window `resize` listener that measures the canvas when the
+    /// browser has no ResizeObserver.
+    _resize_fallback: Option<EventListenerHandle>,
     _event_listeners: WebEventListeners,
 }
 
@@ -280,6 +283,13 @@ impl WebWindow {
             inner.observe_canvas(observer);
             inner.watch_dpr_changes(observer);
         }
+        // Without ResizeObserver the canvas would keep its 1x1 backing store
+        // and the window its zero bounds: nothing paints, including every
+        // native fallback a missing capability is meant to leave working.
+        let resize_fallback = resize_observer.is_none().then(|| {
+            inner.measure_canvas();
+            inner.register_window_resize()
+        });
 
         let event_listeners = inner.register_event_listeners();
         crate::editing_island::publish_window(Rc::downgrade(&inner));
@@ -292,6 +302,7 @@ impl WebWindow {
             _raf_closure: raf_closure,
             _resize_observer: resize_observer,
             _resize_observer_closure: resize_observer_closure,
+            _resize_fallback: resize_fallback,
             _event_listeners: event_listeners,
         })
     }
@@ -306,7 +317,6 @@ impl WebWindow {
             };
 
             let dpr = inner.browser_window.device_pixel_ratio();
-            let dpr_f32 = dpr as f32;
 
             let (physical_width, physical_height, logical_width, logical_height) =
                 if inner.has_device_pixel_support {
@@ -329,91 +339,136 @@ impl WebWindow {
                     (pw, ph, lw, lh)
                 };
 
-            let scale_changed = inner.notify_scale.replace(false);
-            let prev = inner.last_physical_size.get();
-            let size_changed = prev != (physical_width, physical_height);
-
-            if !scale_changed && !size_changed {
-                return;
-            }
-            inner
-                .last_physical_size
-                .set((physical_width, physical_height));
-
-            // Skip rendering to a zero-size canvas (e.g. display:none).
-            if physical_width == 0 || physical_height == 0 {
-                {
-                    let mut s = inner.state.borrow_mut();
-                    s.bounds.size = Size::default();
-                    s.scale_factor = dpr_f32;
-                }
-                // Still fire the callback so GPUI knows the window is gone.
-                inner.with_callback(
-                    |callbacks| &mut callbacks.resize,
-                    |callback| callback(Size::default(), dpr_f32),
-                );
-                return;
-            }
-
-            let max_texture_dimension = inner.state.borrow().max_texture_dimension;
-            let clamped_width = physical_width.min(max_texture_dimension);
-            let clamped_height = physical_height.min(max_texture_dimension);
-
-            // Recompute the logical size from the clamped physical size so
-            // that scale_factor still maps GPUI's logical bounds exactly onto
-            // the surface; otherwise clamping would silently distort the
-            // effective scale.
-            let (logical_width, logical_height) =
-                if (clamped_width, clamped_height) != (physical_width, physical_height) {
-                    (
-                        (clamped_width as f64 / dpr) as f32,
-                        (clamped_height as f64 / dpr) as f32,
-                    )
-                } else {
-                    (logical_width, logical_height)
-                };
-
-            inner
-                .pending_physical_size
-                .set(Some((clamped_width, clamped_height)));
-
-            {
-                let mut s = inner.state.borrow_mut();
-                s.bounds.size = Size {
-                    width: px(logical_width),
-                    height: px(logical_height),
-                };
-                s.scale_factor = dpr_f32;
-            }
-
-            let new_size = Size {
-                width: px(logical_width),
-                height: px(logical_height),
-            };
-
-            inner.with_callback(
-                |callbacks| &mut callbacks.resize,
-                |callback| callback(new_size, dpr_f32),
-            );
-
-            // ResizeObserver runs after layout but before the browser paints.
-            // Render synchronously here so the newly resized CSS canvas is
-            // never presented with its previous backing image stretched into
-            // the new viewport dimensions.
-            inner.with_callback(
-                |callbacks| &mut callbacks.request_frame,
-                |callback| {
-                    callback(RequestFrameOptions {
-                        require_presentation: true,
-                        force_render: true,
-                    })
-                },
+            inner.apply_canvas_size(
+                physical_width,
+                physical_height,
+                logical_width,
+                logical_height,
+                dpr,
             );
         })
     }
 }
 
 impl WebWindowInner {
+    /// Adopts one measurement of the canvas, from the ResizeObserver or from
+    /// the fallback that stands in for it, as the window's size.
+    fn apply_canvas_size(
+        &self,
+        physical_width: u32,
+        physical_height: u32,
+        logical_width: f32,
+        logical_height: f32,
+        dpr: f64,
+    ) {
+        let dpr_f32 = dpr as f32;
+        let scale_changed = self.notify_scale.replace(false);
+        let prev = self.last_physical_size.get();
+        let size_changed = prev != (physical_width, physical_height);
+
+        if !scale_changed && !size_changed {
+            return;
+        }
+        self.last_physical_size
+            .set((physical_width, physical_height));
+
+        // Skip rendering to a zero-size canvas (e.g. display:none).
+        if physical_width == 0 || physical_height == 0 {
+            {
+                let mut s = self.state.borrow_mut();
+                s.bounds.size = Size::default();
+                s.scale_factor = dpr_f32;
+            }
+            // Still fire the callback so GPUI knows the window is gone.
+            self.with_callback(
+                |callbacks| &mut callbacks.resize,
+                |callback| callback(Size::default(), dpr_f32),
+            );
+            return;
+        }
+
+        let max_texture_dimension = self.state.borrow().max_texture_dimension;
+        let clamped_width = physical_width.min(max_texture_dimension);
+        let clamped_height = physical_height.min(max_texture_dimension);
+
+        // Recompute the logical size from the clamped physical size so that
+        // scale_factor still maps GPUI's logical bounds exactly onto the
+        // surface; otherwise clamping would silently distort the effective
+        // scale.
+        let (logical_width, logical_height) =
+            if (clamped_width, clamped_height) != (physical_width, physical_height) {
+                (
+                    (clamped_width as f64 / dpr) as f32,
+                    (clamped_height as f64 / dpr) as f32,
+                )
+            } else {
+                (logical_width, logical_height)
+            };
+
+        self.pending_physical_size
+            .set(Some((clamped_width, clamped_height)));
+
+        let new_size = Size {
+            width: px(logical_width),
+            height: px(logical_height),
+        };
+        {
+            let mut s = self.state.borrow_mut();
+            s.bounds.size = new_size;
+            s.scale_factor = dpr_f32;
+        }
+
+        self.with_callback(
+            |callbacks| &mut callbacks.resize,
+            |callback| callback(new_size, dpr_f32),
+        );
+
+        // Both measurements arrive after layout but before the browser paints.
+        // Render synchronously here so the newly resized CSS canvas is never
+        // presented with its previous backing image stretched into the new
+        // viewport dimensions.
+        self.with_callback(
+            |callbacks| &mut callbacks.request_frame,
+            |callback| {
+                callback(RequestFrameOptions {
+                    require_presentation: true,
+                    force_render: true,
+                })
+            },
+        );
+    }
+
+    /// Measures the canvas directly, for a browser without ResizeObserver.
+    /// The CSS box is all such a browser offers, so the physical size is
+    /// derived from it as the observer's own contentRect path does.
+    fn measure_canvas(&self) {
+        let dpr = self.browser_window.device_pixel_ratio();
+        if dpr as f32 != self.state.borrow().scale_factor {
+            self.notify_scale.set(true);
+        }
+        let rect = self.canvas.get_bounding_client_rect();
+        let logical_width = rect.width() as f32;
+        let logical_height = rect.height() as f32;
+        self.apply_canvas_size(
+            (logical_width as f64 * dpr).round() as u32,
+            (logical_height as f64 * dpr).round() as u32,
+            logical_width,
+            logical_height,
+            dpr,
+        );
+    }
+
+    /// The window's `resize`, which also fires when zoom changes the device
+    /// pixel ratio, is the coarser signal every browser has.
+    fn register_window_resize(self: &Rc<Self>) -> EventListenerHandle {
+        let this = Rc::clone(self);
+        EventListenerHandle::add(
+            self.browser_window.as_ref(),
+            "resize",
+            move |_event: JsValue| this.measure_canvas(),
+        )
+    }
+
     /// Invokes a registered callback with take/call/restore semantics.
     ///
     /// The callback is removed from the slot for the duration of the call, so
