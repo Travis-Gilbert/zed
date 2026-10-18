@@ -284,3 +284,19 @@ path.
 The locked gpui_web wasm library check passes. Product acceptance is the
 TheoremWeb appearance oracle's capability-verified path with ResizeObserver
 removed, against the next consumer artifact.
+
+## An unfocused styled root keeps no selection (patch 0052)
+
+A selection placed inside an editing host focuses that host in Chromium. The
+conduit sync and the restyle that follows applied highlights both wrote the
+stored caret into the styled root whether or not it held focus, so a sync that
+ran after focus had gone elsewhere pulled it back into the composer: an
+unconsumed Escape from Command returned focus to its Search invoker, and the
+next sync took it back into the parked draft. `StyledInput::set_selection` now
+writes only into a root that holds focus. The mirror keeps the caret in its
+bookkeeping, and `ImeMirror::focus` (patch 0050) writes it the moment the root
+takes focus.
+
+Product acceptance is the TheoremWeb Command query case's return to its invoker
+with no stop on the composer, in Chromium and WebKit, against the next consumer
+artifact.
