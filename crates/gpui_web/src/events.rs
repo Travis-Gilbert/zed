@@ -5,7 +5,7 @@ use gpui::{
     Image, ImageFormat, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
     Pixels, PlatformInput, Point, ScrollDelta, ScrollWheelEvent, TouchEvent, TouchId, TouchPhase,
-    point, px,
+    UTF16Selection, point, px,
 };
 use wasm_bindgen::prelude::*;
 
@@ -198,23 +198,56 @@ impl WebWindowInner {
     /// DOM listener owns its closure: sharing one would mean routing every
     /// event through a borrow to get at it, for elements that are never both
     /// focused at once.
+    ///
+    /// The handler is also kept, so that an element the page adopts after the
+    /// window exists -- an editing island -- is given this same handler by
+    /// [`Self::attach_input_listeners`] rather than a second implementation of
+    /// the input path.
     fn listen_input(
         self: &Rc<Self>,
         event_name: &'static str,
         handler: impl FnMut(JsValue) + 'static,
     ) -> Vec<EventListenerHandle> {
-        let targets = self.ime_mirror.event_targets();
-        if let [target] = targets.as_slice() {
-            return vec![EventListenerHandle::add(target, event_name, handler)];
-        }
-        let handler = Rc::new(RefCell::new(handler));
-        targets
+        let handler: SharedListener = Rc::new(RefCell::new(handler));
+        // Weak: the handler holds the window, and the listeners attached
+        // below hold the handler, so a strong reference here would be a cycle.
+        self.input_listeners
+            .borrow_mut()
+            .push((event_name, Rc::downgrade(&handler)));
+        self.ime_mirror
+            .event_targets()
             .into_iter()
-            .map(|target| {
-                let handler = Rc::clone(&handler);
-                EventListenerHandle::add(&target, event_name, move |event: JsValue| {
-                    (handler.borrow_mut())(event)
-                })
+            .map(|target| attach_shared(&target, event_name, &handler))
+            .collect()
+    }
+
+    /// Attach every input-path listener to `target`, an element adopted after
+    /// the window was created. The handles detach them when dropped.
+    pub(crate) fn attach_input_listeners(
+        self: &Rc<Self>,
+        element: &web_sys::HtmlElement,
+        adoption: u64,
+    ) -> Vec<EventListenerHandle> {
+        self.input_listeners
+            .borrow()
+            .iter()
+            .filter_map(|(event_name, handler)| {
+                let handler = handler.upgrade()?;
+                let window = Rc::downgrade(self);
+                let adopted = element.clone();
+                Some(EventListenerHandle::add(
+                    element.as_ref(),
+                    event_name,
+                    move |event: JsValue| {
+                        // A retained predecessor keeps its listener handles until
+                        // drop, but no longer has authority to import any event.
+                        if window.upgrade().is_some_and(|window| {
+                            window.ime_mirror.owns_island_adoption(&adopted, adoption)
+                        }) {
+                            (handler.borrow_mut())(event);
+                        }
+                    },
+                ))
             })
             .collect()
     }
@@ -791,6 +824,36 @@ impl WebWindowInner {
                 key_char: key_char.clone(),
             };
 
+            let is_tab = keystroke.key == "tab"
+                && !modifiers.control
+                && !modifiers.alt
+                && !modifiers.platform;
+            let primary = if this.is_mac {
+                modifiers.platform
+            } else {
+                modifiers.control
+            };
+            if (this.is_composing.get() || event.is_composing())
+                && crate::composition_keys::is_owned_key(&keystroke.key, primary, modifiers.alt)
+            {
+                // The platform can begin composition before any marked text
+                // reaches the input handler. Its editor bindings must not
+                // submit, cancel, navigate, or change history in that gap.
+                // Modifier state above and unrelated shortcuts remain live.
+                event.prevent_default();
+                return;
+            }
+            if is_tab
+                && event
+                    .target()
+                    .and_then(|target| target.dyn_into::<web_sys::HtmlElement>().ok())
+                    .is_some_and(|element| this.ime_mirror.island_uses_native_tab(&element))
+            {
+                // The visible page-owned editor participates in browser
+                // focus order. Let the same event bubble/default normally;
+                // entering the hidden conduit still uses GPUI's tab order.
+                return;
+            }
             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
                 keystroke,
                 is_held,
@@ -803,6 +866,13 @@ impl WebWindowInner {
                     this.schedule_ime_mirror_sync();
                     return;
                 }
+            }
+
+            if is_tab && !this.is_composing.get() && !event.is_composing() {
+                // GPUI propagated at the edge of its tab order. Let the
+                // browser continue from the canvas's input conduit into DOM.
+                this.ime_mirror.blur();
+                return;
             }
 
             if this.is_composing.get() || event.is_composing() {
@@ -889,9 +959,36 @@ impl WebWindowInner {
         self.listen_input("input", move |event: JsValue| {
             let event: web_sys::InputEvent = event.unchecked_into();
 
+            // The mirror's own minimal-diff write on the editing island
+            // reaches the element as an ordinary edit; the document already
+            // holds it.
+            if this.ime_mirror.is_writing() {
+                this.ime_mirror.note_island(|counts| counts.echoes += 1);
+                return;
+            }
+
             // Composition text is delivered through the composition events;
             // the mirror is reconciled once on compositionend.
             if this.is_composing.get() || event.is_composing() {
+                return;
+            }
+
+            // A browser undo or redo (context menu, Edit menu) already
+            // changed the element from the element's own stack. That change
+            // is never imported: the document's one history performs the
+            // command, and the sync writes its result back over the
+            // element. When `beforeinput` carried the intent the command is
+            // already routed; without it, route it now.
+            if let Some((key, modifiers)) = history_keystroke(&event.input_type(), this.is_mac) {
+                if this
+                    .ime_mirror
+                    .input_history(history_direction(&event.input_type()))
+                {
+                    this.dispatch_synthetic_keystroke(key, modifiers);
+                }
+                this.ime_mirror.adopt_element_state();
+                this.ime_mirror.reject_selection_import();
+                this.schedule_ime_mirror_sync();
                 return;
             }
 
@@ -906,7 +1003,9 @@ impl WebWindowInner {
                 &old_value,
                 &new_value,
                 selection_start as usize..selection_end as usize,
-                this.ime_mirror.selection_start().map(|caret| caret as usize),
+                this.ime_mirror
+                    .selection_start()
+                    .map(|caret| caret as usize),
             );
 
             let applied = this.with_input_handler(|handler| {
@@ -926,6 +1025,7 @@ impl WebWindowInner {
             }
 
             this.ime_mirror.adopt_element_state();
+            this.ime_mirror.note_island(|counts| counts.imports += 1);
 
             // SPEC-THEOREMWEB-PWA-HTML-CANVAS-1.1 section 58 tracks
             // "HTML-native editor input latency" as its own row. This is that
@@ -939,9 +1039,7 @@ impl WebWindowInner {
             // early return is not an applied input, and a number that counted
             // them would report the cost of deciding to do nothing.
             if let Some(performance) = web_sys::window().and_then(|window| window.performance()) {
-                crate::native_element::record_input_latency(
-                    performance.now() - event.time_stamp(),
-                );
+                crate::native_element::record_input_latency(performance.now() - event.time_stamp());
             }
         })
     }
@@ -986,7 +1084,10 @@ impl WebWindowInner {
                     .element_selection_end()
                     .unwrap_or(element_start);
                 let (stored_start, stored_end) = this.ime_mirror.stored_selection();
-                if (element_start, element_end) == (stored_start, stored_end) {
+                let element_reversed = this.ime_mirror.element_selection_reversed();
+                if (element_start, element_end) == (stored_start, stored_end)
+                    && element_reversed == this.ime_mirror.stored_selection_reversed()
+                {
                     return;
                 }
                 let applied = this.with_input_handler(|handler| {
@@ -1005,13 +1106,19 @@ impl WebWindowInner {
                         return false;
                     }
                     let alignment = alignment.unwrap();
-                    handler.set_selected_text_range(
-                        alignment + element_start as usize..alignment + element_end as usize,
-                    );
+                    // The direction travels with the range: a backward
+                    // selection made in the element stays backward in the
+                    // app, so Shift+Arrow extends it from the same end.
+                    handler.set_text_selection(UTF16Selection {
+                        range: alignment + element_start as usize..alignment + element_end as usize,
+                        reversed: element_reversed,
+                    });
                     true
                 });
                 if applied == Some(true) {
                     this.ime_mirror.adopt_element_state();
+                    this.ime_mirror
+                        .note_island(|counts| counts.selection_imports += 1);
                 } else {
                     // No import is coming for this move; without a forced
                     // sync the mirror would keep deferring to it and show
@@ -1036,9 +1143,37 @@ impl WebWindowInner {
         self.listen_input("beforeinput", move |event: JsValue| {
             let event: web_sys::InputEvent = event.unchecked_into();
 
+            if this.ime_mirror.is_writing() {
+                return;
+            }
+
             // During composition the composition{update,end} handlers own
             // the text.
             if this.is_composing.get() || event.is_composing() {
+                return;
+            }
+
+            // A browser undo or redo is routed to the document's history
+            // through the keybinding path, the same path the keyboard
+            // takes. The intent is not canceled: the element's own stack
+            // must stay non-empty for the browser to keep offering Undo,
+            // and the sync replaces whatever it did with the document's
+            // result.
+            if let Some((key, modifiers)) = history_keystroke(&event.input_type(), this.is_mac) {
+                let admission = this
+                    .ime_mirror
+                    .before_history(history_direction(&event.input_type()));
+                if admission.dispatch {
+                    this.dispatch_synthetic_keystroke(key, modifiers);
+                }
+                if let Some(generation) = admission.expire {
+                    let weak = Rc::downgrade(&this);
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Some(this) = weak.upgrade() {
+                            this.ime_mirror.expire_history(generation);
+                        }
+                    });
+                }
                 return;
             }
 
@@ -1150,6 +1285,7 @@ impl WebWindowInner {
         let this = Rc::clone(self);
         self.listen_input("compositionstart", move |_event: JsValue| {
             this.is_composing.set(true);
+            this.ime_mirror.begin_composition();
         })
     }
 
@@ -1188,6 +1324,7 @@ impl WebWindowInner {
             // the IME mid-commit. The deferred sync reconciles any
             // app-side divergence afterwards.
             this.ime_mirror.adopt_element_state();
+            this.ime_mirror.end_composition();
             this.schedule_ime_mirror_sync();
         })
     }
@@ -1513,5 +1650,72 @@ mod tests {
         assert!(!should_preserve_focused_input(true, true, result(false),));
         assert!(!should_preserve_focused_input(false, true, result(true),));
         assert!(!should_preserve_focused_input(true, false, result(true),));
+    }
+}
+
+/// One input-path handler, shared by every element the input path is driven
+/// from. A DOM listener owns its closure, so each element gets a small
+/// forwarding closure and the handler itself exists once.
+pub(crate) type SharedListener = Rc<RefCell<dyn FnMut(JsValue)>>;
+
+/// The window's record of a [`SharedListener`], which must not keep it alive.
+pub(crate) type SharedListenerRecord = std::rc::Weak<RefCell<dyn FnMut(JsValue)>>;
+
+fn attach_shared(
+    target: &web_sys::EventTarget,
+    event_name: &'static str,
+    handler: &SharedListener,
+) -> EventListenerHandle {
+    let handler = Rc::clone(handler);
+    EventListenerHandle::add(target, event_name, move |event: JsValue| {
+        (handler.borrow_mut())(event)
+    })
+}
+
+fn history_direction(input_type: &str) -> crate::history_intent::HistoryDirection {
+    if input_type == "historyRedo" {
+        crate::history_intent::HistoryDirection::Redo
+    } else {
+        crate::history_intent::HistoryDirection::Undo
+    }
+}
+
+/// The key press a browser history intent stands for on this platform, or
+/// `None` for any other input type.
+///
+/// These are the bindings the composer's own undo and redo answer to, so a
+/// context-menu Undo and Cmd-Z reach the same command.
+fn history_keystroke(input_type: &str, is_mac: bool) -> Option<(&'static str, Modifiers)> {
+    match (input_type, is_mac) {
+        ("historyUndo", true) => Some((
+            "z",
+            Modifiers {
+                platform: true,
+                ..Modifiers::default()
+            },
+        )),
+        ("historyRedo", true) => Some((
+            "z",
+            Modifiers {
+                platform: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+        )),
+        ("historyUndo", false) => Some((
+            "z",
+            Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+        )),
+        ("historyRedo", false) => Some((
+            "y",
+            Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+        )),
+        _ => None,
     }
 }

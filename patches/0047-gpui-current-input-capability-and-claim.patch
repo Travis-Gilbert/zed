@@ -1,0 +1,411 @@
+From c44dcb76fed7e5bbc0da87535f2079bd4aa1d7ac Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 20:05:29 -0400
+Subject: [PATCH] fix(gpui_web): retain current input capability and
+ accessibility claim
+
+---
+ crates/gpui_web/src/a11y.rs             |  10 ++
+ crates/gpui_web/src/gpui_web.rs         |   1 +
+ crates/gpui_web/src/ime_mirror.rs       |  85 ++++++++++++---
+ crates/gpui_web/src/input_capability.rs | 131 ++++++++++++++++++++++++
+ crates/gpui_web/src/styled_input.rs     |   1 +
+ crates/gpui_web/src/window.rs           |  12 +++
+ 6 files changed, 225 insertions(+), 15 deletions(-)
+ create mode 100644 crates/gpui_web/src/input_capability.rs
+
+diff --git a/crates/gpui_web/src/a11y.rs b/crates/gpui_web/src/a11y.rs
+index 8a326ce..aa37078 100644
+--- a/crates/gpui_web/src/a11y.rs
++++ b/crates/gpui_web/src/a11y.rs
+@@ -344,6 +344,7 @@ pub(crate) struct WebA11yAdapter {
+     /// of the node it claims. Declaring it here rather than querying it keeps
+     /// one authority for what a node is.
+     declared: Rc<Cell<PlatformNativeElement>>,
++    text_focus: Rc<dyn Fn(Option<NodeId>, Option<(web_sys::HtmlElement, NodeId)>)>,
+     nodes: HashMap<NodeId, MirrorNode>,
+     focus: Option<NodeId>,
+     announced: String,
+@@ -394,6 +395,7 @@ impl WebA11yAdapter {
+         document: web_sys::Document,
+         input_element: Rc<RefCell<web_sys::HtmlElement>>,
+         declared: Rc<Cell<PlatformNativeElement>>,
++        text_focus: Rc<dyn Fn(Option<NodeId>, Option<(web_sys::HtmlElement, NodeId)>)>,
+         native_elements: NativeElements,
+         action: Rc<dyn Fn(ActionRequest)>,
+     ) -> anyhow::Result<Self> {
+@@ -485,6 +487,7 @@ impl WebA11yAdapter {
+             live_region,
+             input_element,
+             declared,
++            text_focus,
+             native_elements,
+             nodes: HashMap::default(),
+             focus: None,
+@@ -549,6 +552,13 @@ impl WebA11yAdapter {
+                 }),
+         );
+         self.apply_native_realization(claimed.as_ref(), entry_name.as_ref());
++        // This is the same focused leaf used above to name the conduit. The
++        // handoff may retire a passive fallback, but must not conceal a built
++        // control serving a different actual text field.
++        (self.text_focus)(
++            focused_text.map(|(node_id, _)| *node_id),
++            focused_text.map(|(node_id, _)| (self.input_element.borrow().clone(), *node_id)),
++        );
+ 
+         for (node_id, node) in &update.nodes {
+             if Some(*node_id) == self.natively_realized {
+diff --git a/crates/gpui_web/src/gpui_web.rs b/crates/gpui_web/src/gpui_web.rs
+index 869ba04..0fa405c 100644
+--- a/crates/gpui_web/src/gpui_web.rs
++++ b/crates/gpui_web/src/gpui_web.rs
+@@ -15,6 +15,7 @@ mod file_drop;
+ mod http_client;
+ mod ime_mirror;
+ mod input_edit;
++mod input_capability;
+ mod history_intent;
+ mod composition_keys;
+ mod keyboard;
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index abd24ab..5af9666 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -249,23 +249,11 @@ impl ConduitElement {
+     }
+ 
+     fn read_only(&self) -> bool {
+-        match self {
+-            Self::TextArea(element) => element.read_only(),
+-            Self::Input(element) => element.read_only(),
+-            Self::Styled(element) => element.element().content_editable() == "false",
+-        }
++        crate::input_capability::read_only(self.as_element())
+     }
+ 
+     fn set_read_only(&self, read_only: bool) {
+-        match self {
+-            Self::TextArea(element) => element.set_read_only(read_only),
+-            Self::Input(element) => element.set_read_only(read_only),
+-            Self::Styled(element) => element.element().set_content_editable(if read_only {
+-                "false"
+-            } else {
+-                "plaintext-only"
+-            }),
+-        }
++        crate::input_capability::set_read_only(self.as_element(), read_only);
+     }
+ 
+     /// Whether this element can hold `text` exactly as written.
+@@ -430,6 +418,11 @@ pub(crate) struct ImeMirror {
+     island: RefCell<Option<Rc<Conduit>>>,
+     /// Whether the island, rather than a built conduit, is live.
+     island_live: Cell<bool>,
++    retired_built_claims: RefCell<Vec<crate::input_capability::RetiredInputClaim>>,
++    // Accessibility identity observed from the existing focused text leaf,
++    // never a second input owner. An adoption retains its field identity while
++    // focus visits non-text controls and yields to a different native field.
++    text_claim: crate::input_capability::TextInputClaimIdentity,
+     island_native_tab: Cell<bool>,
+     island_adoption: Cell<u64>,
+     /// Set while the mirror itself edits the island through the browser's
+@@ -578,6 +571,8 @@ impl ImeMirror {
+             selection_reversed: Cell::new(false),
+             island: RefCell::new(None),
+             island_live: Cell::new(false),
++            retired_built_claims: RefCell::new(Vec::new()),
++            text_claim: crate::input_capability::TextInputClaimIdentity::default(),
+             island_native_tab: Cell::new(false),
+             island_adoption: Cell::new(0),
+             writing: Cell::new(false),
+@@ -935,6 +930,10 @@ impl ImeMirror {
+             .conduits
+             .iter()
+             .find(|conduit| conduit.capability == live);
++        crate::input_capability::inherit_read_only(
++            self.live_conduit().as_element(),
++            next.as_element(),
++        );
+         window.suppress_focus_status_events.set(true);
+         // Focus first, and stop here if it does not take. Everything below
+         // assumes the browser is delivering input to the element that becomes
+@@ -1154,6 +1153,7 @@ impl ImeMirror {
+             page_owned: true,
+         })));
+         self.island_native_tab.set(false);
++        self.text_claim.reset();
+         self.island_counts.set(EditingIslandCounts::default());
+         let adoption = self
+             .island_adoption
+@@ -1209,6 +1209,8 @@ impl ImeMirror {
+         }
+         self.set_island_live(window, false);
+         self.island.replace(None);
++        self.text_claim.reset();
++        self.retired_built_claims.borrow_mut().clear();
+         self.island_native_tab.set(false);
+         let html: &web_sys::Element = element.as_ref();
+         html.remove_attribute(ISLAND_ATTRIBUTE).ok();
+@@ -1228,7 +1230,11 @@ impl ImeMirror {
+         let Some(island) = self.island.borrow().clone() else {
+             return false;
+         };
+-        if self.island_live.get() == live || window.is_composing.get() {
++        if window.is_composing.get() {
++            return false;
++        }
++        if self.island_live.get() == live {
++            self.reconcile_built_claims(&island);
+             return false;
+         }
+         let built = {
+@@ -1238,6 +1244,11 @@ impl ImeMirror {
+                 .find(|conduit| conduit.capability == wanted)
+                 .unwrap_or(&self.conduits[0])
+         };
++        let successor = if live { island.as_ref() } else { built };
++        crate::input_capability::inherit_read_only(
++            self.live_conduit().as_element(),
++            successor.as_element(),
++        );
+         window.suppress_focus_status_events.set(true);
+         if live {
+             if island.as_element().focus().is_err() {
+@@ -1264,6 +1275,7 @@ impl ImeMirror {
+             }
+         }
+         window.suppress_focus_status_events.set(false);
++        self.reconcile_built_claims(&island);
+         // As at a conduit switch: the element that became live holds none of
+         // the bookkeeping, so the next sync is a rebuild.
+         self.text.borrow_mut().clear();
+@@ -1280,6 +1292,49 @@ impl ImeMirror {
+         true
+     }
+ 
++    pub(crate) fn observe_text_focus(
++        &self,
++        window: &WebWindowInner,
++        node: Option<gpui::accesskit::NodeId>,
++        claimed: Option<(web_sys::HtmlElement, gpui::accesskit::NodeId)>,
++    ) {
++        if window.is_composing.get() {
++            return;
++        }
++        // Bind only the adapter's actual current text-entry association on
++        // this adopted element, including painted platforms. Never use a
++        // stale focus sample from before it became live or hidden warming.
++        let current_island_association = claimed.is_some_and(|(element, _)| {
++            self.island_live.get()
++                && self.owns_island(&element)
++                && crate::input_capability::is_presented(&element)
++        });
++        self.text_claim
++            .observe(node.map(|id| id.0), current_island_association);
++        if let Some(island) = self.island.borrow().as_ref() {
++            self.reconcile_built_claims(island);
++        }
++    }
++
++    fn reconcile_built_claims(&self, island: &Conduit) {
++        let mut claims = self.retired_built_claims.borrow_mut();
++        if crate::input_capability::is_presented(island.as_element())
++            && self.text_claim.is_passive_builtin()
++        {
++            if claims.is_empty() {
++                claims.extend(self.conduits.iter().map(|conduit| {
++                    crate::input_capability::RetiredInputClaim::retire(conduit.as_element())
++                }));
++            } else {
++                for claim in claims.iter() {
++                    claim.reconcile();
++                }
++            }
++        } else {
++            claims.clear();
++        }
++    }
++
+     /// Whether the island is the live conduit.
+     pub(crate) fn island_is_live(&self) -> bool {
+         self.island_live.get() && self.island.borrow().is_some()
+diff --git a/crates/gpui_web/src/input_capability.rs b/crates/gpui_web/src/input_capability.rs
+new file mode 100644
+index 0000000..af33997
+--- /dev/null
++++ b/crates/gpui_web/src/input_capability.rs
+@@ -0,0 +1,131 @@
++//! DOM capability carried by the current canonical input session.
++//!
++//! The native handler's FocusGained/FocusLost notifications control read-only
++//! state on the live conduit. An inactive DOM node may retain an older state;
++//! a handoff must carry the current session's answer before attempting focus.
++use wasm_bindgen::JsCast as _;
++
++pub(crate) fn read_only(element: &web_sys::HtmlElement) -> bool {
++    if let Some(element) = element.dyn_ref::<web_sys::HtmlTextAreaElement>() {
++        element.read_only()
++    } else if let Some(element) = element.dyn_ref::<web_sys::HtmlInputElement>() {
++        element.read_only()
++    } else {
++        element.content_editable() == "false"
++    }
++}
++
++pub(crate) fn set_read_only(element: &web_sys::HtmlElement, read_only: bool) {
++    if let Some(element) = element.dyn_ref::<web_sys::HtmlTextAreaElement>() {
++        element.set_read_only(read_only);
++    } else if let Some(element) = element.dyn_ref::<web_sys::HtmlInputElement>() {
++        element.set_read_only(read_only);
++    } else {
++        element.set_content_editable(if read_only { "false" } else { "plaintext-only" });
++    }
++}
++
++pub(crate) fn inherit_read_only(current: &web_sys::HtmlElement, successor: &web_sys::HtmlElement) {
++    set_read_only(successor, read_only(current));
++}
++
++pub(crate) fn ensure_styled_focusability(element: &web_sys::HtmlElement) {
++    // Read-only textarea/input conduits remain focusable for selection and
++    // shortcuts. contenteditable=false alone would make a retained div unable
++    // to regain focus and report the native owner's later focus intent.
++    // Respect an explicit tab order supplied by the page.
++    if !element.has_attribute("tabindex") {
++        element.set_tab_index(0);
++    }
++}
++
++/// A built conduit temporarily yields its platform claim to a presented island.
++/// Preserve the element's prior policy; dropping the claim restores only the
++/// attributes this handoff owns, without changing focus or edit capability.
++pub(crate) struct RetiredInputClaim {
++    element: web_sys::HtmlElement,
++    aria_hidden: Option<String>,
++    tabindex: Option<String>,
++}
++
++impl RetiredInputClaim {
++    pub(crate) fn retire(element: &web_sys::HtmlElement) -> Self {
++        let claim = Self {
++            element: element.clone(),
++            aria_hidden: element.get_attribute("aria-hidden"),
++            tabindex: element.get_attribute("tabindex"),
++        };
++        claim.reconcile();
++        claim
++    }
++
++    pub(crate) fn reconcile(&self) {
++        set_attribute(&self.element, "aria-hidden", Some("true"));
++        set_attribute(&self.element, "tabindex", Some("-1"));
++    }
++}
++
++impl Drop for RetiredInputClaim {
++    fn drop(&mut self) {
++        set_attribute(&self.element, "aria-hidden", self.aria_hidden.as_deref());
++        set_attribute(&self.element, "tabindex", self.tabindex.as_deref());
++    }
++}
++
++fn set_attribute(element: &web_sys::HtmlElement, name: &str, value: Option<&str>) {
++    if element.get_attribute(name).as_deref() == value {
++        return;
++    }
++    match value {
++        Some(value) => {
++            element.set_attribute(name, value).ok();
++        }
++        None => {
++            element.remove_attribute(name).ok();
++        }
++    }
++}
++
++/// Host admission uses explicit hidden/inert ancestry while an island warms.
++/// Logical input ownership alone must not remove the native fallback's claim.
++/// This checks declared admission facts, without polling computed layout.
++pub(crate) fn is_presented(element: &web_sys::HtmlElement) -> bool {
++    element.is_connected()
++        && element
++            .closest("[hidden], [inert], [aria-hidden=\"true\"]")
++            .ok()
++            .flatten()
++            .is_none()
++}
++
++/// Whether the built conduit is only transport for the offered island or a
++/// non-text focus target. A different actual text leaf keeps its own claim.
++pub(crate) fn is_passive_builtin(island_node: Option<u64>, focused_text: Option<u64>) -> bool {
++    island_node.is_some() && (focused_text.is_none() || focused_text == island_node)
++}
++
++/// Identity facts projected by the existing accessibility text-entry mapping.
++/// Binding is per adoption: a later different field must never be rebound as
++/// the same island merely because the conduit handoff has not settled yet.
++#[derive(Default)]
++pub(crate) struct TextInputClaimIdentity {
++    island: std::cell::Cell<Option<u64>>,
++    focused: std::cell::Cell<Option<u64>>,
++}
++
++impl TextInputClaimIdentity {
++    pub(crate) fn reset(&self) {
++        self.island.set(None);
++    }
++
++    pub(crate) fn observe(&self, focused: Option<u64>, current_island_association: bool) {
++        self.focused.set(focused);
++        if current_island_association && self.island.get().is_none() {
++            self.island.set(focused);
++        }
++    }
++
++    pub(crate) fn is_passive_builtin(&self) -> bool {
++        is_passive_builtin(self.island.get(), self.focused.get())
++    }
++}
+diff --git a/crates/gpui_web/src/styled_input.rs b/crates/gpui_web/src/styled_input.rs
+index 2a0aafc..2d022e0 100644
+--- a/crates/gpui_web/src/styled_input.rs
++++ b/crates/gpui_web/src/styled_input.rs
+@@ -154,6 +154,7 @@ pub(crate) struct StyledInput {
+ }
+ impl StyledInput {
+     pub(crate) fn new(element: web_sys::HtmlElement) -> Self {
++        crate::input_capability::ensure_styled_focusability(&element);
+         Self {
+             element,
+             applied: RefCell::new(None),
+diff --git a/crates/gpui_web/src/window.rs b/crates/gpui_web/src/window.rs
+index 43818bc..7cb7334 100644
+--- a/crates/gpui_web/src/window.rs
++++ b/crates/gpui_web/src/window.rs
+@@ -997,10 +997,22 @@ impl PlatformWindow for WebWindow {
+         let action: Rc<dyn Fn(gpui::accesskit::ActionRequest)> =
+             Rc::new(move |request| action(request));
+ 
++        let weak = Rc::downgrade(&self.inner);
++        let text_focus: Rc<
++            dyn Fn(
++                Option<gpui::accesskit::NodeId>,
++                Option<(web_sys::HtmlElement, gpui::accesskit::NodeId)>,
++            ),
++        > = Rc::new(move |node, claimed| {
++            if let Some(window) = weak.upgrade() {
++                window.ime_mirror.observe_text_focus(&window, node, claimed);
++            }
++        });
+         let adapter = match WebA11yAdapter::new(
+             document,
+             self.inner.ime_mirror.accessibility_element_handle(),
+             self.inner.ime_mirror.declared_capability_handle(),
++            text_focus,
+             self.inner.native_elements,
+             action,
+         ) {
+-- 
+2.53.0
+

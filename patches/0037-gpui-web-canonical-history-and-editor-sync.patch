@@ -1,0 +1,383 @@
+From 767618614debfe985e82b30f351e99d7fa2aaf91 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 13:15:27 -0400
+Subject: [PATCH] fix(gpui-web): reconcile canonical history and explicit
+ editor changes
+
+---
+ crates/gpui_web/src/editing_island.rs |  27 +++++-
+ crates/gpui_web/src/events.rs         |  30 +++++-
+ crates/gpui_web/src/gpui_web.rs       |   1 +
+ crates/gpui_web/src/history_intent.rs | 133 ++++++++++++++++++++++++++
+ crates/gpui_web/src/ime_mirror.rs     |  54 ++++++++---
+ crates/gpui_web/src/window.rs         |   4 +-
+ 6 files changed, 227 insertions(+), 22 deletions(-)
+ create mode 100644 crates/gpui_web/src/history_intent.rs
+
+diff --git a/crates/gpui_web/src/editing_island.rs b/crates/gpui_web/src/editing_island.rs
+index 89ca1e3..85cf8c9 100644
+--- a/crates/gpui_web/src/editing_island.rs
++++ b/crates/gpui_web/src/editing_island.rs
+@@ -65,11 +65,23 @@ impl EditingIsland {
+         if inner.is_composing.get() && live != inner.ime_mirror.island_is_live() {
+             return inner.ime_mirror.island_is_live();
+         }
+-        let now_live = inner.ime_mirror.set_island_live(&inner, live);
+-        if now_live {
++        let changed = inner.ime_mirror.set_island_live(&inner, live);
++        if changed && inner.ime_mirror.island_is_live() {
+             crate::ime_mirror::ImeMirror::schedule_sync(&inner);
+         }
+-        now_live
++        inner.ime_mirror.island_is_live()
++    }
++
++    /// Schedule the existing coalesced mirror reconciliation after the
++    /// canonical editor changes independently of browser input. Call on a
++    /// revision or selection change, rather than on every rendered frame.
++    /// Composition keeps its current buffer until its normal commit/cancel.
++    pub fn request_sync(&self) {
++        if let Some(inner) = self.window.upgrade() {
++            if inner.ime_mirror.island_is_live() {
++                crate::ime_mirror::ImeMirror::schedule_sync(&inner);
++            }
++        }
+     }
+ 
+     /// Whether the island is the live conduit.
+@@ -86,6 +98,15 @@ impl EditingIsland {
+             .is_some_and(|inner| inner.is_composing.get())
+     }
+ 
++    /// Whether the platform currently holds any text input handler. This is
++    /// presence only, not evidence that it belongs to this editor. `None`
++    /// means the window is gone or its state is temporarily borrowed.
++    pub fn input_handler_present(&self) -> Option<bool> {
++        let inner = self.window.upgrade()?;
++        let state = inner.state.try_borrow().ok()?;
++        Some(state.input_handler.is_some())
++    }
++
+     /// What the island has done since it was adopted.
+     pub fn counts(&self) -> EditingIslandCounts {
+         self.window
+diff --git a/crates/gpui_web/src/events.rs b/crates/gpui_web/src/events.rs
+index 2bd693a..8ba54be 100644
+--- a/crates/gpui_web/src/events.rs
++++ b/crates/gpui_web/src/events.rs
+@@ -939,8 +939,10 @@ impl WebWindowInner {
+             // element. When `beforeinput` carried the intent the command is
+             // already routed; without it, route it now.
+             if let Some((key, modifiers)) = history_keystroke(&event.input_type(), this.is_mac) {
+-                if !this.ime_mirror.take_routed_history() {
+-                    this.ime_mirror.note_island(|counts| counts.history += 1);
++                if this
++                    .ime_mirror
++                    .input_history(history_direction(&event.input_type()))
++                {
+                     this.dispatch_synthetic_keystroke(key, modifiers);
+                 }
+                 this.ime_mirror.adopt_element_state();
+@@ -1117,8 +1119,20 @@ impl WebWindowInner {
+             // and the sync replaces whatever it did with the document's
+             // result.
+             if let Some((key, modifiers)) = history_keystroke(&event.input_type(), this.is_mac) {
+-                this.ime_mirror.route_history();
+-                this.dispatch_synthetic_keystroke(key, modifiers);
++                let admission = this
++                    .ime_mirror
++                    .before_history(history_direction(&event.input_type()));
++                if admission.dispatch {
++                    this.dispatch_synthetic_keystroke(key, modifiers);
++                }
++                if let Some(generation) = admission.expire {
++                    let weak = Rc::downgrade(&this);
++                    wasm_bindgen_futures::spawn_local(async move {
++                        if let Some(this) = weak.upgrade() {
++                            this.ime_mirror.expire_history(generation);
++                        }
++                    });
++                }
+                 return;
+             }
+ 
+@@ -1617,6 +1631,14 @@ fn attach_shared(
+     })
+ }
+ 
++fn history_direction(input_type: &str) -> crate::history_intent::HistoryDirection {
++    if input_type == "historyRedo" {
++        crate::history_intent::HistoryDirection::Redo
++    } else {
++        crate::history_intent::HistoryDirection::Undo
++    }
++}
++
+ /// The key press a browser history intent stands for on this platform, or
+ /// `None` for any other input type.
+ ///
+diff --git a/crates/gpui_web/src/gpui_web.rs b/crates/gpui_web/src/gpui_web.rs
+index 0790751..17b0781 100644
+--- a/crates/gpui_web/src/gpui_web.rs
++++ b/crates/gpui_web/src/gpui_web.rs
+@@ -14,6 +14,7 @@ mod file_drop;
+ mod http_client;
+ mod ime_mirror;
+ mod input_edit;
++mod history_intent;
+ mod keyboard;
+ mod logging;
+ mod native_element;
+diff --git a/crates/gpui_web/src/history_intent.rs b/crates/gpui_web/src/history_intent.rs
+new file mode 100644
+index 0000000..600b016
+--- /dev/null
++++ b/crates/gpui_web/src/history_intent.rs
+@@ -0,0 +1,133 @@
++//! One browser history command may describe several native undo records.
++//!
++//! WebKit emits all of a command's beforeinput records, then its matching
++//! input records. Dispatch the document command once while accounting for
++//! every native record. Draining the batch admits another command immediately,
++//! even in the same JS job. A deferred expiry only retires an incomplete batch
++//! whose cancelable beforeinput never received its input counterpart.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum HistoryDirection {
++    Undo,
++    Redo,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum Phase {
++    Before,
++    Input,
++}
++#[derive(Clone, Copy, Debug)]
++struct Batch {
++    direction: HistoryDirection,
++    remaining: u32,
++    phase: Phase,
++    generation: u64,
++}
++#[derive(Default)]
++pub(crate) struct HistoryIntentGate {
++    batch: Option<Batch>,
++    generation: u64,
++}
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) struct HistoryAdmission {
++    pub dispatch: bool,
++    pub expire: Option<u64>,
++}
++impl HistoryIntentGate {
++    pub(crate) fn before(&mut self, direction: HistoryDirection) -> HistoryAdmission {
++        if let Some(batch) = self.batch.as_mut()
++            && batch.direction == direction
++            && batch.phase == Phase::Before
++        {
++            batch.remaining = batch.remaining.saturating_add(1);
++            return HistoryAdmission {
++                dispatch: false,
++                expire: None,
++            };
++        }
++        self.generation = self.generation.saturating_add(1);
++        self.batch = Some(Batch {
++            direction,
++            remaining: 1,
++            phase: Phase::Before,
++            generation: self.generation,
++        });
++        HistoryAdmission {
++            dispatch: true,
++            expire: Some(self.generation),
++        }
++    }
++    pub(crate) fn input(&mut self, direction: HistoryDirection) -> bool {
++        if let Some(batch) = self.batch.as_mut()
++            && batch.direction == direction
++        {
++            batch.remaining -= 1;
++            batch.phase = Phase::Input;
++            if batch.remaining == 0 {
++                self.batch = None;
++            }
++            return false;
++        }
++        // A browser/extension may omit beforeinput entirely. Its input event
++        // is still a command and must not import the native history's text.
++        true
++    }
++    pub(crate) fn expire(&mut self, generation: u64) {
++        if self
++            .batch
++            .as_ref()
++            .is_some_and(|batch| batch.generation == generation)
++        {
++            self.batch = None;
++        }
++    }
++    pub(crate) fn clear(&mut self) {
++        self.batch = None;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn command(gate: &mut HistoryIntentGate, direction: HistoryDirection, records: usize) -> usize {
++        let before = (0..records)
++            .filter(|_| gate.before(direction).dispatch)
++            .count();
++        before + (0..records).filter(|_| gate.input(direction)).count()
++    }
++    #[test]
++    fn recorded_webkit_six_before_six_input_is_one_document_command() {
++        let mut gate = HistoryIntentGate::default();
++        assert_eq!(command(&mut gate, HistoryDirection::Undo, 6), 1);
++        assert_eq!(command(&mut gate, HistoryDirection::Redo, 6), 1);
++    }
++    #[test]
++    fn separate_commands_in_one_job_are_not_collapsed() {
++        let mut gate = HistoryIntentGate::default();
++        assert_eq!(command(&mut gate, HistoryDirection::Undo, 6), 1);
++        assert_eq!(command(&mut gate, HistoryDirection::Undo, 6), 1);
++        assert_eq!(command(&mut gate, HistoryDirection::Redo, 1), 1);
++    }
++    #[test]
++    fn canceled_beforeinput_expires_without_retiring_a_successor() {
++        let mut gate = HistoryIntentGate::default();
++        let canceled = gate.before(HistoryDirection::Undo);
++        gate.expire(canceled.expire.unwrap());
++        let next = gate.before(HistoryDirection::Undo);
++        assert!(next.dispatch);
++        gate.expire(canceled.expire.unwrap());
++        assert!(!gate.input(HistoryDirection::Undo));
++        assert_eq!(command(&mut gate, HistoryDirection::Undo, 1), 1);
++    }
++    #[test]
++    fn input_only_fallback_is_a_command_and_directions_are_distinct() {
++        let mut gate = HistoryIntentGate::default();
++        assert!(gate.input(HistoryDirection::Undo));
++        assert!(gate.input(HistoryDirection::Redo));
++        assert!(gate.before(HistoryDirection::Undo).dispatch);
++        assert!(gate.before(HistoryDirection::Redo).dispatch);
++        assert!(!gate.input(HistoryDirection::Redo));
++        gate.clear();
++        assert_eq!(command(&mut gate, HistoryDirection::Undo, 1), 1);
++    }
++}
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index 7a0534a..e12b6c1 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -418,9 +418,9 @@ pub(crate) struct ImeMirror {
+     /// The island's text when a composition began, so its end can tell a
+     /// commit from a cancel.
+     composition_checkpoint: RefCell<Option<String>>,
+-    /// A browser history command announced by `beforeinput` and already
+-    /// routed, so the `input` that follows it does not route it twice.
+-    history_routed: Cell<bool>,
++    /// One command can describe several native records, notably WebKit undo.
++    history_intents: RefCell<crate::history_intent::HistoryIntentGate>,
++    history_reconcile: Cell<bool>,
+     island_counts: Cell<EditingIslandCounts>,
+ }
+ 
+@@ -559,7 +559,8 @@ impl ImeMirror {
+             island_live: Cell::new(false),
+             writing: Cell::new(false),
+             composition_checkpoint: RefCell::new(None),
+-            history_routed: Cell::new(false),
++            history_intents: RefCell::new(crate::history_intent::HistoryIntentGate::default()),
++            history_reconcile: Cell::new(false),
+             island_counts: Cell::new(EditingIslandCounts::default()),
+         };
+         // Until an input handler asks otherwise, the element is an IME
+@@ -1180,7 +1181,8 @@ impl ImeMirror {
+         self.selection_reversed.set(false);
+         self.window_hint.set(0);
+         self.composition_checkpoint.replace(None);
+-        self.history_routed.set(false);
++        self.history_intents.borrow_mut().clear();
++        self.history_reconcile.set(false);
+         if live {
+             let configuration = self.configuration.borrow().clone();
+             self.apply_configuration_to(&island, &configuration);
+@@ -1242,16 +1244,30 @@ impl ImeMirror {
+         }
+     }
+ 
+-    /// Record that a browser history command was routed from `beforeinput`,
+-    /// so the `input` that may follow it routes nothing.
+-    pub(crate) fn route_history(&self) {
+-        self.history_routed.set(true);
+-        self.note_island(|counts| counts.history += 1);
++    /// Admit one logical history command while accounting for native records.
++    pub(crate) fn before_history(
++        &self,
++        direction: crate::history_intent::HistoryDirection,
++    ) -> crate::history_intent::HistoryAdmission {
++        let admission = self.history_intents.borrow_mut().before(direction);
++        if admission.dispatch {
++            self.history_reconcile.set(true);
++            self.note_island(|counts| counts.history += 1);
++        }
++        admission
++    }
++
++    pub(crate) fn input_history(&self, direction: crate::history_intent::HistoryDirection) -> bool {
++        let dispatch = self.history_intents.borrow_mut().input(direction);
++        if dispatch {
++            self.history_reconcile.set(true);
++            self.note_island(|counts| counts.history += 1);
++        }
++        dispatch
+     }
+ 
+-    /// Take the record left by [`Self::route_history`].
+-    pub(crate) fn take_routed_history(&self) -> bool {
+-        self.history_routed.replace(false)
++    pub(crate) fn expire_history(&self, generation: u64) {
++        self.history_intents.borrow_mut().expire(generation);
+     }
+ 
+     /// Bring the island to the document, whole.
+@@ -1288,8 +1304,18 @@ impl ImeMirror {
+             .unwrap_or_default();
+         let start = adjusted.unwrap_or(range).start;
+         let current = conduit.element.value();
++        let after_history = self.history_reconcile.replace(false);
+         if current != text {
+-            self.write_island_value(conduit, &current, &text);
++            if after_history {
++                // The browser command may traverse several native records,
++                // while the document command traverses one canonical entry.
++                // Repair its view without adding a new native edit, which
++                // would discard the browser's redo branch.
++                conduit.element.set_value(&text);
++                self.note_island(|counts| counts.writes += 1);
++            } else {
++                self.write_island_value(conduit, &current, &text);
++            }
+         }
+         *self.text.borrow_mut() = conduit.element.value();
+         self.window_hint.set(start);
+diff --git a/crates/gpui_web/src/window.rs b/crates/gpui_web/src/window.rs
+index 7bd4d52..a3ad0eb 100644
+--- a/crates/gpui_web/src/window.rs
++++ b/crates/gpui_web/src/window.rs
+@@ -777,7 +777,9 @@ impl PlatformWindow for WebWindow {
+                 self.inner.sync_virtual_keyboard(false);
+                 self.inner.ime_mirror.reset_position();
+             }
+-            TextInputStateChange::SelectionChanged | TextInputStateChange::ContentChanged => {}
++            TextInputStateChange::SelectionChanged | TextInputStateChange::ContentChanged => {
++                crate::ime_mirror::ImeMirror::schedule_sync(&self.inner);
++            }
+         }
+     }
+ 
+-- 
+2.53.0
+

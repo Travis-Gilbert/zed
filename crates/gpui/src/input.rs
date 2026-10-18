@@ -90,6 +90,16 @@ pub trait EntityInputHandler: 'static + Sized {
     ) {
     }
 
+    /// See [`InputHandler::set_text_selection`] for details
+    fn set_text_selection(
+        &mut self,
+        selection: UTF16Selection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_selected_text_range(selection.range, window, cx);
+    }
+
     /// See [`InputHandler::text_length_utf16`] for details
     fn text_length_utf16(
         &mut self,
@@ -245,6 +255,12 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
         })
     }
 
+    fn set_text_selection(&mut self, selection: UTF16Selection, window: &mut Window, cx: &mut App) {
+        self.view.update(cx, |view, cx| {
+            view.set_text_selection(selection, window, cx)
+        })
+    }
+
     fn element_bounds(&mut self, _window: &mut Window, _cx: &mut App) -> Option<Bounds<Pixels>> {
         Some(self.element_bounds)
     }
@@ -291,6 +307,98 @@ mod tests {
         ParentElement as _, Render, Styled as _, TestAppContext, TextInputAction,
         TextInputStateChange, canvas, div,
     };
+
+    #[gpui::test]
+    fn platform_composition_fact_tracks_empty_open_phase_without_input_or_focus_mutation(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_, cx| ConfigurationTestView {
+            focus_handle: cx.focus_handle(),
+            configuration: TextInputConfiguration::default(),
+        });
+        let platform = cx.test_window(window.into());
+        cx.update_window(window.into(), |_, window, _| {
+            assert!(!window.is_text_composing());
+            let focus = window.focus;
+            platform.simulate_text_composing(true);
+            assert!(
+                window.is_text_composing(),
+                "empty platform composition is observable without marked text"
+            );
+            assert_eq!(window.focus, focus);
+            assert_eq!(platform.text_input_focus_requests(), 0);
+            assert!(platform.text_input_state_changes().is_empty());
+            platform.simulate_text_composing(false);
+            assert!(
+                !window.is_text_composing(),
+                "commit or cancellation closes the same fact"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn explicit_input_focus_requests_survive_same_handle_and_cancel_on_owner_change(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_, cx| ConfigurationTestView {
+            focus_handle: cx.focus_handle(),
+            configuration: TextInputConfiguration::default(),
+        });
+        let view = window.root(cx).unwrap();
+        let test_window = cx.test_window(window.into());
+        let window = AnyWindowHandle::from(window);
+        cx.update_window(window, |_, window, cx| {
+            let focus = view.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                test_window.text_input_state_changes(),
+                vec![TextInputStateChange::FocusGained]
+            );
+            // Same native handle: no FocusGained event, but the user explicitly
+            // asked to return from a DOM control to this installed editor.
+            window.focus(&focus, cx);
+            assert!(window.request_text_input_focus(&focus));
+            assert_eq!(
+                test_window.text_input_focus_requests(),
+                0,
+                "not delivered under the caller's entity borrow"
+            );
+            window.draw(cx).clear(cx);
+            assert_eq!(test_window.text_input_focus_requests(), 1);
+            assert_eq!(
+                test_window.text_input_state_changes(),
+                vec![TextInputStateChange::FocusGained]
+            );
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                test_window.text_input_focus_requests(),
+                1,
+                "ordinary frames never steal platform focus"
+            );
+            let other = cx.focus_handle();
+            assert!(!window.request_text_input_focus(&other));
+            assert!(window.request_text_input_focus(&focus));
+            window.blur(cx);
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                test_window.text_input_focus_requests(),
+                1,
+                "a stale request cannot focus after blur"
+            );
+            window.focus(&focus, cx);
+            assert!(window.request_text_input_focus(&focus));
+            window.focus(&other, cx);
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                test_window.text_input_focus_requests(),
+                1,
+                "another owner cancels the pending request"
+            );
+        })
+        .unwrap();
+    }
 
     #[gpui::test]
     fn text_input_configuration_and_focus_state_are_forwarded_on_change(cx: &mut TestAppContext) {

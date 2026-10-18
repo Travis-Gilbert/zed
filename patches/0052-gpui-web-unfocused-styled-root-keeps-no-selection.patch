@@ -1,0 +1,44 @@
+From 34328321f0c71c4fc0dd3863de77bcbb36b0c683 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Sun, 18 Oct 2026 10:54:01 -0400
+Subject: [PATCH] fix(gpui-web): keep a styled root's caret out of the
+ selection while unfocused
+
+A selection placed inside an editing host focuses that host in Chromium.
+The conduit sync and the restyle after highlights both wrote the stored
+caret into the styled root whether or not it held focus, so a sync that
+ran after focus had moved elsewhere pulled focus back into the composer.
+In TheoremWeb an unconsumed Escape from Command returned focus to its
+Search invoker, and the next sync took it back into the parked draft.
+StyledInput::set_selection now writes only into a root that holds focus;
+the mirror keeps the caret in its bookkeeping, and ImeMirror::focus writes
+it the moment the root takes focus.
+---
+ crates/gpui_web/src/styled_input.rs | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/crates/gpui_web/src/styled_input.rs b/crates/gpui_web/src/styled_input.rs
+index 2d022e0f0a..85a8421097 100644
+--- a/crates/gpui_web/src/styled_input.rs
++++ b/crates/gpui_web/src/styled_input.rs
+@@ -181,6 +181,17 @@ impl StyledInput {
+         let Some(document) = self.element.owner_document() else {
+             return;
+         };
++        // A selection placed inside an editing host focuses that host
++        // (Chromium), so writing one into a root that does not hold focus
++        // would take focus from wherever it went. Such a root keeps its caret
++        // in the mirror's bookkeeping only; `ImeMirror::focus` writes it the
++        // moment the root takes focus.
++        if !document
++            .active_element()
++            .is_some_and(|active| self.element.contains(Some(&active)))
++        {
++            return;
++        }
+         let Ok(Some(selection)) = document.get_selection() else {
+             return;
+         };
+-- 
+2.53.0
+

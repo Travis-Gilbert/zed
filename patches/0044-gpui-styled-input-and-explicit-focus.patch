@@ -1,0 +1,1414 @@
+From 99bea0733a27767276f3157c61f8a0d2eab957e9 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 17:08:27 -0400
+Subject: [PATCH] feat(gpui-web): retain native styled input presentation
+
+---
+ crates/gpui/src/app/test_context.rs        |  27 +-
+ crates/gpui/src/input.rs                   |  68 ++-
+ crates/gpui/src/platform.rs                |   8 +
+ crates/gpui/src/platform/test/window.rs    |  11 +
+ crates/gpui/src/text_system.rs             |  47 ++
+ crates/gpui/src/window.rs                  |  24 +
+ crates/gpui_web/Cargo.toml                 |   5 +
+ crates/gpui_web/src/editing_island.rs      | 111 ++++-
+ crates/gpui_web/src/events.rs              |   4 +-
+ crates/gpui_web/src/gpui_web.rs            |   4 +-
+ crates/gpui_web/src/ime_mirror.rs          |  88 ++--
+ crates/gpui_web/src/input_edit.rs          |  31 ++
+ crates/gpui_web/src/styled_input.rs        | 484 +++++++++++++++++++++
+ crates/gpui_web/src/window.rs              |   9 +
+ crates/gpui_wgpu/src/cosmic_text_system.rs |  56 +++
+ 15 files changed, 927 insertions(+), 50 deletions(-)
+ create mode 100644 crates/gpui_web/src/styled_input.rs
+
+diff --git a/crates/gpui/src/app/test_context.rs b/crates/gpui/src/app/test_context.rs
+index 1dceee0..c693c15 100644
+--- a/crates/gpui/src/app/test_context.rs
++++ b/crates/gpui/src/app/test_context.rs
+@@ -125,10 +125,35 @@ impl AppContext for TestAppContext {
+ impl TestAppContext {
+     /// Creates a new `TestAppContext`. Usually you can rely on `#[gpui::test]` to do this for you.
+     pub fn build(dispatcher: TestDispatcher, fn_name: Option<&'static str>) -> Self {
++        Self::build_with_optional_text_system(dispatcher, fn_name, None)
++    }
++
++    /// Build the normal test platform with an explicitly supplied real text
++    /// system. This qualifies shaping/caret geometry without claiming OS paint.
++    pub fn build_with_text_system(
++        dispatcher: TestDispatcher,
++        fn_name: Option<&'static str>,
++        text_system: Arc<dyn crate::PlatformTextSystem>,
++    ) -> Self {
++        Self::build_with_optional_text_system(dispatcher, fn_name, Some(text_system))
++    }
++
++    fn build_with_optional_text_system(
++        dispatcher: TestDispatcher,
++        fn_name: Option<&'static str>,
++        text_system: Option<Arc<dyn crate::PlatformTextSystem>>,
++    ) -> Self {
+         let arc_dispatcher = Arc::new(dispatcher.clone());
+         let background_executor = BackgroundExecutor::new(arc_dispatcher.clone());
+         let foreground_executor = ForegroundExecutor::new(arc_dispatcher);
+-        let platform = TestPlatform::new(background_executor.clone(), foreground_executor.clone());
++        let platform = match text_system {
++            Some(text_system) => TestPlatform::with_text_system(
++                background_executor.clone(),
++                foreground_executor.clone(),
++                text_system,
++            ),
++            None => TestPlatform::new(background_executor.clone(), foreground_executor.clone()),
++        };
+         let asset_source = Arc::new(());
+         let http_client = http_client::FakeHttpClient::with_404_response();
+         let text_system = Arc::new(TextSystem::new(platform.text_system()));
+diff --git a/crates/gpui/src/input.rs b/crates/gpui/src/input.rs
+index f267cff..6038f6e 100644
+--- a/crates/gpui/src/input.rs
++++ b/crates/gpui/src/input.rs
+@@ -256,8 +256,9 @@ impl<V: EntityInputHandler> InputHandler for ElementInputHandler<V> {
+     }
+ 
+     fn set_text_selection(&mut self, selection: UTF16Selection, window: &mut Window, cx: &mut App) {
+-        self.view
+-            .update(cx, |view, cx| view.set_text_selection(selection, window, cx))
++        self.view.update(cx, |view, cx| {
++            view.set_text_selection(selection, window, cx)
++        })
+     }
+ 
+     fn element_bounds(&mut self, _window: &mut Window, _cx: &mut App) -> Option<Bounds<Pixels>> {
+@@ -307,6 +308,69 @@ mod tests {
+         TextInputStateChange, canvas, div,
+     };
+ 
++    #[gpui::test]
++    fn explicit_input_focus_requests_survive_same_handle_and_cancel_on_owner_change(
++        cx: &mut TestAppContext,
++    ) {
++        let window = cx.add_window(|_, cx| ConfigurationTestView {
++            focus_handle: cx.focus_handle(),
++            configuration: TextInputConfiguration::default(),
++        });
++        let view = window.root(cx).unwrap();
++        let test_window = cx.test_window(window.into());
++        let window = AnyWindowHandle::from(window);
++        cx.update_window(window, |_, window, cx| {
++            let focus = view.read(cx).focus_handle.clone();
++            window.focus(&focus, cx);
++            window.draw(cx).clear(cx);
++            assert_eq!(
++                test_window.text_input_state_changes(),
++                vec![TextInputStateChange::FocusGained]
++            );
++            // Same native handle: no FocusGained event, but the user explicitly
++            // asked to return from a DOM control to this installed editor.
++            window.focus(&focus, cx);
++            assert!(window.request_text_input_focus(&focus));
++            assert_eq!(
++                test_window.text_input_focus_requests(),
++                0,
++                "not delivered under the caller's entity borrow"
++            );
++            window.draw(cx).clear(cx);
++            assert_eq!(test_window.text_input_focus_requests(), 1);
++            assert_eq!(
++                test_window.text_input_state_changes(),
++                vec![TextInputStateChange::FocusGained]
++            );
++            window.draw(cx).clear(cx);
++            assert_eq!(
++                test_window.text_input_focus_requests(),
++                1,
++                "ordinary frames never steal platform focus"
++            );
++            let other = cx.focus_handle();
++            assert!(!window.request_text_input_focus(&other));
++            assert!(window.request_text_input_focus(&focus));
++            window.blur(cx);
++            window.draw(cx).clear(cx);
++            assert_eq!(
++                test_window.text_input_focus_requests(),
++                1,
++                "a stale request cannot focus after blur"
++            );
++            window.focus(&focus, cx);
++            assert!(window.request_text_input_focus(&focus));
++            window.focus(&other, cx);
++            window.draw(cx).clear(cx);
++            assert_eq!(
++                test_window.text_input_focus_requests(),
++                1,
++                "another owner cancels the pending request"
++            );
++        })
++        .unwrap();
++    }
++
+     #[gpui::test]
+     fn text_input_configuration_and_focus_state_are_forwarded_on_change(cx: &mut TestAppContext) {
+         let custom = TextInputConfiguration {
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 7a013e1..c7d9ad1 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1172,6 +1172,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+     /// Requests that the soft keyboard be hidden.
+     fn hide_soft_keyboard(&self) {}
+ 
++    /// Explicitly restore the currently installed text input's platform focus.
++    /// This is an intent, separate from a change in native focus ownership.
++    fn request_text_input_focus(&self) {}
++
+     /// Inform the operating system that the text input state has changed
+     fn text_input_state_changed(&self, _change: TextInputStateChange) {}
+ 
+@@ -1287,6 +1291,10 @@ pub trait PlatformTextSystem: Send + Sync {
+     fn all_font_names(&self) -> Vec<String>;
+     /// Get the font ID for a font descriptor.
+     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
++    /// Observe an already selected face without rerunning a platform matcher.
++    fn resolved_font_face(&self, _font_id: FontId) -> Option<crate::ResolvedFontFace> {
++        None
++    }
+     /// Prewarm any system font caches needed to shape text.
+     fn prewarm_fonts(&self, _font_ids: &[FontId]) {}
+     /// Get metrics for a font.
+diff --git a/crates/gpui/src/platform/test/window.rs b/crates/gpui/src/platform/test/window.rs
+index 38926b6..1ce6a77 100644
+--- a/crates/gpui/src/platform/test/window.rs
++++ b/crates/gpui/src/platform/test/window.rs
+@@ -45,6 +45,7 @@ pub(crate) struct TestWindowState {
+     input_handler: Option<PlatformInputHandler>,
+     text_input_configurations: Vec<TextInputConfiguration>,
+     text_input_state_changes: Vec<TextInputStateChange>,
++    text_input_focus_requests: u64,
+     is_fullscreen: bool,
+     appearance: WindowAppearance,
+     external_drag_files: Vec<(PathBuf, bool)>,
+@@ -109,6 +110,7 @@ impl TestWindow {
+             input_handler: None,
+             text_input_configurations: Vec::new(),
+             text_input_state_changes: Vec::new(),
++            text_input_focus_requests: 0,
+             is_fullscreen: false,
+             appearance: WindowAppearance::Light,
+             external_drag_files: Vec::new(),
+@@ -143,6 +145,11 @@ impl TestWindow {
+         self.0.lock().text_input_configurations.clone()
+     }
+ 
++    /// Explicit platform input focus requests delivered after native prepaint.
++    pub fn text_input_focus_requests(&self) -> u64 {
++        self.0.lock().text_input_focus_requests
++    }
++
+     pub fn text_input_state_changes(&self) -> Vec<TextInputStateChange> {
+         self.0.lock().text_input_state_changes.clone()
+     }
+@@ -276,6 +283,10 @@ impl PlatformWindow for TestWindow {
+         self.0.lock().text_input_configurations.push(configuration);
+     }
+ 
++    fn request_text_input_focus(&self) {
++        self.0.lock().text_input_focus_requests += 1;
++    }
++
+     fn text_input_state_changed(&self, change: TextInputStateChange) {
+         self.0.lock().text_input_state_changes.push(change);
+     }
+diff --git a/crates/gpui/src/text_system.rs b/crates/gpui/src/text_system.rs
+index 3346389..498b8ca 100644
+--- a/crates/gpui/src/text_system.rs
++++ b/crates/gpui/src/text_system.rs
+@@ -139,6 +139,12 @@ impl TextSystem {
+             .next()
+     }
+ 
++    /// Observe the platform face behind an existing font identifier.
++    /// `None` means the backend cannot expose it or the identifier is absent.
++    pub fn resolved_font_face(&self, id: FontId) -> Option<ResolvedFontFace> {
++        self.platform_text_system.resolved_font_face(id)
++    }
++
+     /// Resolves the specified font, falling back to the default font stack if
+     /// the font fails to load.
+     ///
+@@ -980,6 +986,47 @@ impl schemars::JsonSchema for FontWeight {
+     }
+ }
+ 
++/// Read-only identity of the face actually selected by a platform font system.
++#[derive(Clone, Debug, PartialEq)]
++pub struct ResolvedFontFace {
++    family: SharedString,
++    post_script_name: SharedString,
++    weight: FontWeight,
++    style: FontStyle,
++}
++impl ResolvedFontFace {
++    /// Construct metadata from an already selected platform face.
++    pub fn new(
++        family: SharedString,
++        post_script_name: SharedString,
++        weight: FontWeight,
++        style: FontStyle,
++    ) -> Self {
++        Self {
++            family,
++            post_script_name,
++            weight,
++            style,
++        }
++    }
++    /// The selected face's primary family.
++    pub fn family(&self) -> &SharedString {
++        &self.family
++    }
++    /// The selected face's PostScript identity.
++    pub fn post_script_name(&self) -> &SharedString {
++        &self.post_script_name
++    }
++    /// The selected face's actual weight, which may differ from the request.
++    pub fn weight(&self) -> FontWeight {
++        self.weight
++    }
++    /// The selected face's actual style, which may differ from the request.
++    pub fn style(&self) -> FontStyle {
++        self.style
++    }
++}
++
+ /// Allows italic or oblique faces to be selected.
+ #[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Default, Serialize, Deserialize, JsonSchema)]
+ pub enum FontStyle {
+diff --git a/crates/gpui/src/window.rs b/crates/gpui/src/window.rs
+index 87b29dd..cde0ab7 100644
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -1175,6 +1175,7 @@ pub struct Window {
+     /// input session can restart the IME connection).
+     last_text_input_configuration: Option<TextInputConfiguration>,
+     focused_text_input_active: bool,
++    requested_text_input_focus: Option<FocusId>,
+     /// The caret rectangle last pushed to the platform, so the push happens
+     /// on change rather than every frame.
+     last_ime_bounds: Option<Bounds<Pixels>>,
+@@ -2005,6 +2006,7 @@ impl Window {
+             requested_autoscroll: None,
+             last_text_input_configuration: None,
+             focused_text_input_active: false,
++            requested_text_input_focus: None,
+             last_ime_bounds: None,
+             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+@@ -2225,6 +2227,19 @@ impl Window {
+         self.refresh();
+     }
+ 
++    /// Request platform focus for an explicit focus intent on the current
++    /// native handle, including when that handle was already focused. Delivery
++    /// waits for the next paint to install its actual input handler. A later
++    /// focus/blur cancels the request; ordinary redraws never request focus.
++    pub fn request_text_input_focus(&mut self, handle: &FocusHandle) -> bool {
++        if !self.focus_enabled || self.focus != Some(handle.id) {
++            return false;
++        }
++        self.requested_text_input_focus = Some(handle.id);
++        self.refresh();
++        true
++    }
++
+     /// Remove focus from all elements within this context's window.
+     pub fn blur(&mut self, cx: &mut App) {
+         self.clear_pending_keystrokes(cx);
+@@ -3143,6 +3158,15 @@ impl Window {
+                 });
+         }
+ 
++        if self
++            .requested_text_input_focus
++            .take()
++            .is_some_and(|requested| self.focus == Some(requested))
++            && focused_text_input_active
++        {
++            self.platform_window.request_text_input_focus();
++        }
++
+         self.layout_engine.as_mut().unwrap().clear();
+         self.text_system().finish_frame();
+         self.next_frame.finish(&mut self.rendered_frame);
+diff --git a/crates/gpui_web/Cargo.toml b/crates/gpui_web/Cargo.toml
+index 344c610..8e51c25 100644
+--- a/crates/gpui_web/Cargo.toml
++++ b/crates/gpui_web/Cargo.toml
+@@ -71,6 +71,11 @@ web-sys = { version = "0.3", features = [
+     "MouseEvent",
+     "Navigator",
+     "Node",
++    "NodeList",
++    "Text",
++    "Selection",
++    "Range",
++    "CharacterData",
+     "Performance",
+     "PointerEvent",
+     "ReadableStream",
+diff --git a/crates/gpui_web/src/editing_island.rs b/crates/gpui_web/src/editing_island.rs
+index 8b8c88d..6bd56b0 100644
+--- a/crates/gpui_web/src/editing_island.rs
++++ b/crates/gpui_web/src/editing_island.rs
+@@ -9,7 +9,11 @@
+ //! selection, the composition, and the history: the element is a view of
+ //! them that the browser may edit.
+ 
+-use std::{cell::RefCell, rc::Weak};
++use std::{
++    cell::RefCell,
++    rc::{Rc, Weak},
++};
++use wasm_bindgen::JsCast;
+ 
+ use crate::{events::EventListenerHandle, ime_mirror::EditingIslandCounts, window::WebWindowInner};
+ 
+@@ -26,7 +30,7 @@ pub(crate) fn publish_window(window: Weak<WebWindowInner>) {
+ /// page and returns the window to its hidden conduit.
+ pub struct EditingIsland {
+     window: Weak<WebWindowInner>,
+-    element: web_sys::HtmlTextAreaElement,
++    element: web_sys::HtmlElement,
+     adoption: u64,
+     _listeners: Vec<EventListenerHandle>,
+ }
+@@ -42,6 +46,7 @@ impl EditingIsland {
+             return None;
+         }
+         let adoption = inner.ime_mirror.adopt_island(&inner, element.clone());
++        let element: web_sys::HtmlElement = element.unchecked_into();
+         let listeners = inner.attach_input_listeners(&element, adoption);
+         Some(Self {
+             window,
+@@ -53,7 +58,7 @@ impl EditingIsland {
+ 
+     /// The adopted element.
+     pub fn element(&self) -> &web_sys::HtmlTextAreaElement {
+-        &self.element
++        self.element.unchecked_ref()
+     }
+ 
+     /// Make the island the live conduit (`true`) or return input to the
+@@ -109,6 +114,16 @@ impl EditingIsland {
+         }
+     }
+ 
++    /// Whether this handle still owns the current adopted incarnation,
++    /// independently of whether it is live. Retired handles stay retired.
++    pub fn is_current_adoption(&self) -> bool {
++        self.window.upgrade().is_some_and(|inner| {
++            inner
++                .ime_mirror
++                .owns_island_adoption(&self.element, self.adoption)
++        })
++    }
++
+     /// Whether this adoption is still the live conduit.
+     pub fn is_live(&self) -> bool {
+         self.window.upgrade().is_some_and(|inner| {
+@@ -158,3 +173,93 @@ impl Drop for EditingIsland {
+         }
+     }
+ }
++
++/// A page-owned contenteditable realization of the same focused input handler.
++/// The conduit alone writes text, selection and styled descendants. Styles are
++/// presentation metadata, never edits or an independent history.
++pub struct StyledEditingIsland {
++    lease: EditingIsland,
++    input: Rc<crate::styled_input::StyledInput>,
++}
++impl StyledEditingIsland {
++    /// Adopt a retained root; refusal during composition preserves its predecessor.
++    pub fn adopt(element: web_sys::HtmlElement) -> Option<Self> {
++        let window = WINDOW.with(|slot| slot.borrow().clone());
++        let inner = window.upgrade()?;
++        if inner.is_composing.get() {
++            return None;
++        }
++        let input = Rc::new(crate::styled_input::StyledInput::new(element.clone()));
++        let adoption = inner.ime_mirror.adopt_styled_island(&inner, input.clone());
++        let listeners = inner.attach_input_listeners(&element, adoption);
++        Some(Self {
++            lease: EditingIsland {
++                window,
++                element,
++                adoption,
++                _listeners: listeners,
++            },
++            input,
++        })
++    }
++    /// The retained page-owned root.
++    pub fn element(&self) -> &web_sys::HtmlElement {
++        &self.lease.element
++    }
++    /// Activate or deactivate this adoption, refusing swaps during composition.
++    pub fn set_live(&self, live: bool) -> bool {
++        self.lease.set_live(live)
++    }
++    /// Whether this handle owns the current adoption, including while inactive.
++    pub fn is_current_adoption(&self) -> bool {
++        self.lease.is_current_adoption()
++    }
++    /// Whether this incarnation is still the live conduit.
++    pub fn is_live(&self) -> bool {
++        self.lease.is_live()
++    }
++    /// Whether the platform composition is open.
++    pub fn composing(&self) -> bool {
++        self.lease.composing()
++    }
++    /// Use normal browser focus order for unmodified Tab on the live root.
++    pub fn set_native_tab_navigation(&self, enabled: bool) -> bool {
++        self.lease.set_native_tab_navigation(enabled)
++    }
++    /// Request the existing coalesced canonical reconciliation.
++    pub fn request_sync(&self) {
++        self.lease.request_sync();
++    }
++    /// Whether a platform input handler is registered.
++    pub fn input_handler_present(&self) -> Option<bool> {
++        self.lease.input_handler_present()
++    }
++    /// Read-only counts for this adoption only.
++    pub fn counts(&self) -> EditingIslandCounts {
++        self.lease.counts()
++    }
++    /// Publish scalar-safe, resolved native styles for exactly `expected_text`.
++    /// No text or history changes; descendants stay untouched during composition.
++    pub fn set_highlights(
++        &self,
++        expected_text: &str,
++        runs: Vec<crate::styled_input::StyledTextRun>,
++    ) -> Result<(), crate::styled_input::StyledInputRefusal> {
++        use crate::styled_input::StyledInputRefusal;
++        let inner = self
++            .lease
++            .window
++            .upgrade()
++            .ok_or(StyledInputRefusal::Stale)?;
++        if !inner
++            .ime_mirror
++            .owns_island_adoption(&self.lease.element, self.lease.adoption)
++        {
++            return Err(StyledInputRefusal::Stale);
++        }
++        if inner.is_composing.get() {
++            return Err(StyledInputRefusal::Busy);
++        }
++        self.input.set_highlights(expected_text, runs)
++    }
++}
+diff --git a/crates/gpui_web/src/events.rs b/crates/gpui_web/src/events.rs
+index 895d7c9..2c89dcb 100644
+--- a/crates/gpui_web/src/events.rs
++++ b/crates/gpui_web/src/events.rs
+@@ -225,7 +225,7 @@ impl WebWindowInner {
+     /// the window was created. The handles detach them when dropped.
+     pub(crate) fn attach_input_listeners(
+         self: &Rc<Self>,
+-        element: &web_sys::HtmlTextAreaElement,
++        element: &web_sys::HtmlElement,
+         adoption: u64,
+     ) -> Vec<EventListenerHandle> {
+         self.input_listeners
+@@ -846,7 +846,7 @@ impl WebWindowInner {
+             if is_tab
+                 && event
+                     .target()
+-                    .and_then(|target| target.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
++                    .and_then(|target| target.dyn_into::<web_sys::HtmlElement>().ok())
+                     .is_some_and(|element| this.ime_mirror.island_uses_native_tab(&element))
+             {
+                 // The visible page-owned editor participates in browser
+diff --git a/crates/gpui_web/src/gpui_web.rs b/crates/gpui_web/src/gpui_web.rs
+index 7f837ad..869ba04 100644
+--- a/crates/gpui_web/src/gpui_web.rs
++++ b/crates/gpui_web/src/gpui_web.rs
+@@ -9,6 +9,7 @@ mod a11y;
+ mod dispatcher;
+ mod display;
+ mod editing_island;
++mod styled_input;
+ mod events;
+ mod file_drop;
+ mod http_client;
+@@ -25,7 +26,8 @@ mod window;
+ pub use a11y::{A11yMirrorSummary, a11y_mirror_summary};
+ pub use dispatcher::WebDispatcher;
+ pub use display::WebDisplay;
+-pub use editing_island::EditingIsland;
++pub use editing_island::{EditingIsland, StyledEditingIsland};
++pub use styled_input::{StyledInputRefusal, StyledTextRun};
+ pub use ime_mirror::EditingIslandCounts;
+ pub use file_drop::{WebFileDrop, web_file_drops};
+ pub use gpui_wgpu::WebBackendPreference;
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index 7b89685..8ffefcb 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -170,6 +170,7 @@ enum ConduitElement {
+     /// A single-line capability: an input, whose value sanitization strips
+     /// line breaks from an assigned value.
+     Input(web_sys::HtmlInputElement),
++    Styled(Rc<crate::styled_input::StyledInput>),
+ }
+ 
+ impl ConduitElement {
+@@ -177,6 +178,7 @@ impl ConduitElement {
+         let element: &web_sys::HtmlElement = match self {
+             Self::TextArea(element) => element.as_ref(),
+             Self::Input(element) => element.as_ref(),
++            Self::Styled(element) => element.element(),
+         };
+         element
+     }
+@@ -185,6 +187,7 @@ impl ConduitElement {
+         match self {
+             Self::TextArea(element) => element.value(),
+             Self::Input(element) => element.value(),
++            Self::Styled(element) => element.value(),
+         }
+     }
+ 
+@@ -192,6 +195,7 @@ impl ConduitElement {
+         match self {
+             Self::TextArea(element) => element.set_value(value),
+             Self::Input(element) => element.set_value(value),
++            Self::Styled(element) => element.set_value(value),
+         }
+     }
+ 
+@@ -199,6 +203,7 @@ impl ConduitElement {
+         match self {
+             Self::TextArea(element) => element.selection_start().ok().flatten(),
+             Self::Input(element) => element.selection_start().ok().flatten(),
++            Self::Styled(element) => element.selection().map(|(start, _, _)| start),
+         }
+     }
+ 
+@@ -206,6 +211,7 @@ impl ConduitElement {
+         match self {
+             Self::TextArea(element) => element.selection_end().ok().flatten(),
+             Self::Input(element) => element.selection_end().ok().flatten(),
++            Self::Styled(element) => element.selection().map(|(_, end, _)| end),
+         }
+     }
+ 
+@@ -219,6 +225,9 @@ impl ConduitElement {
+         let direction = match self {
+             Self::TextArea(element) => element.selection_direction(),
+             Self::Input(element) => element.selection_direction(),
++            Self::Styled(element) => {
++                return element.selection().is_some_and(|(_, _, reversed)| reversed);
++            }
+         };
+         direction.ok().flatten().as_deref() == Some("backward")
+     }
+@@ -232,6 +241,10 @@ impl ConduitElement {
+             Self::Input(element) => element
+                 .set_selection_range_with_direction(start, end, direction)
+                 .ok(),
++            Self::Styled(element) => {
++                element.set_selection(start, end, reversed);
++                None
++            }
+         };
+     }
+ 
+@@ -239,6 +252,7 @@ impl ConduitElement {
+         match self {
+             Self::TextArea(element) => element.read_only(),
+             Self::Input(element) => element.read_only(),
++            Self::Styled(element) => element.element().content_editable() == "false",
+         }
+     }
+ 
+@@ -246,6 +260,11 @@ impl ConduitElement {
+         match self {
+             Self::TextArea(element) => element.set_read_only(read_only),
+             Self::Input(element) => element.set_read_only(read_only),
++            Self::Styled(element) => element.element().set_content_editable(if read_only {
++                "false"
++            } else {
++                "plaintext-only"
++            }),
+         }
+     }
+ 
+@@ -259,7 +278,7 @@ impl ConduitElement {
+     /// document edit -- would be computed against text that is not there.
+     fn holds(&self, text: &str) -> bool {
+         match self {
+-            Self::TextArea(_) => true,
++            Self::TextArea(_) | Self::Styled(_) => true,
+             Self::Input(_) => !text.contains(['\n', '\r']),
+         }
+     }
+@@ -1053,6 +1072,9 @@ impl ImeMirror {
+     /// back would restart the IME mid-gesture.
+     pub(crate) fn adopt_element_state(&self) {
+         let conduit = self.live_conduit();
++        if let ConduitElement::Styled(input) = &conduit.element {
++            input.invalidate_styles();
++        }
+         *self.text.borrow_mut() = conduit.element.value();
+         let selection_start = self.selection_start().unwrap_or(0);
+         let selection_end = conduit.element.selection_end().unwrap_or(selection_start);
+@@ -1100,6 +1122,18 @@ impl ImeMirror {
+         window: &WebWindowInner,
+         element: web_sys::HtmlTextAreaElement,
+     ) -> u64 {
++        self.adopt_conduit(window, ConduitElement::TextArea(element))
++    }
++
++    pub(crate) fn adopt_styled_island(
++        &self,
++        window: &WebWindowInner,
++        element: Rc<crate::styled_input::StyledInput>,
++    ) -> u64 {
++        self.adopt_conduit(window, ConduitElement::Styled(element))
++    }
++
++    fn adopt_conduit(&self, window: &WebWindowInner, element: ConduitElement) -> u64 {
+         // Retire the old conduit before publishing its successor. The public
+         // adoption gate has already refused an open composition.
+         self.set_island_live(window, false);
+@@ -1109,14 +1143,14 @@ impl ImeMirror {
+                 .remove_attribute(ISLAND_ATTRIBUTE)
+                 .ok();
+         }
+-        let html: &web_sys::Element = element.as_ref();
++        let html: &web_sys::Element = element.as_element().as_ref();
+         // The island names itself. The accessibility adapter reads this to
+         // leave the page's label alone when it claims the island for the
+         // focused node.
+         html.set_attribute(ISLAND_ATTRIBUTE, "").ok();
+         self.island.replace(Some(Rc::new(Conduit {
+             capability: PlatformNativeElement::EditableLeaf,
+-            element: ConduitElement::TextArea(element),
++            element,
+             page_owned: true,
+         })));
+         self.island_native_tab.set(false);
+@@ -1132,21 +1166,22 @@ impl ImeMirror {
+ 
+     pub(crate) fn owns_island_adoption(
+         &self,
+-        element: &web_sys::HtmlTextAreaElement,
++        element: &web_sys::HtmlElement,
+         adoption: u64,
+     ) -> bool {
+         self.island_adoption.get() == adoption && self.owns_island(element)
+     }
+ 
+-    pub(crate) fn owns_island(&self, element: &web_sys::HtmlTextAreaElement) -> bool {
+-        self.island.borrow().as_ref().is_some_and(|island| {
+-            matches!(&island.element, ConduitElement::TextArea(adopted) if adopted == element)
+-        })
++    pub(crate) fn owns_island(&self, element: &web_sys::HtmlElement) -> bool {
++        self.island
++            .borrow()
++            .as_ref()
++            .is_some_and(|island| island.as_element() == element)
+     }
+ 
+     pub(crate) fn set_island_native_tab(
+         &self,
+-        element: &web_sys::HtmlTextAreaElement,
++        element: &web_sys::HtmlElement,
+         adoption: u64,
+         enabled: bool,
+     ) -> bool {
+@@ -1157,7 +1192,7 @@ impl ImeMirror {
+         true
+     }
+ 
+-    pub(crate) fn island_uses_native_tab(&self, element: &web_sys::HtmlTextAreaElement) -> bool {
++    pub(crate) fn island_uses_native_tab(&self, element: &web_sys::HtmlElement) -> bool {
+         self.island_native_tab.get() && self.island_is_live() && self.owns_island(element)
+     }
+ 
+@@ -1166,7 +1201,7 @@ impl ImeMirror {
+     pub(crate) fn release_island(
+         &self,
+         window: &WebWindowInner,
+-        element: &web_sys::HtmlTextAreaElement,
++        element: &web_sys::HtmlElement,
+         adoption: u64,
+     ) {
+         if !self.owns_island_adoption(element, adoption) {
+@@ -1665,36 +1700,7 @@ impl ImeMirror {
+ /// The attribute an adopted editing island carries while it is adopted.
+ pub(crate) const ISLAND_ATTRIBUTE: &str = "data-gpui-editing-island";
+ 
+-/// The smallest replacement turning `current` into `text`, as
+-/// `(start, removed_end, inserted)` in UTF-16 code units of `current`.
+-///
+-/// Neither end splits a surrogate pair: a replacement that began or ended
+-/// between the two halves of an astral character would write half of one.
+-fn minimal_replacement(current: &str, text: &str) -> (usize, usize, String) {
+-    let old: Vec<u16> = current.encode_utf16().collect();
+-    let new: Vec<u16> = text.encode_utf16().collect();
+-    let mut prefix = old
+-        .iter()
+-        .zip(new.iter())
+-        .take_while(|(left, right)| left == right)
+-        .count();
+-    if prefix > 0 && (0xD800..0xDC00).contains(&old[prefix - 1]) {
+-        prefix -= 1;
+-    }
+-    let most = old.len().min(new.len()) - prefix;
+-    let mut suffix = old
+-        .iter()
+-        .rev()
+-        .zip(new.iter().rev())
+-        .take(most)
+-        .take_while(|(left, right)| left == right)
+-        .count();
+-    if suffix > 0 && (0xDC00..0xE000).contains(&new[new.len() - suffix]) {
+-        suffix -= 1;
+-    }
+-    let inserted = String::from_utf16_lossy(&new[prefix..new.len() - suffix]);
+-    (prefix, old.len() - suffix, inserted)
+-}
++use crate::input_edit::minimal_replacement;
+ 
+ /// The line-break-free segment of `text` that contains the caret, as
+ /// `(start, line)` in UTF-16 code units from `text`'s start.
+diff --git a/crates/gpui_web/src/input_edit.rs b/crates/gpui_web/src/input_edit.rs
+index dff6614..ff806a4 100644
+--- a/crates/gpui_web/src/input_edit.rs
++++ b/crates/gpui_web/src/input_edit.rs
+@@ -174,3 +174,34 @@ mod tests {
+         }
+     }
+ }
++
++/// The smallest replacement turning `current` into `text`, as
++/// `(start, removed_end, inserted)` in UTF-16 code units of `current`.
++///
++/// Neither end splits a surrogate pair: a replacement that began or ended
++/// between the two halves of an astral character would write half of one.
++pub(crate) fn minimal_replacement(current: &str, text: &str) -> (usize, usize, String) {
++    let old: Vec<u16> = current.encode_utf16().collect();
++    let new: Vec<u16> = text.encode_utf16().collect();
++    let mut prefix = old
++        .iter()
++        .zip(new.iter())
++        .take_while(|(left, right)| left == right)
++        .count();
++    if prefix > 0 && (0xD800..0xDC00).contains(&old[prefix - 1]) {
++        prefix -= 1;
++    }
++    let most = old.len().min(new.len()) - prefix;
++    let mut suffix = old
++        .iter()
++        .rev()
++        .zip(new.iter().rev())
++        .take(most)
++        .take_while(|(left, right)| left == right)
++        .count();
++    if suffix > 0 && (0xDC00..0xE000).contains(&new[new.len() - suffix]) {
++        suffix -= 1;
++    }
++    let inserted = String::from_utf16_lossy(&new[prefix..new.len() - suffix]);
++    (prefix, old.len() - suffix, inserted)
++}
+diff --git a/crates/gpui_web/src/styled_input.rs b/crates/gpui_web/src/styled_input.rs
+new file mode 100644
+index 0000000..98d24bf
+--- /dev/null
++++ b/crates/gpui_web/src/styled_input.rs
+@@ -0,0 +1,484 @@
++//! Text/UTF-16 selection adapter for the existing IME conduit. Descendants
++//! are presentation only; the focused input handler remains the document.
++use std::{cell::RefCell, ops::Range};
++
++use gpui::{FontStyle, HighlightStyle};
++use wasm_bindgen::{JsCast, JsValue};
++
++/// One resolved native style over scalar-safe UTF-8 byte offsets.
++#[derive(Clone, Debug, PartialEq)]
++pub struct StyledTextRun {
++    /// Range in the canonical document, in UTF-8 bytes.
++    pub range: Range<usize>,
++    /// Absolute native presentation after applying the final highlight to the
++    /// actual base TextStyle and resolving its selected font face. Color is
++    /// final ink (including alpha), not a relative highlight blend.
++    pub style: HighlightStyle,
++}
++
++/// A style projection that could not be applied without changing authority.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum StyledInputRefusal {
++    /// The handle no longer owns the adopted incarnation.
++    Stale,
++    /// Browser composition owns the descendants until commit or cancellation.
++    Busy,
++    /// The supplied styles describe another document revision.
++    TextMismatch,
++    /// A range is reversed, out of bounds, or splits a Unicode scalar.
++    InvalidRange,
++    /// CSS cannot express the supplied style without dropping a native fact.
++    UnsupportedStyle,
++    /// The browser refused an operation on the retained subtree.
++    Dom,
++}
++impl From<JsValue> for StyledInputRefusal {
++    fn from(_: JsValue) -> Self {
++        Self::Dom
++    }
++}
++
++#[derive(Clone)]
++struct Boundary {
++    node: web_sys::Node,
++    offset: u32,
++    text: u32,
++}
++#[derive(Clone)]
++struct Leaf {
++    node: web_sys::Text,
++    range: Range<u32>,
++}
++struct Snapshot {
++    text: String,
++    points: Vec<Boundary>,
++    leaves: Vec<Leaf>,
++}
++impl Snapshot {
++    fn new(root: &web_sys::HtmlElement) -> Self {
++        let mut result = Self {
++            text: String::new(),
++            points: vec![],
++            leaves: vec![],
++        };
++        result.visit(root.as_ref(), true);
++        result
++    }
++    fn len(&self) -> u32 {
++        self.text.encode_utf16().count() as u32
++    }
++    fn visit(&mut self, node: &web_sys::Node, root: bool) {
++        if let Some(text) = node.dyn_ref::<web_sys::Text>() {
++            let start = self.len();
++            self.text.push_str(&text.data());
++            self.leaves.push(Leaf {
++                node: text.clone(),
++                range: start..self.len(),
++            });
++            return;
++        }
++        let tag = node
++            .dyn_ref::<web_sys::Element>()
++            .map(|e| e.tag_name())
++            .unwrap_or_default();
++        if tag == "BR" {
++            // Browsers keep one BR in an otherwise empty editing block.
++            let placeholder = node.next_sibling().is_none();
++            self.points.push(Boundary {
++                node: node.clone(),
++                offset: 0,
++                text: self.len(),
++            });
++            if !placeholder {
++                self.text.push('\n');
++            }
++            return;
++        }
++        let block = !root && matches!(tag.as_str(), "DIV" | "P");
++        if block && node.previous_sibling().is_some() {
++            self.text.push('\n');
++        }
++        let children = node.child_nodes();
++        for i in 0..=children.length() {
++            self.points.push(Boundary {
++                node: node.clone(),
++                offset: i,
++                text: self.len(),
++            });
++            if let Some(child) = children.item(i) {
++                self.visit(&child, false);
++            }
++        }
++        if block
++            && node.next_sibling().is_some_and(|next| {
++                !next
++                    .dyn_ref::<web_sys::Element>()
++                    .is_some_and(|next| matches!(next.tag_name().as_str(), "DIV" | "P"))
++            })
++        {
++            self.text.push('\n');
++        }
++    }
++    fn offset(&self, node: &web_sys::Node, offset: u32) -> Option<u32> {
++        if let Some(leaf) = self.leaves.iter().find(|leaf| <web_sys::Text as AsRef<web_sys::Node>>::as_ref(&leaf.node) == node) {
++            return (offset <= leaf.range.end - leaf.range.start)
++                .then_some(leaf.range.start + offset);
++        }
++        self.points
++            .iter()
++            .find(|point| point.node == *node && point.offset == offset)
++            .map(|point| point.text)
++    }
++    fn point(&self, offset: u32) -> Option<(web_sys::Node, u32)> {
++        self.leaves
++            .iter()
++            .find(|leaf| leaf.range.start <= offset && offset <= leaf.range.end)
++            .map(|leaf| (leaf.node.clone().into(), offset - leaf.range.start))
++            .or_else(|| {
++                self.points
++                    .iter()
++                    .find(|point| point.text == offset)
++                    .map(|point| (point.node.clone(), point.offset))
++            })
++    }
++}
++
++pub(crate) struct StyledInput {
++    element: web_sys::HtmlElement,
++    applied: RefCell<Option<(String, Vec<StyledTextRun>)>>,
++}
++impl StyledInput {
++    pub(crate) fn new(element: web_sys::HtmlElement) -> Self {
++        Self {
++            element,
++            applied: RefCell::new(None),
++        }
++    }
++    pub(crate) fn element(&self) -> &web_sys::HtmlElement {
++        &self.element
++    }
++    pub(crate) fn invalidate_styles(&self) {
++        self.applied.replace(None);
++    }
++    pub(crate) fn value(&self) -> String {
++        Snapshot::new(&self.element).text
++    }
++    pub(crate) fn selection(&self) -> Option<(u32, u32, bool)> {
++        let selection = self.element.owner_document()?.get_selection().ok()??;
++        let snapshot = Snapshot::new(&self.element);
++        let anchor = snapshot.offset(&selection.anchor_node()?, selection.anchor_offset())?;
++        let focus = snapshot.offset(&selection.focus_node()?, selection.focus_offset())?;
++        Some((anchor.min(focus), anchor.max(focus), focus < anchor))
++    }
++    pub(crate) fn set_selection(&self, start: u32, end: u32, reversed: bool) {
++        let Some(document) = self.element.owner_document() else {
++            return;
++        };
++        let Ok(Some(selection)) = document.get_selection() else {
++            return;
++        };
++        let snapshot = Snapshot::new(&self.element);
++        let Some((start_node, start_offset)) = snapshot.point(start) else {
++            return;
++        };
++        let Some((end_node, end_offset)) = snapshot.point(end) else {
++            return;
++        };
++        let _ = if reversed {
++            selection.set_base_and_extent(&end_node, end_offset, &start_node, start_offset)
++        } else {
++            selection.set_base_and_extent(&start_node, start_offset, &end_node, end_offset)
++        };
++    }
++    pub(crate) fn set_value(&self, value: &str) {
++        if let Some(document) = self.element.owner_document() {
++            let _ = self.normalize_blocks(&document);
++        }
++        let snapshot = Snapshot::new(&self.element);
++        if snapshot.text == value {
++            return;
++        }
++        let (start, end, inserted) = crate::input_edit::minimal_replacement(&snapshot.text, value);
++        let Some(document) = self.element.owner_document() else {
++            return;
++        };
++        let Ok(range) = document.create_range() else {
++            return;
++        };
++        let Some((a, ai)) = snapshot.point(start as u32) else {
++            return;
++        };
++        let Some((b, bi)) = snapshot.point(end as u32) else {
++            return;
++        };
++        if range.set_start(&a, ai).is_err() || range.set_end(&b, bi).is_err() {
++            return;
++        }
++        if range.delete_contents().is_err() {
++            return;
++        }
++        if let Some(text) = a.dyn_ref::<web_sys::Text>() {
++            let _ = text.insert_data(ai, &inserted);
++        } else {
++            let _ = range.insert_node(&document.create_text_node(&inserted));
++        }
++        self.applied.replace(None);
++    }
++    fn normalize_blocks(&self, document: &web_sys::Document) -> Result<(), StyledInputRefusal> {
++        if self.element.query_selector("div,p,br")?.is_none() {
++            return Ok(());
++        }
++        let snapshot = Snapshot::new(&self.element);
++        let units: Vec<u16> = snapshot.text.encode_utf16().collect();
++        let mut desired: Vec<web_sys::Node> = Vec::new();
++        let mut offset = 0u32;
++        for leaf in snapshot.leaves {
++            if offset < leaf.range.start {
++                desired.push(
++                    document
++                        .create_text_node(&String::from_utf16_lossy(
++                            &units[offset as usize..leaf.range.start as usize],
++                        ))
++                        .into(),
++                );
++            }
++            offset = leaf.range.end;
++            desired.push(leaf.node.into());
++        }
++        if offset < units.len() as u32 {
++            desired.push(
++                document
++                    .create_text_node(&String::from_utf16_lossy(&units[offset as usize..]))
++                    .into(),
++            );
++        }
++        // Move original Text nodes out of browser-created blocks before
++        // retiring those blocks; never replace surviving text nodes.
++        for node in &desired {
++            self.element.append_child(node)?;
++        }
++        let children = self.element.child_nodes();
++        let retired = (0..children.length())
++            .filter_map(|i| children.item(i))
++            .filter(|node| !desired.contains(node))
++            .collect::<Vec<_>>();
++        for node in retired {
++            self.element.remove_child(&node)?;
++        }
++        Ok(())
++    }
++    pub(crate) fn set_highlights(
++        &self,
++        expected: &str,
++        runs: Vec<StyledTextRun>,
++    ) -> Result<(), StyledInputRefusal> {
++        if self.value() != expected {
++            return Err(StyledInputRefusal::TextMismatch);
++        }
++        for run in &runs {
++            if run.range.start > run.range.end
++                || run.range.end > expected.len()
++                || !expected.is_char_boundary(run.range.start)
++                || !expected.is_char_boundary(run.range.end)
++            {
++                return Err(StyledInputRefusal::InvalidRange);
++            }
++            validate_style(&run.style)?;
++        }
++        if self
++            .applied
++            .borrow()
++            .as_ref()
++            .is_some_and(|(text, old)| text == expected && *old == runs)
++        {
++            return Ok(());
++        }
++        let selection = self.selection();
++        let document = self
++            .element
++            .owner_document()
++            .ok_or(StyledInputRefusal::Dom)?;
++        let mut boundaries = vec![0, expected.len()];
++        for run in &runs {
++            boundaries.extend([run.range.start, run.range.end]);
++        }
++        boundaries.sort_unstable();
++        boundaries.dedup();
++        let utf16: Vec<u32> = boundaries
++            .iter()
++            .map(|&byte| expected[..byte].encode_utf16().count() as u32)
++            .collect();
++        // Validate every resulting interval before touching the retained tree.
++        for interval in boundaries.windows(2) {
++            let mut style = HighlightStyle::default();
++            for run in &runs {
++                if run.range.start <= interval[0] && interval[0] < run.range.end {
++                    merge_style(&mut style, &run.style);
++                }
++            }
++            validate_style(&style)?;
++        }
++        self.normalize_blocks(&document)?;
++        // Retire only our prior wrappers, preserving every browser text node.
++        let wrappers = self.element.query_selector_all("[data-gpui-text-run]")?;
++        for i in (0..wrappers.length()).rev() {
++            let Some(wrapper) = wrappers.item(i) else {
++                continue;
++            };
++            let Some(parent) = wrapper.parent_node() else {
++                continue;
++            };
++            while let Some(child) = wrapper.first_child() {
++                parent.insert_before(&child, Some(&wrapper))?;
++            }
++            parent.remove_child(&wrapper)?;
++        }
++        // Splitting and reparenting retains the browser's original Text nodes.
++        // Replacing all descendants destroys Firefox's native history trigger.
++        for &boundary in utf16.iter().rev() {
++            let snapshot = Snapshot::new(&self.element);
++            if let Some(leaf) = snapshot
++                .leaves
++                .iter()
++                .find(|leaf| leaf.range.start < boundary && boundary < leaf.range.end)
++            {
++                leaf.node.split_text(boundary - leaf.range.start)?;
++            }
++        }
++        let snapshot = Snapshot::new(&self.element);
++        for leaf in snapshot.leaves {
++            let byte = expected
++                .char_indices()
++                .scan(0u32, |offset, (byte, ch)| {
++                    let old = *offset;
++                    *offset += ch.len_utf16() as u32;
++                    Some((old, byte))
++                })
++                .find(|(offset, _)| *offset == leaf.range.start)
++                .map(|(_, byte)| byte)
++                .unwrap_or(expected.len());
++            let mut style = HighlightStyle::default();
++            for run in &runs {
++                if run.range.start <= byte && byte < run.range.end {
++                    merge_style(&mut style, &run.style);
++                }
++            }
++            let span: web_sys::HtmlElement = document
++                .create_element("span")?
++                .dyn_into()
++                .map_err(|_| StyledInputRefusal::Dom)?;
++            span.set_attribute("data-gpui-text-run", "")?;
++            apply_style(&span, &style)?;
++            let parent = leaf.node.parent_node().ok_or(StyledInputRefusal::Dom)?;
++            // Remove the previous presentation wrapper, retaining its text child.
++            if parent
++                .dyn_ref::<web_sys::Element>()
++                .is_some_and(|parent| parent.has_attribute("data-gpui-text-run"))
++                && parent.child_nodes().length() == 1
++            {
++                let grand = parent.parent_node().ok_or(StyledInputRefusal::Dom)?;
++                grand.insert_before(&span, Some(&parent))?;
++                span.append_child(&leaf.node)?;
++                grand.remove_child(&parent)?;
++            } else {
++                parent.insert_before(&span, Some(&leaf.node))?;
++                span.append_child(&leaf.node)?;
++            }
++        }
++        if let Some((start, end, reversed)) = selection {
++            self.set_selection(start, end, reversed);
++        }
++        self.applied.replace(Some((expected.to_owned(), runs)));
++        Ok(())
++    }
++}
++fn merge_style(target: &mut HighlightStyle, source: &HighlightStyle) {
++    if source.color.is_some() {
++        target.color = source.color;
++    }
++    if source.background_color.is_some() {
++        target.background_color = source.background_color;
++    }
++    if source.font_weight.is_some() {
++        target.font_weight = source.font_weight;
++    }
++    if source.font_style.is_some() {
++        target.font_style = source.font_style;
++    }
++    if source.underline.is_some() {
++        target.underline = source.underline;
++    }
++    if source.strikethrough.is_some() {
++        target.strikethrough = source.strikethrough;
++    }
++    if source.fade_out.is_some() {
++        target.fade_out = source.fade_out;
++    }
++}
++fn validate_style(style: &HighlightStyle) -> Result<(), StyledInputRefusal> {
++    // CSS shares decoration thickness/color for underline and strike; native
++    // styles may differ. Refuse that combination rather than silently lose it.
++    if let (Some(a), Some(b)) = (style.underline, style.strikethrough) {
++        if a.thickness != b.thickness || a.color != b.color || a.wavy {
++            return Err(StyledInputRefusal::UnsupportedStyle);
++        }
++    }
++    if style.fade_out.is_some_and(|fade| fade != 0.0) {
++        return Err(StyledInputRefusal::UnsupportedStyle);
++    }
++    Ok(())
++}
++fn apply_style(element: &web_sys::HtmlElement, style: &HighlightStyle) -> Result<(), JsValue> {
++    let css = element.style();
++    if let Some(color) = style.color {
++        css.set_property("color", &color.to_string())?;
++    }
++    if let Some(color) = style.background_color {
++        css.set_property("background-color", &color.to_string())?;
++    }
++    if let Some(weight) = style.font_weight {
++        css.set_property("font-weight", &weight.0.to_string())?;
++    }
++    if let Some(font) = style.font_style {
++        css.set_property(
++            "font-style",
++            match font {
++                FontStyle::Normal => "normal",
++                FontStyle::Italic => "italic",
++                FontStyle::Oblique => "oblique",
++            },
++        )?;
++    }
++    let mut lines = vec![];
++    if style.underline.is_some() {
++        lines.push("underline");
++    }
++    if style.strikethrough.is_some() {
++        lines.push("line-through");
++    }
++    if !lines.is_empty() {
++        css.set_property("text-decoration-line", &lines.join(" "))?;
++    }
++    if let Some(underline) = style.underline {
++        css.set_property(
++            "text-decoration-thickness",
++            &format!("{}px", f32::from(underline.thickness)),
++        )?;
++        css.set_property(
++            "text-decoration-style",
++            if underline.wavy { "wavy" } else { "solid" },
++        )?;
++        if let Some(color) = underline.color {
++            css.set_property("text-decoration-color", &color.to_string())?;
++        }
++    } else if let Some(strike) = style.strikethrough {
++        css.set_property(
++            "text-decoration-thickness",
++            &format!("{}px", f32::from(strike.thickness)),
++        )?;
++        if let Some(color) = strike.color {
++            css.set_property("text-decoration-color", &color.to_string())?;
++        }
++    }
++    Ok(())
++}
+diff --git a/crates/gpui_web/src/window.rs b/crates/gpui_web/src/window.rs
+index a3ad0eb..934b8e2 100644
+--- a/crates/gpui_web/src/window.rs
++++ b/crates/gpui_web/src/window.rs
+@@ -770,6 +770,15 @@ impl PlatformWindow for WebWindow {
+         self.inner.ime_mirror.apply_configuration(&configuration);
+     }
+ 
++    fn request_text_input_focus(&self) {
++        // The IME owns its element until commit/cancel. An explicit later
++        // editor focus intent must not move an open composition.
++        if !self.inner.is_composing.get() {
++            self.inner.sync_virtual_keyboard(true);
++            crate::ime_mirror::ImeMirror::schedule_sync(&self.inner);
++        }
++    }
++
+     fn text_input_state_changed(&self, change: TextInputStateChange) {
+         match change {
+             TextInputStateChange::FocusGained => self.inner.sync_virtual_keyboard(true),
+diff --git a/crates/gpui_wgpu/src/cosmic_text_system.rs b/crates/gpui_wgpu/src/cosmic_text_system.rs
+index e84d924..1e9c4a4 100644
+--- a/crates/gpui_wgpu/src/cosmic_text_system.rs
++++ b/crates/gpui_wgpu/src/cosmic_text_system.rs
+@@ -156,6 +156,24 @@ impl PlatformTextSystem for CosmicTextSystem {
+         Ok(candidates[ix])
+     }
+ 
++    fn resolved_font_face(&self, font_id: FontId) -> Option<gpui::ResolvedFontFace> {
++        let state = self.0.read();
++        let loaded = state.loaded_fonts.get(font_id.0)?;
++        let face = state.font_system.db().face(loaded.font.id())?;
++        let family = face.families.first()?.0.clone().into();
++        let style = match face.style {
++            Style::Normal => gpui::FontStyle::Normal,
++            Style::Italic => gpui::FontStyle::Italic,
++            Style::Oblique => gpui::FontStyle::Oblique,
++        };
++        Some(gpui::ResolvedFontFace::new(
++            family,
++            face.post_script_name.clone().into(),
++            gpui::FontWeight(face.weight.0 as f32),
++            style,
++        ))
++    }
++
+     fn prewarm_fonts(&self, font_ids: &[FontId]) {
+         self.0.write().prewarm_fonts(font_ids);
+     }
+@@ -1063,6 +1081,44 @@ mod tests {
+     const IBM_PLEX: &[u8] =
+         include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+ 
++    #[test]
++    fn resolved_face_reports_actual_weight_and_style_instead_of_requested_descriptor() -> Result<()>
++    {
++        let platform = text_system()?;
++        platform.add_fonts(vec![Cow::Borrowed(include_bytes!(
++            "../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf"
++        ))])?;
++        let system = gpui::TextSystem::new(Arc::new(platform));
++        let requested = gpui::Font {
++            weight: gpui::FontWeight(450.),
++            style: gpui::FontStyle::Italic,
++            ..gpui::font("IBM Plex Sans")
++        };
++        let id = system.resolve_font(&requested);
++        let face = system
++            .resolved_font_face(id)
++            .expect("actual selected embedded face");
++        assert_eq!(face.family().as_ref(), "IBM Plex Sans");
++        assert_eq!(face.weight(), gpui::FontWeight::NORMAL);
++        assert_eq!(face.style(), gpui::FontStyle::Normal);
++        assert_eq!(face.post_script_name().as_ref(), "IBMPlexSans");
++        assert_eq!(
++            system.get_font_for_id(id),
++            Some(requested),
++            "old cache API reports the request"
++        );
++        let bold = system.resolve_font(&gpui::Font {
++            weight: gpui::FontWeight::BOLD,
++            ..gpui::font("IBM Plex Sans")
++        });
++        assert_eq!(
++            system.resolved_font_face(bold).unwrap().weight(),
++            gpui::FontWeight(600.)
++        );
++        assert!(system.resolved_font_face(FontId(usize::MAX)).is_none());
++        Ok(())
++    }
++
+     /// Every code point of `Bidi_Class=B`, each of which starts a new bidi
+     /// paragraph and so can split one line into mixed-direction paragraphs.
+     const SEPARATORS: &[char] = &[
+-- 
+2.53.0
+

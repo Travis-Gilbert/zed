@@ -129,6 +129,17 @@ pub trait Platform: 'static {
     fn foreground_executor(&self) -> ForegroundExecutor;
     fn text_system(&self) -> Arc<dyn PlatformTextSystem>;
 
+    /// The operating system's reduced-motion preference, if supported.
+    /// `None` leaves the application's existing motion policy unchanged.
+    fn reduce_motion(&self) -> Option<bool> {
+        None
+    }
+
+    /// Replaces the platform-owned motion listener. Delivery must be deferred
+    /// onto the foreground executor, outside any synchronous native callback.
+    /// Unsupported platforms leave the application policy unchanged.
+    fn on_reduce_motion_change(&self, _callback: Box<dyn FnMut(bool)>) {}
+
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>);
     fn quit(&self);
     fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<OsString>);
@@ -1161,6 +1172,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Requests that the soft keyboard be hidden.
     fn hide_soft_keyboard(&self) {}
 
+    /// Explicitly restore the currently installed text input's platform focus.
+    /// This is an intent, separate from a change in native focus ownership.
+    fn request_text_input_focus(&self) {}
+
+    /// Whether the platform currently owns an open text composition, including
+    /// the empty phase before the document has received marked text.
+    fn is_text_composing(&self) -> bool {
+        false
+    }
+
     /// Inform the operating system that the text input state has changed
     fn text_input_state_changed(&self, _change: TextInputStateChange) {}
 
@@ -1276,6 +1297,10 @@ pub trait PlatformTextSystem: Send + Sync {
     fn all_font_names(&self) -> Vec<String>;
     /// Get the font ID for a font descriptor.
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
+    /// Observe an already selected face without rerunning a platform matcher.
+    fn resolved_font_face(&self, _font_id: FontId) -> Option<crate::ResolvedFontFace> {
+        None
+    }
     /// Prewarm any system font caches needed to shape text.
     fn prewarm_fonts(&self, _font_ids: &[FontId]) {}
     /// Get metrics for a font.
@@ -1813,6 +1838,13 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    /// See [`InputHandler::set_text_selection`].
+    pub fn set_text_selection(&mut self, selection: UTF16Selection) {
+        self.cx
+            .update(|window, cx| self.handler.set_text_selection(selection, window, cx))
+            .ok();
+    }
+
     /// See [`InputHandler::element_bounds`].
     pub fn element_bounds(&mut self) -> Option<Bounds<Pixels>> {
         self.cx
@@ -1999,6 +2031,19 @@ pub trait InputHandler: 'static {
         _window: &mut Window,
         _cx: &mut App,
     ) {
+    }
+
+    /// Set the user's selection together with its direction.
+    ///
+    /// The directional form of [`Self::set_selected_text_range`], for
+    /// platforms whose text machinery reports which end of the selection is
+    /// the focus: a browser `<textarea>` reports `selectionDirection`, and a
+    /// backwards selection imported without it would put the caret at the
+    /// wrong end. `selection.reversed` means the focus is at `range.start`.
+    /// The default drops the direction, which is what a handler that keeps
+    /// no direction can honor.
+    fn set_text_selection(&mut self, selection: UTF16Selection, window: &mut Window, cx: &mut App) {
+        self.set_selected_text_range(selection.range, window, cx);
     }
 
     /// Get the bounds of the focused text element in window coordinates, if known.

@@ -45,6 +45,8 @@ pub(crate) struct TestWindowState {
     input_handler: Option<PlatformInputHandler>,
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
+    text_input_focus_requests: u64,
+    text_composing: bool,
     is_fullscreen: bool,
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
@@ -109,6 +111,8 @@ impl TestWindow {
             input_handler: None,
             text_input_configurations: Vec::new(),
             text_input_state_changes: Vec::new(),
+            text_input_focus_requests: 0,
+            text_composing: false,
             is_fullscreen: false,
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
@@ -138,9 +142,19 @@ impl TestWindow {
         self.0.lock().frame_scheduled
     }
 
+    /// Simulate the platform's composition phase independently of marked text.
+    pub fn simulate_text_composing(&self, composing: bool) {
+        self.0.lock().text_composing = composing;
+    }
+
     /// Every [`TextInputConfiguration`] forwarded to this window, in order.
     pub fn text_input_configurations(&self) -> Vec<TextInputConfiguration> {
         self.0.lock().text_input_configurations.clone()
+    }
+
+    /// Explicit platform input focus requests delivered after native prepaint.
+    pub fn text_input_focus_requests(&self) -> u64 {
+        self.0.lock().text_input_focus_requests
     }
 
     pub fn text_input_state_changes(&self) -> Vec<TextInputStateChange> {
@@ -274,6 +288,14 @@ impl PlatformWindow for TestWindow {
 
     fn set_text_input_configuration(&mut self, configuration: TextInputConfiguration) {
         self.0.lock().text_input_configurations.push(configuration);
+    }
+
+    fn is_text_composing(&self) -> bool {
+        self.0.lock().text_composing
+    }
+
+    fn request_text_input_focus(&self) {
+        self.0.lock().text_input_focus_requests += 1;
     }
 
     fn text_input_state_changed(&self, change: TextInputStateChange) {

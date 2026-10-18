@@ -1,0 +1,30 @@
+From 81f57734c2e47106b8271c63a3b6a29cb3080bb8 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Thu, 15 Oct 2026 13:20:08 -0400
+Subject: [PATCH] fix(gpui-web): keep Tab inside active IME composition
+
+---
+ crates/gpui_web/src/events.rs | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/crates/gpui_web/src/events.rs b/crates/gpui_web/src/events.rs
+index 8ba54be..82c576f 100644
+--- a/crates/gpui_web/src/events.rs
++++ b/crates/gpui_web/src/events.rs
+@@ -813,6 +813,13 @@ impl WebWindowInner {
+                 && !modifiers.control
+                 && !modifiers.alt
+                 && !modifiers.platform;
++            if is_tab && (this.is_composing.get() || event.is_composing()) {
++                // A composition owns its current conduit and focus until it
++                // commits or cancels. Do not run focus-navigation bindings
++                // before the composition guard below can see this key.
++                event.prevent_default();
++                return;
++            }
+             let result = this.dispatch_input(PlatformInput::KeyDown(KeyDownEvent {
+                 keystroke,
+                 is_held,
+-- 
+2.53.0
+

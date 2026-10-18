@@ -1,0 +1,48 @@
+From 4bc784fa43ed77b99385ddd112907747e3c937f1 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Wed, 14 Oct 2026 12:09:40 -0400
+Subject: [PATCH 32/33] feat(gpui): add aria_disabled so an element can publish
+ AccessKit disabled
+
+---
+ crates/gpui/src/elements/div.rs | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/crates/gpui/src/elements/div.rs b/crates/gpui/src/elements/div.rs
+index f9208d0..de5f22b 100644
+--- a/crates/gpui/src/elements/div.rs
++++ b/crates/gpui/src/elements/div.rs
+@@ -1354,6 +1354,15 @@ pub trait StatefulInteractiveElement: InteractiveElement {
+         self
+     }
+ 
++    /// Mark this element as disabled for assistive technology (AccessKit's
++    /// `disabled`). This is the accessibility state only: it neither blocks
++    /// input nor changes how the element is drawn, so the caller keeps owning
++    /// both. `false` publishes nothing, which is how a node says it is enabled.
++    fn aria_disabled(mut self, disabled: bool) -> Self {
++        self.interactivity().aria.disabled = disabled;
++        self
++    }
++
+     /// Set the expanded state for this element.
+     fn aria_expanded(mut self, expanded: bool) -> Self {
+         self.interactivity().aria.expanded = Some(expanded);
+@@ -2060,6 +2069,7 @@ pub(crate) struct AriaProperties {
+     pub(crate) description: Option<SharedString>,
+     pub(crate) keyshortcuts: Option<SharedString>,
+     pub(crate) selected: Option<bool>,
++    pub(crate) disabled: bool,
+     pub(crate) expanded: Option<bool>,
+     pub(crate) toggled: Option<accesskit::Toggled>,
+     pub(crate) numeric_value: Option<f64>,
+@@ -3476,6 +3486,9 @@ impl Interactivity {
+         if let Some(selected) = self.aria.selected {
+             node.set_selected(selected);
+         }
++        if self.aria.disabled {
++            node.set_disabled();
++        }
+         if let Some(expanded) = self.aria.expanded {
+             node.set_expanded(expanded);
+         }
