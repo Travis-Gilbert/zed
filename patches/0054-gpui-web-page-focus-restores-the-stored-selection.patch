@@ -1,0 +1,79 @@
+From 93c292dbb0e9d44bd66070ac86b105736a289ba9 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Sun, 18 Oct 2026 14:57:52 -0400
+Subject: [PATCH] fix(gpui-web): restore the stored selection when the page
+ focuses a conduit
+
+The selectionchange import ignores moves while the conduit is unfocused,
+so a selection the browser moved then (a write into an unfocused styled
+root, the document selection crossing to a popup) was never imported.
+Focus the page gave the element, by Tab or its own focus(), then fired no
+selectionchange, and the sync deferred to an import that was not coming:
+every later inbound write (undo, redo, an agent's text) stayed off the
+element. The focus listener now restores the stored selection, as the
+platform's own focus() already did, and schedules a sync to reassert the
+app's; a click's caret still wins through its pending import.
+---
+ crates/gpui_web/src/events.rs     |  8 ++++++++
+ crates/gpui_web/src/ime_mirror.rs | 26 +++++++++++++++++++-------
+ 2 files changed, 27 insertions(+), 7 deletions(-)
+
+diff --git a/crates/gpui_web/src/events.rs b/crates/gpui_web/src/events.rs
+index 2c89dcbb76..d3d2a4eeea 100644
+--- a/crates/gpui_web/src/events.rs
++++ b/crates/gpui_web/src/events.rs
+@@ -1332,6 +1332,14 @@ impl WebWindowInner {
+     fn register_focus(self: &Rc<Self>) -> Vec<EventListenerHandle> {
+         let this = Rc::clone(self);
+         self.listen_input("focus", move |_event: JsValue| {
++            // A selection that moved while the conduit was unfocused was never
++            // imported; restore the stored one and let a sync reassert the
++            // app's. A click's own caret still wins: its import is pending,
++            // and the sync defers to it.
++            if !this.is_composing.get() && this.ime_mirror.is_focused() {
++                this.ime_mirror.restore_selection();
++                this.schedule_ime_mirror_sync();
++            }
+             if this.suppress_focus_status_events.get() {
+                 return;
+             }
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index 4781a1e7d4..a8972db3e8 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -1027,13 +1027,25 @@ impl ImeMirror {
+         if conduit.as_element().focus().is_err() {
+             return;
+         }
+-        // The document has one selection, and a sync of another conduit can
+-        // leave it outside this one. Focusing a contenteditable root then puts
+-        // the caret at its start (WebKit), and the `selectionchange` that move
+-        // queues would import the browser's caret as the person's. Restored
+-        // here, synchronously, the event finds the stored selection and
+-        // imports nothing. Bookkeeping that no longer describes the element
+-        // belongs to the next sync's rebuild instead.
++        self.restore_selection();
++    }
++
++    /// Put the stored selection back into the live conduit as it gains focus.
++    ///
++    /// The document has one selection, and a sync of another conduit can
++    /// leave it outside this one. Focusing a contenteditable root then puts
++    /// the caret at its start (WebKit), and the `selectionchange` that move
++    /// queues would import the browser's caret as the person's. Restored
++    /// here, synchronously, the event finds the stored selection and
++    /// imports nothing. Bookkeeping that no longer describes the element
++    /// belongs to the next sync's rebuild instead.
++    ///
++    /// The same holds for focus the page gives the element (Tab, or the
++    /// page's own `focus()`): a selection that moved while it was unfocused
++    /// was never imported, and no `selectionchange` is coming for it, so a
++    /// sync would otherwise defer to that move forever.
++    pub(crate) fn restore_selection(&self) {
++        let conduit = self.live_conduit();
+         if conduit.element.value() != *self.text.borrow() {
+             return;
+         }
+-- 
+2.53.0
+

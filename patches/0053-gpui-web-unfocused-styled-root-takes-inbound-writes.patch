@@ -1,0 +1,154 @@
+From dd848444ad21c5053405828bdd7e132fda92e9e0 Mon Sep 17 00:00:00 2001
+From: Travis Gilbert <1travisgilbert@gmail.com>
+Date: Sun, 18 Oct 2026 13:55:56 -0400
+Subject: [PATCH] fix(gpui-web): write inbound text into an unfocused styled
+ root
+
+Patch 0052 left a styled root that does not hold focus with no DOM
+selection, but the island sync still recorded the handler's selection
+as the mirror's baseline. Every later sync then found the value
+matching and the live selection (none) differing from the baseline, read
+that as an IME moving the selection, and returned before writing. Text
+an agent or an undo put into the draft while focus was elsewhere never
+reached the element.
+
+The guard now applies only while the conduit holds focus, since only a
+focused element can be mid-gesture. Selection writes report whether the
+element took them, and the island counts a write only when one happened.
+---
+ crates/gpui_web/src/ime_mirror.rs   | 47 +++++++++++++++++++++--------
+ crates/gpui_web/src/styled_input.rs | 18 ++++++-----
+ 2 files changed, 44 insertions(+), 21 deletions(-)
+
+diff --git a/crates/gpui_web/src/ime_mirror.rs b/crates/gpui_web/src/ime_mirror.rs
+index 28f2c0186f..4781a1e7d4 100644
+--- a/crates/gpui_web/src/ime_mirror.rs
++++ b/crates/gpui_web/src/ime_mirror.rs
+@@ -232,20 +232,35 @@ impl ConduitElement {
+         direction.ok().flatten().as_deref() == Some("backward")
+     }
+ 
+-    fn set_selection_range(&self, start: u32, end: u32, reversed: bool) {
++    /// Writes the selection, and says whether the element now holds it.
++    ///
++    /// A text control always takes the range. A styled root that does not
++    /// hold focus keeps no selection at all, so the write is refused there and
++    /// the caret lives only in the mirror's bookkeeping until focus arrives.
++    fn set_selection_range(&self, start: u32, end: u32, reversed: bool) -> bool {
+         let direction = if reversed { "backward" } else { "forward" };
+         match self {
+             Self::TextArea(element) => element
+                 .set_selection_range_with_direction(start, end, direction)
+-                .ok(),
++                .is_ok(),
+             Self::Input(element) => element
+                 .set_selection_range_with_direction(start, end, direction)
+-                .ok(),
+-            Self::Styled(element) => {
+-                element.set_selection(start, end, reversed);
+-                None
+-            }
+-        };
++                .is_ok(),
++            Self::Styled(element) => element.set_selection(start, end, reversed),
++        }
++    }
++
++    /// Whether the document's focus is this element or inside it.
++    ///
++    /// Only a focused element can have its selection moved by an IME, so this
++    /// is what separates a gesture in flight from an element that simply has
++    /// no selection of its own to report.
++    fn holds_focus(&self) -> bool {
++        let element: &web_sys::Element = self.as_element().as_ref();
++        element
++            .owner_document()
++            .and_then(|document| document.active_element())
++            .is_some_and(|active| element.contains(Some(&active)))
+     }
+ 
+     fn read_only(&self) -> bool {
+@@ -1487,13 +1502,13 @@ impl ImeMirror {
+         self.window_hint.set(start);
+         let selection_start = selection.range.start.saturating_sub(start) as u32;
+         let selection_end = selection.range.end.saturating_sub(start) as u32;
+-        if conduit.element.selection_start() != Some(selection_start)
++        if (conduit.element.selection_start() != Some(selection_start)
+             || conduit.element.selection_end() != Some(selection_end)
+-            || conduit.element.selection_reversed() != selection.reversed
+-        {
+-            conduit
++            || conduit.element.selection_reversed() != selection.reversed)
++            && conduit
+                 .element
+-                .set_selection_range(selection_start, selection_end, selection.reversed);
++                .set_selection_range(selection_start, selection_end, selection.reversed)
++        {
+             self.note_island(|counts| counts.writes += 1);
+         }
+         self.selection.set((
+@@ -1662,7 +1677,13 @@ impl ImeMirror {
+             // an in-progress gesture, e.g. Android's slide-on-backspace
+             // growing its selection. The import reconciles the two sides and
+             // schedules a fresh sync when it cannot adopt the move.
++            //
++            // Only a focused element can be mid-gesture. An unfocused styled
++            // root reports no selection at all, which differs from every
++            // baseline; read as a gesture, that would hold off every inbound
++            // write (an agent's text, an undo) until the reader clicked in.
+             if !mirror.selection_import_rejected.replace(false)
++                && conduit.element.holds_focus()
+                 && *mirror.text.borrow() == conduit.element.value()
+             {
+                 let live_start = mirror.selection_start().unwrap_or(0);
+diff --git a/crates/gpui_web/src/styled_input.rs b/crates/gpui_web/src/styled_input.rs
+index 85a8421097..4fe1a29c02 100644
+--- a/crates/gpui_web/src/styled_input.rs
++++ b/crates/gpui_web/src/styled_input.rs
+@@ -177,9 +177,10 @@ impl StyledInput {
+         let focus = snapshot.offset(&selection.focus_node()?, selection.focus_offset())?;
+         Some((anchor.min(focus), anchor.max(focus), focus < anchor))
+     }
+-    pub(crate) fn set_selection(&self, start: u32, end: u32, reversed: bool) {
++    /// Places the selection, and says whether it was placed.
++    pub(crate) fn set_selection(&self, start: u32, end: u32, reversed: bool) -> bool {
+         let Some(document) = self.element.owner_document() else {
+-            return;
++            return false;
+         };
+         // A selection placed inside an editing host focuses that host
+         // (Chromium), so writing one into a root that does not hold focus
+@@ -190,23 +191,24 @@ impl StyledInput {
+             .active_element()
+             .is_some_and(|active| self.element.contains(Some(&active)))
+         {
+-            return;
++            return false;
+         }
+         let Ok(Some(selection)) = document.get_selection() else {
+-            return;
++            return false;
+         };
+         let snapshot = Snapshot::new(&self.element);
+         let Some((start_node, start_offset)) = snapshot.point(start) else {
+-            return;
++            return false;
+         };
+         let Some((end_node, end_offset)) = snapshot.point(end) else {
+-            return;
++            return false;
+         };
+-        let _ = if reversed {
++        if reversed {
+             selection.set_base_and_extent(&end_node, end_offset, &start_node, start_offset)
+         } else {
+             selection.set_base_and_extent(&start_node, start_offset, &end_node, end_offset)
+-        };
++        }
++        .is_ok()
+     }
+     pub(crate) fn set_value(&self, value: &str) {
+         if let Some(document) = self.element.owner_document() {
+-- 
+2.53.0
+

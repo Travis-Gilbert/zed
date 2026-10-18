@@ -318,3 +318,23 @@ only when one happened.
 Product acceptance is TheoremWeb's `undo_redo_share_draft_history` editing case
 in Chromium and WebKit, with the Command query case's return to its invoker
 unchanged, against the next consumer artifact.
+
+## Focus the page gives a conduit restores its stored selection (patch 0054)
+
+Patch 0053 did not repair TheoremWeb's `undo_redo_share_draft_history`. The
+`selectionchange` import ignores moves while the conduit is unfocused, so a
+selection the browser moved then was never imported: writing Bold into the
+unfocused styled root left its DOM caret at 2 (WebKit) or 12 (Chromium) while
+the app's caret was at 7. When the page focused the root again (Tab, or its own
+`focus()`), the selection did not change, no `selectionchange` fired, and the
+sync guard deferred to an import that was not coming. Undo, redo and an agent's
+text all stayed off the element.
+
+The focus listener now restores the stored selection into the live conduit,
+which the platform's own `focus()` already did, and schedules a sync to
+reassert the app's selection. A click's own caret still wins: the browser
+places it after the focus event, its import is pending, and the guard defers
+to it. Patch 0053's record also adds its patch file, which its commit left out.
+
+Product acceptance is the same editing case in Chromium and WebKit against the
+next consumer artifact.
