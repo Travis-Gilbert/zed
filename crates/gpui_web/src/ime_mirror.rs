@@ -1027,13 +1027,25 @@ impl ImeMirror {
         if conduit.as_element().focus().is_err() {
             return;
         }
-        // The document has one selection, and a sync of another conduit can
-        // leave it outside this one. Focusing a contenteditable root then puts
-        // the caret at its start (WebKit), and the `selectionchange` that move
-        // queues would import the browser's caret as the person's. Restored
-        // here, synchronously, the event finds the stored selection and
-        // imports nothing. Bookkeeping that no longer describes the element
-        // belongs to the next sync's rebuild instead.
+        self.restore_selection();
+    }
+
+    /// Put the stored selection back into the live conduit as it gains focus.
+    ///
+    /// The document has one selection, and a sync of another conduit can
+    /// leave it outside this one. Focusing a contenteditable root then puts
+    /// the caret at its start (WebKit), and the `selectionchange` that move
+    /// queues would import the browser's caret as the person's. Restored
+    /// here, synchronously, the event finds the stored selection and
+    /// imports nothing. Bookkeeping that no longer describes the element
+    /// belongs to the next sync's rebuild instead.
+    ///
+    /// The same holds for focus the page gives the element (Tab, or the
+    /// page's own `focus()`): a selection that moved while it was unfocused
+    /// was never imported, and no `selectionchange` is coming for it, so a
+    /// sync would otherwise defer to that move forever.
+    pub(crate) fn restore_selection(&self) {
+        let conduit = self.live_conduit();
         if conduit.element.value() != *self.text.borrow() {
             return;
         }

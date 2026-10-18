@@ -1332,6 +1332,14 @@ impl WebWindowInner {
     fn register_focus(self: &Rc<Self>) -> Vec<EventListenerHandle> {
         let this = Rc::clone(self);
         self.listen_input("focus", move |_event: JsValue| {
+            // A selection that moved while the conduit was unfocused was never
+            // imported; restore the stored one and let a sync reassert the
+            // app's. A click's own caret still wins: its import is pending,
+            // and the sync defers to it.
+            if !this.is_composing.get() && this.ime_mirror.is_focused() {
+                this.ime_mirror.restore_selection();
+                this.schedule_ime_mirror_sync();
+            }
             if this.suppress_focus_status_events.get() {
                 return;
             }
