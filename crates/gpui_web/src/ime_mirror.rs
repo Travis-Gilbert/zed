@@ -232,20 +232,35 @@ impl ConduitElement {
         direction.ok().flatten().as_deref() == Some("backward")
     }
 
-    fn set_selection_range(&self, start: u32, end: u32, reversed: bool) {
+    /// Writes the selection, and says whether the element now holds it.
+    ///
+    /// A text control always takes the range. A styled root that does not
+    /// hold focus keeps no selection at all, so the write is refused there and
+    /// the caret lives only in the mirror's bookkeeping until focus arrives.
+    fn set_selection_range(&self, start: u32, end: u32, reversed: bool) -> bool {
         let direction = if reversed { "backward" } else { "forward" };
         match self {
             Self::TextArea(element) => element
                 .set_selection_range_with_direction(start, end, direction)
-                .ok(),
+                .is_ok(),
             Self::Input(element) => element
                 .set_selection_range_with_direction(start, end, direction)
-                .ok(),
-            Self::Styled(element) => {
-                element.set_selection(start, end, reversed);
-                None
-            }
-        };
+                .is_ok(),
+            Self::Styled(element) => element.set_selection(start, end, reversed),
+        }
+    }
+
+    /// Whether the document's focus is this element or inside it.
+    ///
+    /// Only a focused element can have its selection moved by an IME, so this
+    /// is what separates a gesture in flight from an element that simply has
+    /// no selection of its own to report.
+    fn holds_focus(&self) -> bool {
+        let element: &web_sys::Element = self.as_element().as_ref();
+        element
+            .owner_document()
+            .and_then(|document| document.active_element())
+            .is_some_and(|active| element.contains(Some(&active)))
     }
 
     fn read_only(&self) -> bool {
@@ -1487,13 +1502,13 @@ impl ImeMirror {
         self.window_hint.set(start);
         let selection_start = selection.range.start.saturating_sub(start) as u32;
         let selection_end = selection.range.end.saturating_sub(start) as u32;
-        if conduit.element.selection_start() != Some(selection_start)
+        if (conduit.element.selection_start() != Some(selection_start)
             || conduit.element.selection_end() != Some(selection_end)
-            || conduit.element.selection_reversed() != selection.reversed
-        {
-            conduit
+            || conduit.element.selection_reversed() != selection.reversed)
+            && conduit
                 .element
-                .set_selection_range(selection_start, selection_end, selection.reversed);
+                .set_selection_range(selection_start, selection_end, selection.reversed)
+        {
             self.note_island(|counts| counts.writes += 1);
         }
         self.selection.set((
@@ -1662,7 +1677,13 @@ impl ImeMirror {
             // an in-progress gesture, e.g. Android's slide-on-backspace
             // growing its selection. The import reconciles the two sides and
             // schedules a fresh sync when it cannot adopt the move.
+            //
+            // Only a focused element can be mid-gesture. An unfocused styled
+            // root reports no selection at all, which differs from every
+            // baseline; read as a gesture, that would hold off every inbound
+            // write (an agent's text, an undo) until the reader clicked in.
             if !mirror.selection_import_rejected.replace(false)
+                && conduit.element.holds_focus()
                 && *mirror.text.borrow() == conduit.element.value()
             {
                 let live_start = mirror.selection_start().unwrap_or(0);

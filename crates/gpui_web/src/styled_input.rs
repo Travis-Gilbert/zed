@@ -177,9 +177,10 @@ impl StyledInput {
         let focus = snapshot.offset(&selection.focus_node()?, selection.focus_offset())?;
         Some((anchor.min(focus), anchor.max(focus), focus < anchor))
     }
-    pub(crate) fn set_selection(&self, start: u32, end: u32, reversed: bool) {
+    /// Places the selection, and says whether it was placed.
+    pub(crate) fn set_selection(&self, start: u32, end: u32, reversed: bool) -> bool {
         let Some(document) = self.element.owner_document() else {
-            return;
+            return false;
         };
         // A selection placed inside an editing host focuses that host
         // (Chromium), so writing one into a root that does not hold focus
@@ -190,23 +191,24 @@ impl StyledInput {
             .active_element()
             .is_some_and(|active| self.element.contains(Some(&active)))
         {
-            return;
+            return false;
         }
         let Ok(Some(selection)) = document.get_selection() else {
-            return;
+            return false;
         };
         let snapshot = Snapshot::new(&self.element);
         let Some((start_node, start_offset)) = snapshot.point(start) else {
-            return;
+            return false;
         };
         let Some((end_node, end_offset)) = snapshot.point(end) else {
-            return;
+            return false;
         };
-        let _ = if reversed {
+        if reversed {
             selection.set_base_and_extent(&end_node, end_offset, &start_node, start_offset)
         } else {
             selection.set_base_and_extent(&start_node, start_offset, &end_node, end_offset)
-        };
+        }
+        .is_ok()
     }
     pub(crate) fn set_value(&self, value: &str) {
         if let Some(document) = self.element.owner_document() {
