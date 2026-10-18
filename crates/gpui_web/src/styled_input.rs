@@ -181,6 +181,17 @@ impl StyledInput {
         let Some(document) = self.element.owner_document() else {
             return;
         };
+        // A selection placed inside an editing host focuses that host
+        // (Chromium), so writing one into a root that does not hold focus
+        // would take focus from wherever it went. Such a root keeps its caret
+        // in the mirror's bookkeeping only; `ImeMirror::focus` writes it the
+        // moment the root takes focus.
+        if !document
+            .active_element()
+            .is_some_and(|active| self.element.contains(Some(&active)))
+        {
+            return;
+        }
         let Ok(Some(selection)) = document.get_selection() else {
             return;
         };
