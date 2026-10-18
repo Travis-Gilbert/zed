@@ -300,3 +300,21 @@ takes focus.
 Product acceptance is the TheoremWeb Command query case's return to its invoker
 with no stop on the composer, in Chromium and WebKit, against the next consumer
 artifact.
+
+## An unfocused styled root still takes inbound writes (patch 0053)
+
+Patch 0052 left a styled root that does not hold focus with no DOM selection,
+while the island sync still recorded the handler's selection as the mirror's
+baseline. The sync guard that holds off writes during an IME selection move
+compares the live selection with that baseline whenever the value matches, so
+from then on every sync read the root's missing selection as a gesture in flight
+and returned before writing. A draft an agent revised, or an undo applied, while
+focus was elsewhere kept its old text. The guard now applies only while the
+conduit holds focus, the only state in which an IME can be moving its
+selection. `ConduitElement::set_selection_range` and `StyledInput::set_selection`
+report whether the element took the selection, and the island counts a write
+only when one happened.
+
+Product acceptance is TheoremWeb's `undo_redo_share_draft_history` editing case
+in Chromium and WebKit, with the Command query case's return to its invoker
+unchanged, against the next consumer artifact.

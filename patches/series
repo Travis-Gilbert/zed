@@ -39,3 +39,4 @@
 0050-gpui-web-focus-keeps-stored-caret.patch
 0051-gpui-web-size-without-resize-observer.patch
 0052-gpui-web-unfocused-styled-root-keeps-no-selection.patch
+0053-gpui-web-unfocused-styled-root-takes-inbound-writes.patch
